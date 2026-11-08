@@ -1,0 +1,50 @@
+[package]
+name = "evolve-llm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "Apache-2.0"
+description = "Run GGUF language models on the GPU from WebAssembly through WebGPU."
+repository = "https://github.com/anthony-firn/evolve-llm"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "evolve-llm"
+path = "src/bin/cli.rs"
+required-features = ["native"]
+
+[features]
+default = ["native"]
+native = ["dep:pollster", "wgpu/vulkan", "wgpu/metal", "wgpu/dx12"]
+
+[dependencies]
+fancy-regex = { version = "0.20", default-features = false, features = ["std", "unicode"] }
+minijinja = { version = "3.1", default-features = false, features = ["builtins", "macros", "multi_template", "json", "serde", "loop_controls"] }
+minijinja-contrib = { version = "3.1", features = ["pycompat"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-normalization = "0.1"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl"] }
+pollster = { version = "0.4", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl", "webgpu"] }
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = "thin"
+codegen-units = 4
+
+[profile.dev]
+debug = 0
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

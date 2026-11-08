@@ -1,0 +1,24 @@
+name: Check
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Unit and fixture tests
+        # GPU and model tests skip themselves when no adapter or GGUF file is present.
+        run: cargo test --release
+      - name: Browser module tests
+        run: npm test
+      - name: Install wasm-bindgen
+        run: cargo install wasm-bindgen-cli --version "$(grep -A1 'name = "wasm-bindgen"' Cargo.lock | sed -n 's/version = "\(.*\)"/\1/p')" --locked
+      - name: Build the web app
+        run: npm run build

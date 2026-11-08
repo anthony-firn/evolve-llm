@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Evolve LLM: language models on your GPU, in the browser</title>
+  <meta name="description" content="Run open language models on your own GPU from a web page. A Rust engine compiled to WebAssembly computes every token with WebGPU, and your messages stay on your device.">
+  <link rel="canonical" href="https://www.evolvetech.dev/play/evolve-llm/">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#06080d">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f5f6fa">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="app.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#prompt">Skip to the message box</a>
+  <div class="app" id="app" data-phase="starting">
+    <header class="top">
+      <a class="brand" href="./" aria-label="Evolve LLM home">
+        <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff9b4a"/><stop offset="1" stop-color="#ff5e3a"/></linearGradient></defs><rect width="32" height="32" rx="9" fill="url(#lg)"/><path d="M9 10h14M9 16h9M9 22h14" stroke="#160b04" stroke-width="2.6" stroke-linecap="round"/><circle cx="23" cy="16" r="2.4" fill="#160b04"/></svg>
+        <span><strong>Evolve LLM</strong><small>Local models · WebGPU</small></span>
+      </a>
+      <p class="gpu-chip" id="gpu-chip" data-state="checking"><i aria-hidden="true"></i><span id="gpu-name">Checking for WebGPU…</span></p>
+      <div class="top-actions">
+        <button class="ghost" type="button" id="new-chat" disabled>New chat</button>
+        <button class="ghost" type="button" id="open-settings" aria-haspopup="dialog">Settings</button>
+        <button class="ghost models-toggle" type="button" id="open-models" aria-controls="sidebar" aria-expanded="false">Models</button>
+      </div>
+    </header>
+
+    <aside class="sidebar" id="sidebar" aria-labelledby="models-title">
+      <div class="side-head">
+        <h2 id="models-title">Models</h2>
+        <p>Each model downloads once from Hugging Face, then runs from this browser.</p>
+      </div>
+      <ul class="model-list" id="model-list"></ul>
+      <details class="other" id="other-sources">
+        <summary>Other models</summary>
+        <form id="hf-form" class="hf-form" novalidate>
+          <label for="hf-input">Any single-file GGUF on Hugging Face</label>
+          <div class="field-row">
+            <input id="hf-input" name="ref" autocomplete="off" spellcheck="false" placeholder="owner/repo/model.gguf" aria-describedby="hf-help">
+            <button type="submit">Get</button>
+          </div>
+          <p class="hint" id="hf-help">Llama, Mistral, Qwen2, Qwen3 and SmolLM layouts. Q4, Q5, Q6, Q8, IQ4 and F16 weights.</p>
+        </form>
+        <label class="file-pick">
+          <input type="file" id="file-input" accept=".gguf,application/octet-stream">
+          <span>Open a GGUF file from this device</span>
+        </label>
+        <p class="hint">Opened files are read in place and are not copied or uploaded.</p>
+      </details>
+      <div class="storage" id="storage" hidden></div>
+    </aside>
+    <div class="scrim" id="scrim" hidden></div>
+
+    <main class="main" id="main">
+      <div class="scroll" id="scroll">
+        <section class="welcome" id="welcome" aria-labelledby="welcome-title">
+          <p class="eyebrow">Private by design</p>
+          <h1 id="welcome-title">Run a language model on your own GPU.</h1>
+          <p class="lede">Choose a model to download it once. It then runs entirely in this tab: a Rust engine compiled to WebAssembly computes every token with WebGPU shaders. Your messages never leave this device.</p>
+          <ul class="points">
+            <li><strong>No install, no account.</strong> A modern browser is all it takes.</li>
+            <li><strong>Stays on your device.</strong> No server sees your prompts or replies.</li>
+            <li><strong>Works offline</strong> once a model is saved in the browser.</li>
+          </ul>
+          <div class="notice" id="gpu-notice" hidden></div>
+          <button class="primary start" type="button" id="start-recommended" hidden>Start with the recommended model</button>
+        </section>
+
+        <section class="loading" id="loading" hidden aria-live="polite">
+          <p class="eyebrow" id="loading-step">Downloading</p>
+          <h2 id="loading-title">Preparing</h2>
+          <div class="bar" role="progressbar" id="loading-bar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-labelledby="loading-title"><span></span></div>
+          <p class="loading-detail" id="loading-detail"></p>
+          <ol class="steps" id="loading-steps">
+            <li data-step="download">Download from Hugging Face</li>
+            <li data-step="upload">Move weights to the GPU</li>
+            <li data-step="prepare">Prepare the context</li>
+          </ol>
+          <button class="ghost" type="button" id="cancel-load">Cancel</button>
+        </section>
+
+        <section class="ready" id="ready" hidden aria-labelledby="ready-title">
+          <h2 id="ready-title">Ready</h2>
+          <p class="ready-meta" id="ready-meta"></p>
+          <div class="suggestions" id="suggestions"></div>
+        </section>
+
+        <ol class="messages" id="messages" aria-label="Conversation"></ol>
+      </div>
+
+      <form class="composer" id="composer">
+        <label class="sr-only" for="prompt">Message</label>
+        <textarea id="prompt" rows="1" placeholder="Choose a model to start" disabled enterkeyhint="send"></textarea>
+        <button class="send" type="submit" id="send" disabled aria-label="Send">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button class="stop" type="button" id="stop" hidden aria-label="Stop generating">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg>
+        </button>
+      </form>
+      <p class="status-line" id="status-line" aria-live="polite"></p>
+    </main>
+  </div>
+
+  <dialog class="settings" id="settings" aria-labelledby="settings-title">
+    <form method="dialog" id="settings-form">
+      <header><h2 id="settings-title">Settings</h2><button class="ghost" value="close" aria-label="Close settings">Done</button></header>
+      <label class="block">System prompt
+        <textarea name="system" rows="3" placeholder="You are a helpful assistant."></textarea>
+      </label>
+      <div class="grid">
+        <label>Temperature <output name="temperatureOut"></output><input type="range" name="temperature" min="0" max="2" step="0.05"></label>
+        <label>Top-p <output name="top_pOut"></output><input type="range" name="top_p" min="0.05" max="1" step="0.01"></label>
+        <label>Top-k <output name="top_kOut"></output><input type="range" name="top_k" min="0" max="200" step="1"></label>
+        <label>Min-p <output name="min_pOut"></output><input type="range" name="min_p" min="0" max="0.5" step="0.01"></label>
+        <label>Repeat penalty <output name="repeat_penaltyOut"></output><input type="range" name="repeat_penalty" min="1" max="1.5" step="0.01"></label>
+        <label>Longest reply <output name="maxTokensOut"></output><input type="range" name="maxTokens" min="64" max="4096" step="64"></label>
+      </div>
+      <label class="block">Context length
+        <select name="ctx">
+          <option value="1024">1,024 tokens</option>
+          <option value="2048">2,048 tokens</option>
+          <option value="4096">4,096 tokens</option>
+          <option value="8192">8,192 tokens</option>
+          <option value="16384">16,384 tokens</option>
+        </select>
+        <small>Used when a model loads. Longer contexts use more GPU memory.</small>
+      </label>
+      <label class="check"><input type="checkbox" name="thinking"> Let reasoning models think before answering</label>
+      <footer><button class="ghost" type="button" id="reset-settings">Restore defaults</button><button class="primary" value="close">Done</button></footer>
+    </form>
+  </dialog>
+</body>
+</html>
