@@ -84,6 +84,7 @@ button:disabled{cursor:not-allowed;opacity:.5}
 .model{position:relative;display:block;width:100%;text-align:left;padding:12px 13px;border-radius:13px;border:1px solid var(--line);background:var(--surface);transition:border-color .15s,background .15s,transform .15s}
 .model:hover:not(:disabled){border-color:var(--line-3);transform:translateY(-1px)}
 .model[aria-current=true]{border-color:rgba(255,155,74,.55);box-shadow:var(--glow)}
+.model[aria-current=true]:disabled{opacity:1;cursor:default}
 .model .row{display:flex;align-items:baseline;gap:8px;justify-content:space-between}
 .model .name{font:600 .95rem var(--display);letter-spacing:-.01em}
 .model .size{font:500 .72rem var(--mono);color:var(--dim);white-space:nowrap}
@@ -161,7 +162,7 @@ button:disabled{cursor:not-allowed;opacity:.5}
 .msg .who{font:500 .7rem var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--dim)}
 .msg.user .bubble{max-width:85%;padding:11px 15px;border-radius:16px 16px 4px 16px;background:var(--user);white-space:pre-wrap;overflow-wrap:anywhere}
 .msg.assistant .bubble{width:100%;overflow-wrap:anywhere}
-.bubble>*+*{margin-top:.75em}
+.bubble>*+*,.bubble .answer>*+*,.bubble blockquote>*+*{margin-top:.75em}
 .bubble h3,.bubble h4,.bubble h5,.bubble h6,.bubble h7,.bubble h8{font-size:1.05rem;margin-top:1.1em}
 .bubble ul,.bubble ol{padding-left:1.4em}
 .bubble li+li{margin-top:.25em}
