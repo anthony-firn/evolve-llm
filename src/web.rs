@@ -59,8 +59,9 @@ fn describe(g: &gguf::Gguf) -> Result<ModelInfo, String> {
     let mut parameters = 0;
     let mut gpu_weight_bytes = 0;
     let mut file_bytes = 0;
-    for (name, rows, k) in model::matrices(&config) {
+    for (name, rows, k, experts) in model::matrices(&config) {
         let t = g.tensor(&name).unwrap();
+        let rows = rows * experts;
         *weight_types
             .entry(quant::type_name(t.ggml_type).to_string())
             .or_insert(0) += (rows * k) as u64;

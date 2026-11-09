@@ -20,8 +20,14 @@ fn binding3(fmt: GpuFormat) -> &'static str {
 
 /// Matrix kernels: params, weight codes, weight scales, input, output, bias.
 const MATMUL_BINDINGS: &str = r#"
-struct P { K: u32, N: u32, out_stride: u32, out_offset: u32, mode: u32, has_bias: u32, x_offset: u32, pad: u32 }
+struct P { K: u32, N: u32, out_stride: u32, out_offset: u32, mode: u32, has_bias: u32, x_offset: u32, x_stride: u32,
+           group_rows: u32, group_stride: u32, n_used: u32, slot0: u32, exp_rows: u32, map_offset: u32, w_offset: u32, pad1: u32 }
 @group(0) @binding(1) var<uniform> p: P;
+// Input offset of output row `r` (of this shard): rows in groups read their own slice of x.
+fn xbase(r: u32) -> u32 {
+    if (p.group_rows == 0u) { return p.x_offset; }
+    return p.x_offset + ((p.out_offset + r) / p.group_rows) * p.group_stride;
+}
 @group(0) @binding(2) var<storage, read> wcodes: array<u32>;
 @group(0) @binding(4) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> y: array<f32>;
@@ -285,7 +291,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let lane = li % LANES;
     var acc = 0.0;
     if (row < p.N) {
-        let xb = p.x_offset >> 2u;
+        let xb = xbase(row) >> 2u;
         let chunks = p.K / CHUNK;
         for (var c = lane; c < chunks; c += LANES) {
             acc += chunk_dot(row, c, xb);
@@ -328,7 +334,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let wslot = (li >> 2u) * WS + (li & 3u) * 2u;
     for (var k0 = 0u; k0 < p.K; k0 += 32u) {
         var xv = vec4<f32>(0.0);
-        if (xt < T) { xv = x[((p.x_offset + xt * p.K + k0) >> 2u) + (li & 7u)]; }
+        if (xt < T) { xv = x[((xbase(row0) + xt * p.x_stride + k0) >> 2u) + (li & 7u)]; }
         xs[li] = xv;
         var w = W8(vec4<f32>(0.0), vec4<f32>(0.0));
         if (wr < p.N) { w = load8(wr, k0 + (li & 3u) * 8u); }
@@ -434,7 +440,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /// Rotary position embedding on queries (in place) and keys, then store keys
 /// and values in the f16 cache at their positions.
 pub const ROPE: &str = r#"
-struct P { n_head: u32, n_kv: u32, head_dim: u32, half_rot: u32, neox: u32, kv_dim: u32, q_dim: u32, pad: u32 }
+struct P { n_head: u32, n_kv: u32, head_dim: u32, half_rot: u32, neox: u32, kv_dim: u32, q_dim: u32, rot_offset: u32 }
 @group(0) @binding(1) var<uniform> p: P;
 @group(0) @binding(2) var<storage, read_write> q: array<f32>;
 @group(0) @binding(3) var<storage, read> k: array<f32>;
@@ -467,7 +473,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let cs_base = pos * p.half_rot;
     let hd = p.head_dim;
     if (wg.x < p.n_head) {
-        let base = t * p.q_dim + wg.x * hd;
+        let base = t * p.q_dim + wg.x * hd + p.rot_offset;
         for (var i = li; i < p.half_rot; i += 64u) {
             let cs = table[cs_base + i];
             var a = base + 2u * i;
@@ -582,4 +588,392 @@ pub fn rope() -> String {
 
 pub fn attention() -> String {
     format!("{COMMON}{ATTENTION}")
+}
+
+/// Expert matrices: the input and output of one (token, chosen expert) pair per workgroup row.
+fn id_bindings(fmt: GpuFormat) -> String {
+    let base = match fmt {
+        GpuFormat::Block(_) => MATMUL_BINDINGS.to_string()
+            + binding3(fmt)
+            + "@group(0) @binding(7) var<storage, read> wv4: array<vec4<u32>>;\n",
+        _ => MATMUL_BINDINGS.replace(
+            "var<storage, read> wcodes: array<u32>;",
+            "var<storage, read> wc4: array<vec4<u32>>;",
+        ) + binding3(fmt),
+    };
+    base.replace(
+        "@group(0) @binding(6) var<storage, read> bias: array<f32>;",
+        "// Chosen experts per (token, slot), then their weights as f32 bits from `w_offset`.\n@group(0) @binding(6) var<storage, read> route: array<u32>;\n// Expert to resident slot, or 0xffffffff when the expert is not on the GPU.\n@group(0) @binding(8) var<storage, read> emap: array<u32>;",
+    )
+    .replace("    if (p.has_bias == 1u) { v += bias[p.out_offset + r]; }\n", "")
+}
+
+/// Gate or up projection of chosen experts: one (token, expert) pair per workgroup column.
+pub fn gemv_id(fmt: GpuFormat, lanes: u32) -> String {
+    format!(
+        "{COMMON}{}{}\nconst LANES: u32 = {lanes}u;\nconst ROWS: u32 = {}u;\n{}",
+        id_bindings(fmt),
+        gemv_chunk(fmt),
+        256 / lanes,
+        r#"
+var<workgroup> red: array<f32, 256>;
+var<workgroup> wslot: u32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let pair = wg.y;
+    if (li == 0u) { wslot = emap[p.map_offset + route[pair]]; }
+    let slot = workgroupUniformLoad(&wslot);
+    let in_shard = slot != 0xffffffffu && slot >= p.slot0 && slot < p.slot0 + p.N / p.exp_rows;
+    let row = wg.x * ROWS + li / LANES;
+    let lane = li % LANES;
+    var acc = 0.0;
+    if (in_shard && row < p.exp_rows) {
+        let wrow = (slot - p.slot0) * p.exp_rows + row;
+        let xb = (p.x_offset + (pair / p.n_used) * p.x_stride) >> 2u;
+        for (var c = lane; c < p.K / CHUNK; c += LANES) { acc += chunk_dot(wrow, c, xb); }
+    }
+    red[li] = acc;
+    workgroupBarrier();
+    for (var s = LANES / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) { red[li] += red[li + s]; }
+        workgroupBarrier();
+    }
+    if (in_shard && lane == 0u && row < p.exp_rows) {
+        let i = pair * p.out_stride + row;
+        if (p.mode == 0u) { y[i] = red[li]; } else { let g = y[i]; y[i] = g / (1.0 + exp(-g)) * red[li]; }
+    }
+}
+"#
+    )
+}
+
+/// Down projection of chosen experts, weighted and summed into the residual of each token.
+pub fn gemv_id_down(fmt: GpuFormat, lanes: u32) -> String {
+    format!(
+        "{COMMON}{}{}\nconst LANES: u32 = {lanes}u;\nconst ROWS: u32 = {}u;\n{}",
+        id_bindings(fmt),
+        gemv_chunk(fmt),
+        256 / lanes,
+        r#"
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.y;
+    let row = wg.x * ROWS + li / LANES;
+    let lane = li % LANES;
+    let per_shard = p.N / p.exp_rows;
+    var acc = 0.0;
+    for (var s = 0u; s < p.n_used; s++) {
+        let pair = t * p.n_used + s;
+        let slot = emap[p.map_offset + route[pair]];
+        if (slot != 0xffffffffu && slot >= p.slot0 && slot < p.slot0 + per_shard && row < p.exp_rows) {
+            let wrow = (slot - p.slot0) * p.exp_rows + row;
+            let xb = (p.x_offset + pair * p.x_stride) >> 2u;
+            var d = 0.0;
+            for (var c = lane; c < p.K / CHUNK; c += LANES) { d += chunk_dot(wrow, c, xb); }
+            acc += bitcast<f32>(route[p.w_offset + pair]) * d;
+        }
+    }
+    red[li] = acc;
+    workgroupBarrier();
+    for (var s = LANES / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) { red[li] += red[li + s]; }
+        workgroupBarrier();
+    }
+    if (lane == 0u && row < p.exp_rows) {
+        let i = t * p.out_stride + p.out_offset + row;
+        y[i] = y[i] + red[li];
+    }
+}
+"#
+    )
+}
+
+/// Expert routing per token: probabilities, optional group limit, top-k and weights.
+pub const TOPK: &str = r#"
+struct P { n_expert: u32, n_used: u32, gating: u32, norm: u32, scale: f32, has_bias: u32, n_group: u32, n_group_used: u32,
+           w_offset: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> logits: array<f32>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> route: array<u32>;
+
+const NEG: f32 = -3.4e38;
+var<workgroup> pr: array<f32, 1024>;
+var<workgroup> sel: array<f32, 1024>;
+var<workgroup> rv: array<f32, 256>;
+var<workgroup> ri: array<u32, 256>;
+var<workgroup> gsum: array<f32, 64>;
+var<workgroup> gkeep: array<u32, 64>;
+var<workgroup> chosen: array<u32, 32>;
+var<workgroup> cw: array<f32, 32>;
+
+fn reduce_max(li: u32) {
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (li < s) { rv[li] = max(rv[li], rv[li + s]); }
+        workgroupBarrier();
+    }
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.x;
+    let n = p.n_expert;
+    var mx = NEG;
+    for (var i = li; i < n; i += 256u) { let v = logits[t * n + i]; pr[i] = v; mx = max(mx, v); }
+    if (p.gating == 0u) {
+        rv[li] = mx;
+        workgroupBarrier();
+        reduce_max(li);
+        let m = rv[0];
+        workgroupBarrier();
+        var sm = 0.0;
+        for (var i = li; i < n; i += 256u) { let e = exp(pr[i] - m); pr[i] = e; sm += e; }
+        rv[li] = sm;
+        workgroupBarrier();
+        for (var s = 128u; s > 0u; s >>= 1u) {
+            if (li < s) { rv[li] += rv[li + s]; }
+            workgroupBarrier();
+        }
+        let total = rv[0];
+        for (var i = li; i < n; i += 256u) { pr[i] = pr[i] / total; }
+    } else {
+        for (var i = li; i < n; i += 256u) { pr[i] = 1.0 / (1.0 + exp(-pr[i])); }
+    }
+    workgroupBarrier();
+    for (var i = li; i < n; i += 256u) {
+        var v = pr[i];
+        if (p.has_bias == 1u) { v += bias[i]; }
+        sel[i] = v;
+    }
+    workgroupBarrier();
+    if (p.n_group > 1u) {
+        // Each group scores the sum of its two best experts; only the best groups stay.
+        let per = n / p.n_group;
+        if (li < p.n_group) {
+            var a = NEG;
+            var b = NEG;
+            for (var i = 0u; i < per; i++) {
+                let v = sel[li * per + i];
+                if (v > a) { b = a; a = v; } else if (v > b) { b = v; }
+            }
+            gsum[li] = a + b;
+            gkeep[li] = 0u;
+        }
+        workgroupBarrier();
+        if (li == 0u) {
+            for (var k = 0u; k < p.n_group_used; k++) {
+                var best = NEG;
+                var bi = 0u;
+                for (var g = 0u; g < p.n_group; g++) {
+                    if (gkeep[g] == 0u && gsum[g] > best) { best = gsum[g]; bi = g; }
+                }
+                gkeep[bi] = 1u;
+            }
+        }
+        workgroupBarrier();
+        for (var i = li; i < n; i += 256u) {
+            if (gkeep[i / per] == 0u) { sel[i] = NEG; }
+        }
+        workgroupBarrier();
+    }
+    for (var k = 0u; k < p.n_used; k++) {
+        var bv = NEG;
+        var bi = 0xffffffffu;
+        for (var i = li; i < n; i += 256u) {
+            if (sel[i] > bv) { bv = sel[i]; bi = i; }
+        }
+        rv[li] = bv;
+        ri[li] = bi;
+        workgroupBarrier();
+        for (var s = 128u; s > 0u; s >>= 1u) {
+            if (li < s) {
+                let ov = rv[li + s];
+                let oi = ri[li + s];
+                if (ov > rv[li] || (ov == rv[li] && oi < ri[li])) { rv[li] = ov; ri[li] = oi; }
+            }
+            workgroupBarrier();
+        }
+        if (li == 0u) {
+            let w = ri[0];
+            chosen[k] = w;
+            cw[k] = pr[w];
+            sel[w] = NEG;
+        }
+        workgroupBarrier();
+    }
+    if (li == 0u) {
+        var sum = 0.0;
+        for (var k = 0u; k < p.n_used; k++) { sum += cw[k]; }
+        var div = 1.0;
+        if (p.norm == 1u) { div = max(sum, 6.103515625e-5); }
+        for (var k = 0u; k < p.n_used; k++) {
+            route[t * p.n_used + k] = chosen[k];
+            route[p.w_offset + t * p.n_used + k] = bitcast<u32>(cw[k] / div * p.scale);
+        }
+    }
+}
+"#;
+
+/// MLA: normalise the latent half of `kv_a`, rotate its key half, and store both in the f16 cache.
+pub const MLA_STORE: &str = r#"
+struct P { lat: u32, rope: u32, cdim: u32, neox: u32, eps: f32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> kva: array<f32>;
+@group(0) @binding(3) var<storage, read> w: array<f32>;
+@group(0) @binding(4) var<storage, read> table: array<vec2<f32>>;
+@group(0) @binding(5) var<storage, read_write> cache: array<u32>;
+var<workgroup> red: array<f32, 256>;
+
+fn rot(base: u32, d: u32, csb: u32) -> f32 {
+    let x = kva[base + d];
+    let h = p.rope / 2u;
+    if (p.neox == 1u) {
+        if (d < h) { let cs = table[csb + d]; return x * cs.x - kva[base + d + h] * cs.y; }
+        let cs = table[csb + d - h];
+        return kva[base + d - h] * cs.y + x * cs.x;
+    }
+    let cs = table[csb + d / 2u];
+    if ((d & 1u) == 0u) { return x * cs.x - kva[base + d + 1u] * cs.y; }
+    return kva[base + d - 1u] * cs.y + x * cs.x;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.x;
+    let pos = step.pos0 + t;
+    let base = t * p.cdim;
+    var s = 0.0;
+    for (var i = li; i < p.lat; i += 256u) { let v = kva[base + i]; s += v * v; }
+    red[li] = s;
+    workgroupBarrier();
+    for (var k = 128u; k > 0u; k >>= 1u) {
+        if (li < k) { red[li] += red[li + k]; }
+        workgroupBarrier();
+    }
+    let scale = inverseSqrt(red[0] / f32(p.lat) + p.eps);
+    let cb = pos * (p.cdim / 2u);
+    for (var e = li; e < p.lat / 2u; e += 256u) {
+        let d = 2u * e;
+        cache[cb + e] = pack2x16float(vec2<f32>(kva[base + d] * scale * w[d], kva[base + d + 1u] * scale * w[d + 1u]));
+    }
+    let csb = pos * (p.rope / 2u);
+    for (var e = li; e < p.rope / 2u; e += 256u) {
+        let d = 2u * e;
+        cache[cb + p.lat / 2u + e] = pack2x16float(vec2<f32>(rot(base + p.lat, d, csb), rot(base + p.lat, d + 1u, csb)));
+    }
+}
+"#;
+
+/// MLA attention: several query heads per workgroup share each read of the latent cache.
+/// Scores use [absorbed query | rotated query] against [latent | rotated key]; values are the latent.
+pub const MLA_ATTENTION: &str = r#"
+struct P { n_head: u32, lat: u32, rope: u32, qstride: u32, qrope: u32, cdim: u32, scale: f32, heads: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> qlat: array<f32>;
+@group(0) @binding(3) var<storage, read> q: array<f32>;
+@group(0) @binding(4) var<storage, read> cache: array<u32>;
+@group(0) @binding(5) var<storage, read_write> o: array<f32>;
+
+const HM: u32 = 4u;
+const NEG: f32 = -3.4e38;
+var<workgroup> qs: array<f32, 2304>;
+var<workgroup> pr: array<f32, 1024>;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.y;
+    let h0 = wg.x * p.heads;
+    let D = p.cdim;
+    let L = p.lat;
+    for (var i = li; i < p.heads * D; i += 256u) {
+        let h = h0 + i / D;
+        let d = i % D;
+        if (d < L) { qs[i] = qlat[(t * p.n_head + h) * L + d]; }
+        else { qs[i] = q[(t * p.n_head + h) * p.qstride + p.qrope + d - L]; }
+    }
+    workgroupBarrier();
+    let n_keys = step.pos0 + t + 1u;
+    let nd = (L + 255u) / 256u;
+    var m = array<f32, 4>(NEG, NEG, NEG, NEG);
+    var l = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+    var acc: array<f32, 16>;
+    for (var i = 0u; i < 16u; i++) { acc[i] = 0.0; }
+    for (var j0 = 0u; j0 < n_keys; j0 += 256u) {
+        let j = j0 + li;
+        var sc = array<f32, 4>(NEG, NEG, NEG, NEG);
+        if (j < n_keys) {
+            let kb = j * (D / 2u);
+            var dv = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+            for (var e = 0u; e < D / 2u; e++) {
+                let kk = unpack2x16float(cache[kb + e]);
+                for (var h = 0u; h < HM; h++) {
+                    if (h < p.heads) { dv[h] += qs[h * D + 2u * e] * kk.x + qs[h * D + 2u * e + 1u] * kk.y; }
+                }
+            }
+            for (var h = 0u; h < HM; h++) { sc[h] = dv[h] * p.scale; }
+        }
+        for (var h = 0u; h < HM; h++) {
+            if (h >= p.heads) { break; }
+            red[li] = sc[h];
+            workgroupBarrier();
+            for (var r = 128u; r > 0u; r >>= 1u) {
+                if (li < r) { red[li] = max(red[li], red[li + r]); }
+                workgroupBarrier();
+            }
+            let m_new = max(m[h], red[0]);
+            workgroupBarrier();
+            var pj = 0.0;
+            if (j < n_keys) { pj = exp(sc[h] - m_new); }
+            pr[li * HM + h] = pj;
+            red[li] = pj;
+            workgroupBarrier();
+            for (var r = 128u; r > 0u; r >>= 1u) {
+                if (li < r) { red[li] += red[li + r]; }
+                workgroupBarrier();
+            }
+            let corr = exp(m[h] - m_new);
+            l[h] = l[h] * corr + red[0];
+            for (var qd = 0u; qd < 4u; qd++) { acc[h * 4u + qd] *= corr; }
+            m[h] = m_new;
+            workgroupBarrier();
+        }
+        let nk = min(256u, n_keys - j0);
+        for (var jj = 0u; jj < nk; jj++) {
+            let vb = (j0 + jj) * (D / 2u);
+            for (var qd = 0u; qd < nd; qd++) {
+                let d = li + 256u * qd;
+                if (d < L) {
+                    let pair = unpack2x16float(cache[vb + d / 2u]);
+                    let v = select(pair.x, pair.y, (d & 1u) == 1u);
+                    for (var h = 0u; h < HM; h++) {
+                        if (h < p.heads) { acc[h * 4u + qd] += pr[jj * HM + h] * v; }
+                    }
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+    for (var h = 0u; h < p.heads; h++) {
+        for (var qd = 0u; qd < nd; qd++) {
+            let d = li + 256u * qd;
+            if (d < L) { o[(t * p.n_head + h0 + h) * L + d] = acc[h * 4u + qd] / l[h]; }
+        }
+    }
+}
+"#;
+
+pub fn topk() -> String {
+    format!("{COMMON}{TOPK}")
+}
+
+pub fn mla_store() -> String {
+    format!("{COMMON}{MLA_STORE}")
+}
+
+pub fn mla_attention() -> String {
+    format!("{COMMON}{MLA_ATTENTION}")
 }
