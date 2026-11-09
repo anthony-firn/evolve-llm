@@ -2,7 +2,8 @@
 
 use crate::chat::{Message, Options};
 use crate::gguf::{self, ParseError};
-use crate::gpu::{self, engine::Engine};
+use crate::gpu::{self, engine::{Engine, Options as EngineOptions}};
+use crate::source::WeightSource;
 use crate::model;
 use crate::quant;
 use crate::sampler::SamplerConfig;
@@ -39,12 +40,19 @@ struct Inspection {
     need: Option<u64>,
     error: Option<String>,
     model: Option<ModelInfo>,
+    /// Parts of a split model; the other parts' headers are needed before it can be described.
+    split: Option<usize>,
 }
 
 #[derive(Serialize)]
 struct ModelInfo {
     config: model::Config,
     parameters: u64,
+    /// Parameters each token uses (fewer than `parameters` for mixture-of-experts models).
+    active_parameters: u64,
+    /// GPU bytes when every weight is resident, in the fast and in the file-sized layout.
+    fast_bytes: u64,
+    compact_bytes: u64,
     weight_types: BTreeMap<String, u64>,
     gpu_weight_bytes: u64,
     file_bytes: u64,
@@ -71,10 +79,19 @@ fn describe(g: &gguf::Gguf) -> Result<ModelInfo, String> {
             .bytes(k, rows);
         file_bytes += quant::row_bytes(t.ggml_type, k)? as u64 * rows as u64;
     }
+    let mut compact_bytes = 0;
+    for (name, rows, k, experts) in model::matrices(&config) {
+        let t = g.tensor(&name).unwrap();
+        compact_bytes += quant::GpuFormat::choose(t.ggml_type, quant::Layout::Compact)
+            .unwrap()
+            .bytes(k, rows * experts);
+    }
     for (_, len) in model::vectors(&config) {
         parameters += len as u64;
         gpu_weight_bytes += len as u64 * 4;
+        compact_bytes += len as u64 * 4;
     }
+    let active_parameters = config.parameters().1;
     let tokenizer = g
         .str("tokenizer.ggml.model")
         .unwrap_or("unknown")
@@ -85,6 +102,9 @@ fn describe(g: &gguf::Gguf) -> Result<ModelInfo, String> {
     Ok(ModelInfo {
         config,
         parameters,
+        active_parameters,
+        fast_bytes: gpu_weight_bytes,
+        compact_bytes,
         weight_types,
         gpu_weight_bytes,
         file_bytes,
@@ -94,43 +114,83 @@ fn describe(g: &gguf::Gguf) -> Result<ModelInfo, String> {
     })
 }
 
-/// Parse a file prefix. Returns `{need}` when more bytes are required,
-/// `{error}` when the model cannot run, otherwise `{model}`.
+fn inspection(r: Result<gguf::Gguf, ParseError>) -> Inspection {
+    let none = Inspection {
+        need: None,
+        error: None,
+        model: None,
+        split: None,
+    };
+    match r {
+        Err(ParseError::NeedMore(n)) => Inspection { need: Some(n), ..none },
+        Err(e) => Inspection { error: Some(e.to_string()), ..none },
+        Ok(g) => match describe(&g) {
+            Ok(m) => Inspection { model: Some(m), ..none },
+            Err(e) => Inspection { error: Some(e), ..none },
+        },
+    }
+}
+
+/// Parse a file prefix. Returns `{need}` when more bytes are required, `{split}` for the first
+/// part of a split model, `{error}` when the model cannot run, otherwise `{model}`.
 #[wasm_bindgen]
 pub fn inspect(header: &[u8]) -> String {
-    let r = match gguf::parse(header) {
-        Err(ParseError::NeedMore(n)) => Inspection {
-            need: Some(n),
+    match gguf::parse(header) {
+        Ok(g) if g.split_count() > 1 => json(&Inspection {
+            need: None,
             error: None,
             model: None,
-        },
-        Err(e) => Inspection {
-            need: None,
-            error: Some(e.to_string()),
-            model: None,
-        },
-        Ok(g) => match describe(&g) {
-            Ok(m) => Inspection {
-                need: None,
-                error: None,
-                model: Some(m),
-            },
-            Err(e) => Inspection {
-                need: None,
-                error: Some(e),
-                model: None,
-            },
-        },
-    };
-    json(&r)
+            split: Some(g.split_count()),
+        }),
+        r => json(&inspection(r)),
+    }
+}
+
+fn merged(headers: &js_sys::Array) -> Result<gguf::Gguf, String> {
+    let parts = headers
+        .iter()
+        .map(|h| gguf::parse(&js_sys::Uint8Array::new(&h).to_vec()).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    gguf::Gguf::merge(parts)
+}
+
+/// Describe a split model from the headers of all its parts, in order.
+#[wasm_bindgen]
+pub fn inspect_parts(headers: js_sys::Array) -> String {
+    json(&inspection(merged(&headers).map_err(ParseError::Invalid)))
 }
 
 /// Estimated GPU bytes for activations and the KV cache at a context length.
 #[wasm_bindgen]
-pub fn state_bytes(header: &[u8], ctx: u32) -> Result<f64, JsValue> {
-    let g = gguf::parse(header).map_err(err)?;
+pub fn state_bytes(headers: js_sys::Array, ctx: u32) -> Result<f64, JsValue> {
+    let g = merged(&headers).map_err(err)?;
     let cfg = model::config(&g).map_err(err)?;
     Ok(Engine::state_bytes(&cfg, ctx as usize) as f64)
+}
+
+/// Reads weights through a synchronous JavaScript function `(file, offset, target)` that fills
+/// `target` (a view of WebAssembly memory) from an OPFS access handle or a `File`.
+struct JsSource(js_sys::Function);
+
+impl WeightSource for JsSource {
+    fn read(&self, file: usize, offset: u64, len: usize) -> Result<Vec<u8>, String> {
+        let mut buf = vec![0u8; len];
+        // The view stays valid because the callback does not call back into WebAssembly.
+        let view = unsafe { js_sys::Uint8Array::view_mut_raw(buf.as_mut_ptr(), len) };
+        self.0
+            .call3(&JsValue::NULL, &JsValue::from(file as f64), &JsValue::from(offset as f64), &view)
+            .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))?;
+        Ok(buf)
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LoadOptions {
+    #[serde(default)]
+    low_power: bool,
+    /// GPU bytes for weights; larger models stream the rest from storage.
+    #[serde(default)]
+    budget: Option<f64>,
 }
 
 #[wasm_bindgen]
@@ -139,21 +199,46 @@ pub struct Loader {
     header: gguf::Gguf,
 }
 
-/// Open the GPU and allocate weight buffers for the model whose header is given.
+/// Open the GPU and allocate weight buffers for the model whose headers are given (one per file
+/// of a split model). When the GPU runs out of memory, retries keeping less of the model on it.
 #[wasm_bindgen]
-pub async fn create_loader(header: Vec<u8>, low_power: bool) -> Result<Loader, JsValue> {
-    let g = gguf::parse(&header).map_err(err)?;
-    let preference = if low_power {
+pub async fn create_loader(headers: js_sys::Array, options: String) -> Result<Loader, JsValue> {
+    let g = merged(&headers).map_err(err)?;
+    let o: LoadOptions = serde_json::from_str(&options).unwrap_or_default();
+    let preference = if o.low_power {
         wgpu::PowerPreference::LowPower
     } else {
         wgpu::PowerPreference::HighPerformance
     };
-    let gpu = gpu::init_with(preference).await.map_err(err)?;
-    let engine = Engine::new(gpu, &g).map_err(err)?;
-    Ok(Loader {
-        engine: Some(engine),
-        header: g,
-    })
+    let mut gpu = gpu::init_with(preference).await.map_err(err)?;
+    let mut budget = o.budget.map(|b| b as u64);
+    for _ in 0..6 {
+        let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let opts = EngineOptions {
+            binding_limit: None,
+            layout: crate::quant::Layout::Fast,
+            budget,
+        };
+        let engine = Engine::with_options(gpu, &g, opts).map_err(err)?;
+        match scope.pop().await {
+            None => {
+                return Ok(Loader {
+                    engine: Some(engine),
+                    header: g,
+                })
+            }
+            Some(_) => {
+                // Give the memory back, then try again with 60% of what was asked for.
+                let tried = engine.weight_bytes;
+                gpu = engine.into_gpu();
+                budget = Some((tried as f64 * 0.6) as u64);
+                if budget.unwrap() < 64 << 20 {
+                    break;
+                }
+            }
+        }
+    }
+    Err(err("the GPU ran out of memory even for a small part of this model"))
 }
 
 #[wasm_bindgen]
@@ -165,6 +250,16 @@ impl Loader {
 
     pub fn device(&self) -> String {
         json(&self.engine.as_ref().unwrap().gpu.info)
+    }
+
+    /// Which weights stay on the GPU and which are read while the model runs, as JSON.
+    pub fn placement(&self) -> String {
+        json(&self.engine.as_ref().unwrap().placement)
+    }
+
+    /// The reader for weights that are not resident.
+    pub fn set_source(&self, read: js_sys::Function) {
+        self.engine.as_ref().unwrap().set_source(Box::new(JsSource(read)));
     }
 
     pub fn upload(&mut self, name: &str, row0: u32, bytes: &[u8]) -> Result<(), JsValue> {
@@ -202,6 +297,7 @@ struct ChatInfo<'a> {
     template_from_model: bool,
     end_tokens: Vec<u32>,
     device: &'a gpu::DeviceInfo,
+    placement: &'a crate::gpu::engine::Placement,
 }
 
 fn parse_messages(messages: &str, options: &str) -> Result<(Vec<Message>, Options), JsValue> {
@@ -226,7 +322,13 @@ impl Chat {
             template_from_model: s.template.from_model,
             end_tokens: s.tok.end_tokens(),
             device: &s.engine.gpu.info,
+            placement: &s.engine.placement,
         })
+    }
+
+    /// Streaming counters since the last call, as JSON.
+    pub fn stats(&self) -> String {
+        json(&self.inner.borrow().engine.take_stream_stats())
     }
 
     /// The formatted prompt text for a conversation.

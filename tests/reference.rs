@@ -21,6 +21,13 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
 }
 
+fn try_fixture(name: &str) -> Option<Value> {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    std::fs::read_to_string(p).ok().map(|t| serde_json::from_str(&t).unwrap())
+}
+
 fn b64(s: &str) -> Vec<u8> {
     let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::new();
@@ -99,11 +106,16 @@ fn model_path(file: &str) -> Option<PathBuf> {
 }
 
 const MODELS: &[&str] = &["stories15m", "smollm2", "qwen25", "qwen3", "llama32"];
+/// Models checked from their GGUF header alone (tools/make_header_fixtures.py): tokenizer and
+/// chat template, for models far too large to download for tests.
+const HEADERS: &[&str] = &["header-deepseek31", "header-kimik2"];
 
 #[test]
 fn tokenizers_match_hugging_face() {
-    for key in MODELS {
-        let fx = fixture(&format!("{key}.json"));
+    for key in MODELS.iter().chain(HEADERS) {
+        let Some(fx) = try_fixture(&format!("{key}.json")) else {
+            continue;
+        };
         let Some(path) = model_path(fx["file"].as_str().unwrap()) else {
             continue;
         };
@@ -130,8 +142,10 @@ fn tokenizers_match_hugging_face() {
 
 #[test]
 fn chat_templates_match_transformers() {
-    for key in MODELS {
-        let fx = fixture(&format!("{key}.json"));
+    for key in MODELS.iter().chain(HEADERS) {
+        let Some(fx) = try_fixture(&format!("{key}.json")) else {
+            continue;
+        };
         let Some(chats) = fx.get("chat").and_then(Value::as_array) else {
             continue;
         };

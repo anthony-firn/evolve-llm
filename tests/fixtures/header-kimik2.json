@@ -1,0 +1,321 @@
+{
+ "file": "header-kimik2.gguf",
+ "tokenizer": [
+  {
+   "text": "Hello world",
+   "ids": [
+    19180,
+    2695
+   ]
+  },
+  {
+   "text": "  leading spaces and trailing   ",
+   "ids": [
+    220,
+    8134,
+    14803,
+    316,
+    42711,
+    274
+   ]
+  },
+  {
+   "text": "The year 2026 had 365 days; 1234567 is a number.",
+   "ids": [
+    1008,
+    1389,
+    220,
+    2975,
+    21,
+    1688,
+    220,
+    17541,
+    3997,
+    26,
+    220,
+    6694,
+    12972,
+    22,
+    387,
+    261,
+    2343,
+    13
+   ]
+  },
+  {
+   "text": "naïve café, résumé — “quotes” and ‘apostrophes’",
+   "ids": [
+    4768,
+    44187,
+    367,
+    70591,
+    11,
+    23606,
+    7671,
+    1941,
+    4275,
+    1674,
+    136300,
+    1207,
+    316,
+    4286,
+    447,
+    703,
+    3234,
+    2336,
+    553
+   ]
+  },
+  {
+   "text": "I'm, you're, they've, we'll, she'd, IT'S, I'D",
+   "ids": [
+    17172,
+    11,
+    8645,
+    11,
+    51329,
+    11,
+    20944,
+    11,
+    144869,
+    11,
+    9752,
+    34480,
+    11,
+    4154,
+    35
+   ]
+  },
+  {
+   "text": "日本語のテキストと中文混合",
+   "ids": [
+    4546,
+    63011,
+    4663,
+    25875,
+    32045,
+    33360,
+    9219,
+    16717,
+    13935
+   ]
+  },
+  {
+   "text": "emoji 🚀🔥 and 👩‍👩‍👧‍👦 family",
+   "ids": [
+    33120,
+    17137,
+    40101,
+    66957,
+    98,
+    316,
+    130732,
+    102,
+    67963,
+    64390,
+    102,
+    67963,
+    64390,
+    100,
+    67963,
+    64390,
+    99,
+    3545
+   ]
+  },
+  {
+   "text": "def f(x):\n    return x**2  # comment\n\n\n\tTabbed",
+   "ids": [
+    1166,
+    285,
+    3940,
+    2360,
+    274,
+    745,
+    1288,
+    381,
+    17,
+    220,
+    1214,
+    8018,
+    3898,
+    197,
+    11855,
+    6343
+   ]
+  },
+  {
+   "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    27,
+    91,
+    348,
+    9485,
+    91,
+    29,
+    2482,
+    198,
+    9663,
+    163586,
+    198,
+    27,
+    91,
+    348,
+    9485,
+    91,
+    29,
+    69702,
+    198
+   ]
+  },
+  {
+   "text": "é decomposed accent and Å vs Å",
+   "ids": [
+    68,
+    37484,
+    511,
+    136252,
+    38309,
+    316,
+    133480,
+    12583,
+    401,
+    136,
+    232
+   ]
+  },
+  {
+   "text": "multiple\n\n\nnewlines\r\nand CRLF",
+   "ids": [
+    59967,
+    3898,
+    3514,
+    11541,
+    462,
+    516,
+    116292,
+    37
+   ]
+  },
+  {
+   "text": "   ",
+   "ids": [
+    274
+   ]
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "ids": [
+    101908,
+    101908,
+    101908,
+    101908,
+    101908,
+    101908,
+    101908,
+    36324,
+    45421
+   ]
+  },
+  {
+   "text": "http://example.com/path?query=1&b=2#frag",
+   "ids": [
+    3531,
+    1316,
+    17480,
+    1304,
+    73505,
+    30,
+    4964,
+    28,
+    16,
+    5,
+    65,
+    28,
+    17,
+    2,
+    53846
+   ]
+  },
+  {
+   "text": "Ünïcödé ÀÉÎÕÜ ß ǅ",
+   "ids": [
+    89743,
+    77,
+    44187,
+    66,
+    5954,
+    67,
+    1941,
+    118367,
+    39983,
+    117933,
+    127,
+    243,
+    89743,
+    3648,
+    253,
+    220,
+    131,
+    227
+   ]
+  },
+  {
+   "text": "123 4567 89012 3.14159 1,000,000",
+   "ids": [
+    6694,
+    220,
+    12972,
+    22,
+    220,
+    33208,
+    1042,
+    220,
+    18,
+    13,
+    18702,
+    6276,
+    220,
+    16,
+    11,
+    1476,
+    11,
+    1476
+   ]
+  },
+  {
+   "text": "",
+   "ids": []
+  }
+ ],
+ "chat": [
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a concise assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is WebGPU?"
+    },
+    {
+     "role": "assistant",
+     "content": "A browser API for GPU graphics and compute."
+    },
+    {
+     "role": "user",
+     "content": "Can it run language models?"
+    }
+   ],
+   "options": {
+    "date": [
+     2026,
+     11,
+     8
+    ]
+   },
+   "text": "<|im_system|>system<|im_middle|>\nYou are a concise assistant.<|im_end|><|im_user|>user<|im_middle|>What is WebGPU?<|im_end|><|im_assistant|>assistant<|im_middle|>A browser API for GPU graphics and compute.<|im_end|><|im_user|>user<|im_middle|>Can it run language models?<|im_end|><|im_assistant|>assistant<|im_middle|>"
+  }
+ ]
+}

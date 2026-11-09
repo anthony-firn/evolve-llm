@@ -1,5 +1,5 @@
 // Runs the WebAssembly engine off the main thread: downloads, GPU upload and generation.
-import init, { create_loader, inspect } from './pkg/evolve_llm.js';
+import init, { create_loader, inspect, inspect_parts } from './pkg/evolve_llm.js';
 import { formatBytes } from './models.js';
 
 const CHUNK = 16 << 20; // bytes read from the file per upload call
@@ -7,6 +7,9 @@ const post = (type, data = {}) => self.postMessage({ type, ...data });
 
 let wasm = null;
 let chat = null;
+// Synchronous readers of the loaded model's files, kept open while it runs: weights that do not
+// fit on the GPU are read again from them.
+let readers = [];
 let stopRequested = false;
 let cancelLoad = false;
 let downloadAbort = null;
@@ -72,6 +75,15 @@ async function readMeta(dir, key) {
   try { return text ? JSON.parse(text) : null; } catch { return null; }
 }
 
+// File name of part `i` of a model in storage: single files keep `${key}.gguf`.
+function partName(key, i, count) {
+  return count > 1 ? `${key}.p${i + 1}.gguf` : `${key}.gguf`;
+}
+
+async function storedSize(dir, name) {
+  try { return (await (await dir.getFileHandle(name)).getFile()).size; } catch { return 0; }
+}
+
 async function listCached() {
   if (!navigator.storage?.getDirectory) return { models: [], supported: false };
   const dir = await modelsDir();
@@ -81,8 +93,9 @@ async function listCached() {
     const key = name.slice(0, -5);
     const meta = await readMeta(dir, key);
     if (!meta) continue;
+    const count = meta.parts?.length || 1;
     let size = 0;
-    try { size = (await (await dir.getFileHandle(`${key}.gguf`)).getFile()).size; } catch { /* missing data file */ }
+    for (let i = 0; i < count; i++) size += await storedSize(dir, partName(key, i, count));
     models.push({ ...meta, key, stored: size });
   }
   let estimate = null;
@@ -94,7 +107,11 @@ async function listCached() {
 
 async function removeCached(key) {
   const dir = await modelsDir();
-  for (const name of [`${key}.gguf`, `${key}.json`]) {
+  const meta = await readMeta(dir, key);
+  const count = meta?.parts?.length || 1;
+  const names = [`${key}.json`, `${key}.gguf`];
+  for (let i = 0; i < count; i++) names.push(partName(key, i, count));
+  for (const name of names) {
     try { await dir.removeEntry(name); } catch { /* already gone */ }
   }
 }
@@ -106,104 +123,187 @@ function httpError(status) {
   return `The download failed with HTTP ${status}.`;
 }
 
+// Download every part of a model into storage, resuming partial parts. Returns the part names.
 async function download(entry) {
   if (!navigator.storage?.getDirectory) throw new Error('This browser cannot store downloaded models. Open a GGUF file from your device instead.');
   const dir = await modelsDir();
-  const { key, url } = entry;
+  const { key } = entry;
+  const parts = entry.parts?.length ? entry.parts : [{ file: entry.file, url: entry.url, bytes: entry.bytes }];
+  const count = parts.length;
+  const names = parts.map((_, i) => partName(key, i, count));
   const meta = await readMeta(dir, key);
-  const handle = await dir.getFileHandle(`${key}.gguf`, { create: true });
-  let have = (await handle.getFile()).size;
-  if (meta?.complete && meta.url === url && have === meta.bytes) return handle.getFile();
-  if (!meta || meta.url !== url) have = 0;
-
+  const same = meta && meta.url === entry.url && (meta.parts?.length || 1) === count;
+  if (same && meta.complete) {
+    let ok = true;
+    for (let i = 0; i < count; i++) ok &&= (await storedSize(dir, names[i])) === (meta.parts?.[i]?.bytes ?? meta.bytes);
+    if (ok) return names;
+  }
+  const total = parts.reduce((t, p) => t + (p.bytes || 0), 0);
+  let have = 0;
+  for (let i = 0; i < count; i++) have += same ? await storedSize(dir, names[i]) : 0;
   const estimate = await navigator.storage.estimate().catch(() => null);
-  const need = Math.max(0, (entry.bytes || 0) - have);
-  if (estimate?.quota && need > estimate.quota - (estimate.usage || 0)) {
-    throw new Error(`This browser can store ${formatBytes(estimate.quota - (estimate.usage || 0))} more, and the model needs ${formatBytes(need)}. Remove a downloaded model or open the file from your device.`);
+  if (estimate?.quota && total - have > estimate.quota - (estimate.usage || 0)) {
+    throw new Error(`This browser can store ${formatBytes(estimate.quota - (estimate.usage || 0))} more, and the model needs ${formatBytes(total - have)}. Remove a downloaded model or open the files from your device.`);
   }
   try { await navigator.storage.persist?.(); } catch { /* best effort */ }
-
-  downloadAbort = new AbortController();
-  let res;
-  try {
-    res = await fetch(url, { headers: have > 0 ? { Range: `bytes=${have}-` } : {}, signal: downloadAbort.signal });
-  } catch (e) {
-    if (e?.name === 'AbortError') throw new Error('Download paused. Choose the model again to resume.');
-    throw new Error('Could not reach Hugging Face. Check your connection and try again.');
-  }
-  if (!res.ok) throw new Error(httpError(res.status));
-  let total;
-  if (res.status === 206) {
-    total = Number((res.headers.get('content-range') || '').split('/')[1]) || entry.bytes;
-  } else {
-    have = 0;
-    total = Number(res.headers.get('content-length')) || entry.bytes || 0;
-  }
-  const record = { url, repo: entry.repo, file: entry.file, revision: entry.revision, name: entry.name, bytes: total, complete: false, started: meta?.started || Date.now() };
+  const record = { url: entry.url, repo: entry.repo, file: entry.file, revision: entry.revision, name: entry.name, bytes: total,
+    parts: parts.map((p) => ({ file: p.file, bytes: p.bytes })), complete: false, started: meta?.started || Date.now() };
   await writeText(dir, `${key}.json`, JSON.stringify(record));
-  const access = await handle.createSyncAccessHandle();
-  let pos = have;
-  try {
-    if (have === 0) access.truncate(0);
-    const reader = res.body.getReader();
-    const t0 = performance.now();
-    let last = 0;
-    for (;;) {
-      let chunk;
-      try {
-        chunk = await reader.read();
-      } catch (e) {
-        if (e?.name === 'AbortError') throw new Error('Download paused. Choose the model again to resume.');
-        throw new Error('The connection dropped. Choose the model again to resume the download.');
-      }
-      if (chunk.done) break;
-      access.write(chunk.value, { at: pos });
-      pos += chunk.value.byteLength;
-      const now = performance.now();
-      if (now - last > 150) {
-        last = now;
-        post('progress', { phase: 'download', loaded: pos, total, rate: (pos - have) / Math.max(0.001, (now - t0) / 1000) });
-      }
+  const t0 = performance.now();
+  let done = have;
+  let last = 0;
+  for (let i = 0; i < count; i++) {
+    const part = parts[i];
+    const handle = await dir.getFileHandle(names[i], { create: true });
+    let pos = same ? (await handle.getFile()).size : 0;
+    if (part.bytes && pos === part.bytes) continue;
+    if (part.bytes && pos > part.bytes) pos = 0;
+    downloadAbort = new AbortController();
+    let res;
+    try {
+      res = await fetch(part.url, { headers: pos > 0 ? { Range: `bytes=${pos}-` } : {}, signal: downloadAbort.signal });
+    } catch (e) {
+      if (e?.name === 'AbortError') throw new Error('Download paused. Choose the model again to resume.');
+      throw new Error('Could not reach Hugging Face. Check your connection and try again.');
     }
-    access.flush();
-  } finally {
-    access.close();
-    downloadAbort = null;
+    if (!res.ok) throw new Error(httpError(res.status));
+    if (res.status !== 206) { done -= pos; pos = 0; }
+    const access = await handle.createSyncAccessHandle();
+    try {
+      if (pos === 0) access.truncate(0);
+      const reader = res.body.getReader();
+      for (;;) {
+        let chunk;
+        try {
+          chunk = await reader.read();
+        } catch (e) {
+          if (e?.name === 'AbortError') throw new Error('Download paused. Choose the model again to resume.');
+          throw new Error('The connection dropped. Choose the model again to resume the download.');
+        }
+        if (chunk.done) break;
+        access.write(chunk.value, { at: pos });
+        pos += chunk.value.byteLength;
+        done += chunk.value.byteLength;
+        const now = performance.now();
+        if (now - last > 150) {
+          last = now;
+          post('progress', { phase: 'download', loaded: done, total, part: i + 1, parts: count,
+            rate: (done - have) / Math.max(0.001, (now - t0) / 1000) });
+        }
+      }
+      access.flush();
+    } finally {
+      access.close();
+      downloadAbort = null;
+    }
+    if (part.bytes && pos !== part.bytes) throw new Error('The download ended early. Choose the model again to resume it.');
   }
-  if (total && pos !== total) throw new Error('The download ended early. Choose the model again to resume it.');
-  await writeText(dir, `${key}.json`, JSON.stringify({ ...record, bytes: pos, complete: true, saved: Date.now() }));
-  return (await dir.getFileHandle(`${key}.gguf`)).getFile();
+  await writeText(dir, `${key}.json`, JSON.stringify({ ...record, complete: true, saved: Date.now() }));
+  return names;
+}
+
+// ---- Reading model files ----
+
+// A synchronous random-access reader: an OPFS access handle for stored models, or
+// FileReaderSync for files opened from the device. Both fill a view of WebAssembly memory.
+async function openReaders(source) {
+  const out = [];
+  if (source.names) {
+    const dir = await modelsDir();
+    for (const name of source.names) {
+      const handle = await dir.getFileHandle(name);
+      let access;
+      try { access = await handle.createSyncAccessHandle({ mode: 'read-only' }); } catch { access = await handle.createSyncAccessHandle(); }
+      out.push({
+        size: access.getSize(),
+        read(offset, target) {
+          const n = access.read(target, { at: offset });
+          if (n !== target.length) throw new Error('The stored model is shorter than its header says.');
+        },
+        close() { access.close(); },
+      });
+    }
+  } else {
+    const sync = new FileReaderSync();
+    for (const file of source.files) {
+      out.push({
+        size: file.size,
+        read(offset, target) {
+          const buf = sync.readAsArrayBuffer(file.slice(offset, offset + target.length));
+          if (buf.byteLength !== target.length) throw new Error('The file is shorter than its header says. It may be incomplete.');
+          target.set(new Uint8Array(buf));
+        },
+        close() {},
+      });
+    }
+  }
+  return out;
+}
+
+function closeReaders() {
+  for (const r of readers) {
+    try { r.close(); } catch { /* already closed */ }
+  }
+  readers = [];
 }
 
 // ---- Loading onto the GPU ----
 
-async function readHeader(blob) {
-  let size = Math.min(blob.size, 8 << 20);
+function readBytes(reader, offset, length) {
+  const out = new Uint8Array(length);
+  reader.read(offset, out);
+  return out;
+}
+
+// The header of one file: read a growing prefix until it parses.
+function readHeader(reader) {
+  let size = Math.min(reader.size, 8 << 20);
   for (;;) {
-    const bytes = new Uint8Array(await blob.slice(0, size).arrayBuffer());
+    const bytes = readBytes(reader, 0, size);
     const result = JSON.parse(inspect(bytes));
     if (result.need) {
-      if (size >= blob.size) throw new Error('The file ends inside its header. It may be incomplete or damaged.');
-      size = Math.min(blob.size, Math.max(result.need, size * 2));
+      if (size >= reader.size) throw new Error('The file ends inside its header. It may be incomplete or damaged.');
+      size = Math.min(reader.size, Math.max(result.need, size * 2));
       continue;
     }
-    if (result.error) throw new Error(result.error);
-    return { bytes, model: result.model };
+    return { bytes, result };
   }
 }
 
-async function loadBlob(blob, wantCtx, lowPower) {
-  const { bytes, model } = await readHeader(blob);
+async function loadModel(source, wantCtx, lowPower, budgetPref) {
+  readers = await openReaders(source);
+  const first = readHeader(readers[0]);
+  if (first.result.error) throw new Error(first.result.error);
+  const headers = [first.bytes];
+  let model = first.result.model;
+  if (first.result.split) {
+    if (readers.length !== first.result.split) {
+      throw new Error(`This model is split into ${first.result.split} files. Open all ${first.result.split} parts together.`);
+    }
+    for (let i = 1; i < readers.length; i++) {
+      const h = readHeader(readers[i]);
+      if (h.result.error && !h.result.split) throw new Error(h.result.error);
+      headers.push(h.bytes);
+    }
+    const merged = JSON.parse(inspect_parts(headers));
+    if (merged.error) throw new Error(merged.error);
+    model = merged.model;
+  }
   post('inspected', { model });
   const ctx = Math.max(256, Math.min(wantCtx, model.config.ctx_train));
+  // Auto keeps models up to 4 GB fully on the GPU and streams the rest of larger ones.
+  const AUTO = 4 * 2 ** 30;
+  const budget = budgetPref === 'all' ? null
+    : budgetPref && budgetPref !== 'auto' ? Number(budgetPref) * 2 ** 30
+    : (model.fast_bytes > AUTO ? AUTO : null);
   let loader;
   try {
-    loader = await create_loader(bytes, lowPower);
+    loader = await create_loader(headers, JSON.stringify({ low_power: lowPower, budget }));
   } catch (e) {
     throw new Error(`Could not start the model on the GPU: ${e?.message || e}`);
   }
   try {
-    const plan = JSON.parse(loader.plan());
+    const plan = JSON.parse(loader.plan()).filter((p) => p.resident);
     const total = plan.reduce((sum, p) => sum + p.bytes, 0);
     let done = 0;
     let last = 0;
@@ -213,18 +313,20 @@ async function loadBlob(blob, wantCtx, lowPower) {
       for (let r = 0; r < p.rows; r += rows) {
         if (cancelLoad) throw new Error('Loading was cancelled.');
         const n = Math.min(rows, p.rows - r);
-        const start = p.offset + r * p.row_bytes;
-        const buf = await blob.slice(start, start + n * p.row_bytes).arrayBuffer();
-        if (buf.byteLength !== n * p.row_bytes) throw new Error('The file is shorter than its header says. It may be incomplete.');
-        loader.upload(p.name, r, new Uint8Array(buf));
-        done += buf.byteLength;
+        const bytes = readBytes(readers[p.file], p.offset + r * p.row_bytes, n * p.row_bytes);
+        loader.upload(p.name, r, bytes);
+        done += bytes.length;
         const now = performance.now();
         if (now - last > 100) {
           last = now;
           post('progress', { phase: 'upload', loaded: done, total, rate: done / Math.max(0.001, (now - t0) / 1000) });
+          // Let progress and cancel messages through.
+          await new Promise((r) => setTimeout(r, 0));
         }
       }
     }
+    const files = readers;
+    loader.set_source((file, offset, target) => files[file].read(offset, target));
     post('progress', { phase: 'prepare', loaded: total, total });
     chat = loader.finish(ctx);
   } finally {
@@ -238,6 +340,7 @@ function unload() {
     chat.free();
     chat = null;
   }
+  closeReaders();
 }
 
 // ---- Generation ----
@@ -279,7 +382,7 @@ async function generate({ messages, options, sampler, maxTokens }) {
   const tail = chat.flush();
   if (tail) post('token', { text: tail });
   const t2 = performance.now();
-  post('done', { reason, tokens: n, ms: t2 - t1, used: chat.context_used(), context: ctx });
+  post('done', { reason, tokens: n, ms: t2 - t1, used: chat.context_used(), context: ctx, stream: JSON.parse(chat.stats()) });
 }
 
 // ---- Messages from the page ----
@@ -294,19 +397,20 @@ const handlers = {
   async adapter({ gpu }) {
     post('adapter', { adapter: await describeAdapter(gpu) });
   },
-  async load({ source, ctx, gpu }) {
+  async load({ source, ctx, gpu, gpuMemory }) {
     cancelLoad = false;
     unload();
     await ensureWasm();
-    let blob;
+    let files;
     if (source.kind === 'file') {
-      blob = source.file;
+      files = { files: source.files || [source.file] };
     } else {
-      blob = await download(source);
+      files = { names: await download(source) };
       post('cache', await listCached().catch(() => ({ models: [], supported: false })));
     }
-    const result = await loadBlob(blob, ctx, gpu === 'low-power');
-    post('loaded', { ...result, source: source.kind === 'file' ? { kind: 'file', name: source.file.name } : { kind: 'hf', key: source.key, id: source.id } });
+    const result = await loadModel(files, ctx, gpu === 'low-power', gpuMemory);
+    const name = source.kind === 'file' ? (source.files || [source.file])[0].name : null;
+    post('loaded', { ...result, source: source.kind === 'file' ? { kind: 'file', name } : { kind: 'hf', key: source.key, id: source.id } });
   },
   async generate(msg) {
     await generate(msg);

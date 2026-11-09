@@ -1593,6 +1593,11 @@ impl Engine {
             .collect())
     }
 
+    /// Free the weights and hand back the GPU (to retry with a smaller budget).
+    pub fn into_gpu(self) -> Gpu {
+        self.gpu
+    }
+
     /// Where weights that are not resident are read from (required when `placement.streaming`).
     pub fn set_source(&self, source: Box<dyn WeightSource>) {
         *self.source.borrow_mut() = Some(source);
@@ -1628,14 +1633,22 @@ impl Engine {
         for name in names {
             let m = &self.mats[name];
             let tp = self.tensor(name).clone();
-            let raw = self.read(&tp, 0, tp.bytes as usize)?;
-            #[cfg(not(target_arch = "wasm32"))]
-            let t0 = std::time::Instant::now();
-            let w = quant::to_gpu_bytes(m.ggml_type, &raw, m.k, m.total_rows())?;
-            self.gpu.queue.write_buffer(&m.shards[0].codes, 0, &w);
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                self.stream.borrow_mut().stats.upload_seconds += t0.elapsed().as_secs_f64();
+            // In slices of about 32 MB, so a large head never needs one huge buffer.
+            let step = ((32u64 << 20) / tp.row_bytes).max(1) as usize;
+            let total = m.total_rows();
+            let mut r = 0;
+            while r < total {
+                let n = step.min(total - r);
+                let raw = self.read(&tp, r as u64 * tp.row_bytes, n * tp.row_bytes as usize)?;
+                #[cfg(not(target_arch = "wasm32"))]
+                let t0 = std::time::Instant::now();
+                let w = quant::to_gpu_bytes(m.ggml_type, &raw, m.k, n)?;
+                self.gpu.queue.write_buffer(&m.shards[0].codes, m.fmt.bytes(m.k, r), &w);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.stream.borrow_mut().stats.upload_seconds += t0.elapsed().as_secs_f64();
+                }
+                r += n;
             }
             bytes += tp.bytes;
         }

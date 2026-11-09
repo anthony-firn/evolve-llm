@@ -9,6 +9,10 @@ use unicode_normalization::UnicodeNormalization;
 
 const GPT2: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 const LLAMA3: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// DeepSeek V3 and R1 (`deepseek-v3`): digits, then CJK runs, then this.
+const DEEPSEEK3: &str = r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"##;
+/// Kimi K2's tiktoken pattern: Han runs apart, other letters in case-shaped words.
+const KIMI_K2: &str = r"[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 const NORMAL: i32 = 1;
@@ -146,6 +150,8 @@ impl Tokenizer {
             }
             "qwen2" | "deepseek-r1-qwen" | "qwen35" => (vec![QWEN2], true, false),
             "smollm" => (vec![r"\p{N}", GPT2], false, false),
+            "deepseek-v3" => (vec![r"\p{N}{1,3}", r"[一-龥぀-ゟ゠-ヿ]+", DEEPSEEK3], false, false),
+            "kimi-k2" => (vec![KIMI_K2], false, false),
             _ => (vec![GPT2], false, false),
         };
         let pre = if kind == Kind::Bpe {

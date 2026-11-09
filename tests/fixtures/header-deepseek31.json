@@ -1,0 +1,330 @@
+{
+ "file": "header-deepseek31.gguf",
+ "tokenizer": [
+  {
+   "text": "Hello world",
+   "ids": [
+    19923,
+    2058
+   ]
+  },
+  {
+   "text": "  leading spaces and trailing   ",
+   "ids": [
+    223,
+    6646,
+    13564,
+    305,
+    52964,
+    361
+   ]
+  },
+  {
+   "text": "The year 2026 had 365 days; 1234567 is a number.",
+   "ids": [
+    671,
+    1141,
+    223,
+    939,
+    24,
+    936,
+    223,
+    15551,
+    3137,
+    29,
+    223,
+    6895,
+    18009,
+    25,
+    344,
+    260,
+    1167,
+    16
+   ]
+  },
+  {
+   "text": "naïve café, résumé — “quotes” and ‘apostrophes’",
+   "ids": [
+    2720,
+    91223,
+    57664,
+    14,
+    21538,
+    90902,
+    2136,
+    811,
+    403,
+    7183,
+    430,
+    305,
+    2096,
+    630,
+    602,
+    123116,
+    442
+   ]
+  },
+  {
+   "text": "I'm, you're, they've, we'll, she'd, IT'S, I'D",
+   "ids": [
+    43,
+    4571,
+    14,
+    440,
+    4750,
+    14,
+    851,
+    5270,
+    14,
+    579,
+    5922,
+    14,
+    1225,
+    7485,
+    14,
+    8606,
+    28138,
+    14,
+    342,
+    9,
+    38
+   ]
+  },
+  {
+   "text": "日本語のテキストと中文混合",
+   "ids": [
+    88768,
+    1576,
+    17383,
+    20367,
+    24552,
+    2495,
+    21134,
+    14769
+   ]
+  },
+  {
+   "text": "emoji 🚀🔥 and 👩‍👩‍👧‍👦 family",
+   "ids": [
+    18872,
+    7063,
+    7351,
+    251,
+    225,
+    115840,
+    305,
+    52780,
+    105,
+    46088,
+    25730,
+    105,
+    46088,
+    25730,
+    103,
+    46088,
+    25730,
+    102,
+    3096
+   ]
+  },
+  {
+   "text": "def f(x):\n    return x**2  # comment\n\n\n\tTabbed",
+   "ids": [
+    3465,
+    285,
+    4042,
+    3395,
+    361,
+    1354,
+    1527,
+    666,
+    20,
+    223,
+    1823,
+    7006,
+    6328,
+    200,
+    36440,
+    15130
+   ]
+  },
+  {
+   "text": "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    30,
+    94,
+    328,
+    37864,
+    94,
+    32,
+    5265,
+    201,
+    6366,
+    30,
+    94,
+    328,
+    42616,
+    94,
+    1018,
+    30,
+    94,
+    328,
+    37864,
+    94,
+    32,
+    624,
+    15059,
+    201
+   ]
+  },
+  {
+   "text": "é decomposed accent and Å vs Å",
+   "ids": [
+    71,
+    17793,
+    106929,
+    35785,
+    305,
+    28000,
+    8062,
+    334,
+    139,
+    235
+   ]
+  },
+  {
+   "text": "multiple\n\n\nnewlines\r\nand CRLF",
+   "ids": [
+    87372,
+    6328,
+    2839,
+    12678,
+    204,
+    201,
+    458,
+    12414,
+    68688
+   ]
+  },
+  {
+   "text": "   ",
+   "ids": [
+    361
+   ]
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "ids": [
+    89086,
+    89086,
+    89086,
+    89086,
+    89086,
+    89086,
+    89086,
+    39535,
+    68769
+   ]
+  },
+  {
+   "text": "http://example.com/path?query=1&b=2#frag",
+   "ids": [
+    6900,
+    2272,
+    30357,
+    2193,
+    9391,
+    901,
+    33,
+    12066,
+    31,
+    19,
+    8,
+    68,
+    31,
+    20,
+    5,
+    72,
+    3174
+   ]
+  },
+  {
+   "text": "Ünïcödé ÀÉÎÕÜ ß ǅ",
+   "ids": [
+    52526,
+    80,
+    16709,
+    69,
+    54879,
+    619,
+    50353,
+    16462,
+    67626,
+    103234,
+    52526,
+    1067,
+    256,
+    223,
+    134,
+    230
+   ]
+  },
+  {
+   "text": "123 4567 89012 3.14159 1,000,000",
+   "ids": [
+    6895,
+    223,
+    18009,
+    25,
+    223,
+    27168,
+    736,
+    223,
+    21,
+    16,
+    9926,
+    3318,
+    223,
+    19,
+    14,
+    1320,
+    14,
+    1320
+   ]
+  },
+  {
+   "text": "",
+   "ids": []
+  }
+ ],
+ "chat": [
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a concise assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is WebGPU?"
+    },
+    {
+     "role": "assistant",
+     "content": "A browser API for GPU graphics and compute."
+    },
+    {
+     "role": "user",
+     "content": "Can it run language models?"
+    }
+   ],
+   "options": {
+    "date": [
+     2026,
+     11,
+     8
+    ]
+   },
+   "text": "<｜begin▁of▁sentence｜>You are a concise assistant.<｜User｜>What is WebGPU?<｜Assistant｜></think>A browser API for GPU graphics and compute.<｜end▁of▁sentence｜><｜User｜>Can it run language models?<｜Assistant｜></think>"
+  }
+ ]
+}
