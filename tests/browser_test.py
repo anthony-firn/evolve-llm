@@ -12,6 +12,8 @@ import argparse
 import functools
 import http.server
 import os
+import shutil
+import tempfile
 import subprocess
 import sys
 import threading
@@ -97,8 +99,15 @@ def main():
             a.screens.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(a.screens / "welcome.png"))
 
+        # Open the file under a neutral name: a catalog file name would mark that catalog
+        # entry as running, and the download check below needs it free.
+        local = Path(tempfile.mkdtemp()) / "local-model.gguf"
+        try:
+            os.link(a.model, local)
+        except OSError:
+            shutil.copyfile(a.model, local)
         t0 = time.time()
-        page.set_input_files("#file-input", str(a.model))
+        page.set_input_files("#file-input", str(local))
         page.wait_for_selector("#ready:not([hidden])", timeout=180000)
         print(f"loaded local file in {time.time() - t0:.1f}s:", page.inner_text("#ready-meta"))
 
