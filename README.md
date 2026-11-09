@@ -191,3 +191,7 @@ tokenizers, sentencepiece and gguf, and a llama.cpp checkout for its converter.
 
 Apache 2.0. The IQ code books and block decoders derive from ggml (MIT); see NOTICE. Models are
 not part of this repository; each one keeps its own license, shown in the model picker.
+
+## Browser embedding API
+
+[Try the developer quickstart](https://www.evolvetech.dev/developers/llm/) or read [the embedding contract](docs/embedding.md). The versioned runtime bundle includes `createEngine`, TypeScript declarations and an executable example. Its offline protocol fixture needs no model download; a separate button runs real inference. Stream cancellation, timeouts and worker failures release the model, and concurrent calls are rejected. The engine and its measured results are unchanged by this SDK release.

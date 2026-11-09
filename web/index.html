@@ -35,7 +35,7 @@
       </div>
       <ul class="model-list" id="model-list"></ul>
       <h3 class="list-title" id="large-title">Large models</h3>
-      <p class="list-note">Mixture-of-experts models. When one does not fit on the GPU, its experts stay in browser storage and are read as each token needs them.</p>
+      <p class="list-note">Mixture-of-experts models. OLMoE 1B-7B has been run in the browser; the largest entries have architecture tests but have not run end to end. Their speed is unmeasured.</p>
       <ul class="model-list" id="large-list" aria-labelledby="large-title"></ul>
       <details class="other" id="other-sources">
         <summary>Other models</summary>
@@ -69,6 +69,7 @@
             <li><strong>Stays on your device.</strong> No server sees your prompts or replies. Web search is off unless you turn it on.</li>
             <li><strong>Works offline</strong> once a model is saved in the browser.</li>
           </ul>
+          <p class="hint"><a href="/developers/llm/">Embed this engine: SDK, executable example and tested limits</a></p>
           <div class="notice" id="gpu-notice" hidden></div>
           <button class="primary start" type="button" id="start-recommended" hidden>Start with the recommended model</button>
         </section>
