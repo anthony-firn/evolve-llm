@@ -129,6 +129,13 @@
         </select>
         <small>Used when a model loads. Longer contexts use more GPU memory.</small>
       </label>
+      <label class="block">Graphics processor
+        <select name="gpu">
+          <option value="high-performance">Highest performance</option>
+          <option value="low-power">Power saving</option>
+        </select>
+        <small>On laptops with two GPUs, power saving usually picks the integrated one. Used when a model loads.</small>
+      </label>
       <label class="check"><input type="checkbox" name="thinking"> Let reasoning models think before answering</label>
       <footer><button class="ghost" type="button" id="reset-settings">Restore defaults</button><button class="primary" value="close">Done</button></footer>
     </form>

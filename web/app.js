@@ -5,7 +5,7 @@ const $ = (id) => document.getElementById(id);
 const app = $('app');
 const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 
-const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true };
+const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance' };
 const SUGGESTIONS = [
   'Explain WebGPU to a curious 12-year-old.',
   'Write a haiku about running AI on my own laptop.',
@@ -209,8 +209,10 @@ function startLoad(source) {
   if (!state.adapter?.ok) return;
   closeDrawer();
   if (state.phase === 'generating') return;
-  const label = source.kind === 'file' ? source.file.name.replace(/\.gguf$/i, '') : source.name;
-  state.loading = { label, key: source.key, id: source.id, kind: source.kind };
+  // A file from disk that is one of the catalog models gets its friendly name.
+  const known = source.kind === 'file' ? MODELS.find((m) => m.file.toLowerCase() === source.file.name.toLowerCase()) : null;
+  const label = known ? known.name : source.kind === 'file' ? source.file.name.replace(/\.gguf$/i, '') : source.name;
+  state.loading = { label, key: known ? cacheKey(known.repo, known.file) : source.key, id: known ? known.id : source.id, kind: source.kind };
   state.loaded = null;
   state.messages = [];
   renderMessages();
@@ -223,7 +225,7 @@ function startLoad(source) {
   loadStarted = performance.now();
   setPhase('loading');
   if (source.kind === 'hf') remember('evolve-llm-last', source.id);
-  worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx) });
+  worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx), gpu: state.settings.gpu });
 }
 
 function setStep(step, skipDownload = false) {
@@ -270,7 +272,7 @@ function formatDuration(s) {
 
 function onLoaded({ model, chat, source }) {
   const label = state.loading?.label || chat.name;
-  state.loaded = { ...source, label, info: model, chat };
+  state.loaded = { ...source, key: state.loading?.key ?? source.key, label, info: model, chat };
   state.loading = null;
   $('loading-bar').classList.remove('indeterminate');
   const secs = (performance.now() - loadStarted) / 1000;
@@ -561,6 +563,7 @@ function fillSettings() {
     form.elements[`${k}Out`].value = s[k];
   }
   form.elements.ctx.value = String(s.ctx);
+  form.elements.gpu.value = s.gpu;
   form.elements.thinking.checked = Boolean(s.thinking);
 }
 form.addEventListener('input', (e) => {
@@ -571,14 +574,23 @@ form.addEventListener('input', (e) => {
     state.settings[t.name] = Number(t.value);
     form.elements[`${t.name}Out`].value = t.value;
   } else if (t.name === 'ctx') state.settings.ctx = Number(t.value);
+  else if (t.name === 'gpu') {
+    state.settings.gpu = t.value;
+    worker.postMessage({ type: 'adapter', gpu: t.value });
+  }
   else state.settings[t.name] = t.value;
   saveSettings();
 });
 form.addEventListener('change', (e) => {
-  if (e.target.name === 'ctx' && state.loaded) $('status-line').textContent = 'The new context length applies the next time a model loads.';
+  if ((e.target.name === 'ctx' || e.target.name === 'gpu') && state.loaded) $('status-line').textContent = 'This setting applies the next time a model loads.';
 });
 $('open-settings').addEventListener('click', () => { fillSettings(); dialog.showModal(); });
-$('reset-settings').addEventListener('click', () => { state.settings = { ...DEFAULTS }; saveSettings(); fillSettings(); });
+$('reset-settings').addEventListener('click', () => {
+  state.settings = { ...DEFAULTS };
+  saveSettings();
+  fillSettings();
+  worker.postMessage({ type: 'adapter', gpu: state.settings.gpu });
+});
 
 setPhase('starting');
-worker.postMessage({ type: 'hello' });
+worker.postMessage({ type: 'hello', gpu: state.settings.gpu });

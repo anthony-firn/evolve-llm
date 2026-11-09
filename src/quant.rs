@@ -424,59 +424,57 @@ pub fn dequantize(t: u32, bytes: &[u8], out: &mut [f32]) -> Result<(), String> {
 /// The layout a weight matrix uses on the GPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GpuFormat {
-    /// Unsigned 4-bit codes, eight per word, in groups of 32 values:
-    /// `value = scale * (code - offset) + bias`.
-    Q4 { offset: u8, bias: bool },
+    /// Unsigned codes split into a plane of 4-bit nibbles (eight per word) and,
+    /// for 5- and 6-bit formats, a plane of `high` extra bits per value:
+    /// `code = nibble | high_bits << 4`, `value = scale * (code - offset) + bias`.
+    Q4 {
+        group: u8,
+        high: u8,
+        offset: u8,
+        bias: bool,
+    },
     /// Signed 8-bit codes, four per word: `value = scale * code + bias`.
     Q8 { group: u8, bias: bool },
     /// Two IEEE half floats per word.
     F16,
 }
 
+/// GPU bytes of one matrix: nibble or code plane, extra-bit plane, scales.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Planes {
+    pub low: u64,
+    pub high: u64,
+    pub scales: u64,
+}
+
 impl GpuFormat {
     pub fn for_type(t: u32) -> Option<GpuFormat> {
+        let q4 = |group, high, offset, bias| GpuFormat::Q4 {
+            group,
+            high,
+            offset,
+            bias,
+        };
         Some(match t {
-            Q4_0 => GpuFormat::Q4 {
-                offset: 8,
-                bias: false,
-            },
-            Q4_1 | Q4_K => GpuFormat::Q4 {
-                offset: 0,
-                bias: true,
-            },
-            Q8_0 | Q5_0 | IQ4_NL | IQ4_XS => GpuFormat::Q8 {
+            Q4_0 => q4(32, 0, 8, false),
+            Q4_1 | Q4_K => q4(32, 0, 0, true),
+            Q5_0 => q4(32, 1, 16, false),
+            Q5_1 | Q5_K => q4(32, 1, 0, true),
+            Q6_K => q4(16, 2, 32, false),
+            Q3_K => q4(16, 0, 4, false),
+            Q2_K => q4(16, 0, 0, true),
+            Q8_0 | IQ4_NL | IQ4_XS => GpuFormat::Q8 {
                 group: 32,
                 bias: false,
-            },
-            Q5_1 | Q5_K => GpuFormat::Q8 {
-                group: 32,
-                bias: true,
-            },
-            Q6_K | Q3_K => GpuFormat::Q8 {
-                group: 16,
-                bias: false,
-            },
-            Q2_K => GpuFormat::Q8 {
-                group: 16,
-                bias: true,
             },
             F32 | F16 | BF16 => GpuFormat::F16,
             _ => return None,
         })
     }
 
-    pub fn values_per_word(self) -> usize {
-        match self {
-            GpuFormat::Q4 { .. } => 8,
-            GpuFormat::Q8 { .. } => 4,
-            GpuFormat::F16 => 2,
-        }
-    }
-
     pub fn group(self) -> usize {
         match self {
-            GpuFormat::Q4 { .. } => 32,
-            GpuFormat::Q8 { group, .. } => group as usize,
+            GpuFormat::Q4 { group, .. } | GpuFormat::Q8 { group, .. } => group as usize,
             GpuFormat::F16 => 0,
         }
     }
@@ -491,26 +489,51 @@ impl GpuFormat {
 
     pub fn key(self) -> String {
         match self {
-            GpuFormat::Q4 { offset, bias } => format!("q4o{offset}b{}", bias as u8),
+            GpuFormat::Q4 {
+                group,
+                high,
+                offset,
+                bias,
+            } => format!("q4g{group}h{high}o{offset}b{}", bias as u8),
             GpuFormat::Q8 { group, bias } => format!("q8g{group}b{}", bias as u8),
             GpuFormat::F16 => "f16".into(),
         }
     }
 
-    /// GPU bytes for a matrix of `rows` x `k` values: (codes, scales).
-    pub fn sizes(self, k: usize, rows: usize) -> (u64, u64) {
+    /// GPU bytes for a matrix of `rows` x `k` values.
+    pub fn planes(self, k: usize, rows: usize) -> Planes {
         let n = (k * rows) as u64;
-        let codes = n / self.values_per_word() as u64 * 4;
-        let scales = match self {
-            GpuFormat::F16 => 0,
-            _ => n / self.group() as u64 * self.scale_stride() as u64 * 4,
-        };
-        (codes, scales)
+        match self {
+            GpuFormat::Q4 { group, high, .. } => Planes {
+                low: n / 2,
+                high: n * high as u64 / 8,
+                scales: n / group as u64 * self.scale_stride() as u64 * 4,
+            },
+            GpuFormat::Q8 { group, .. } => Planes {
+                low: n,
+                high: 0,
+                scales: n / group as u64 * self.scale_stride() as u64 * 4,
+            },
+            GpuFormat::F16 => Planes {
+                low: n * 2,
+                high: 0,
+                scales: 0,
+            },
+        }
+    }
+
+    /// (code bytes including any extra-bit plane, scale bytes).
+    pub fn sizes(self, k: usize, rows: usize) -> (u64, u64) {
+        let p = self.planes(k, rows);
+        (p.low + p.high, p.scales)
     }
 }
 
 pub struct Packed {
+    /// Nibbles, 8-bit codes or halves.
     pub codes: Vec<u32>,
+    /// Extra high bits of 5- and 6-bit codes, `high` bits per value.
+    pub high: Vec<u32>,
     pub scales: Vec<f32>,
 }
 
@@ -527,10 +550,12 @@ pub fn repack(t: u32, bytes: &[u8], k: usize, rows: usize) -> Result<Packed, Str
         ));
     }
     let n = k * rows;
-    if n % fmt.values_per_word() != 0 || (fmt != GpuFormat::F16 && k % fmt.group() != 0) {
+    if n % 8 != 0 || (fmt != GpuFormat::F16 && k % 32 != 0) {
         return Err(format!("row length {k} does not fit the GPU layout"));
     }
-    let mut codes = vec![0u32; n / fmt.values_per_word()];
+    let planes = fmt.planes(k, rows);
+    let mut codes = vec![0u32; (planes.low / 4) as usize];
+    let mut high = vec![0u32; (planes.high / 4) as usize];
     if fmt == GpuFormat::F16 {
         for i in 0..n {
             let h = match t {
@@ -541,6 +566,7 @@ pub fn repack(t: u32, bytes: &[u8], k: usize, rows: usize) -> Result<Packed, Str
         }
         return Ok(Packed {
             codes,
+            high,
             scales: Vec::new(),
         });
     }
@@ -561,11 +587,20 @@ pub fn repack(t: u32, bytes: &[u8], k: usize, rows: usize) -> Result<Packed, Str
             }
         }
         match fmt {
-            GpuFormat::Q4 { offset, .. } => {
+            GpuFormat::Q4 {
+                high: hb, offset, ..
+            } => {
+                let mask = (1u32 << (4 + hb)) - 1;
                 for i in 0..vals {
-                    let code = (block.codes[i] as i32 + offset as i32) as u32 & 0xf;
+                    let q = (block.codes[i] as i32 + offset as i32) as u32;
+                    debug_assert_eq!(q & !mask, 0, "{} code out of range", type_name(t));
                     let e = base + i;
-                    codes[e / 8] |= code << (4 * (e % 8));
+                    codes[e / 8] |= (q & 0xf) << (4 * (e % 8));
+                    match hb {
+                        1 => high[e / 32] |= ((q >> 4) & 1) << (e % 32),
+                        2 => high[e / 16] |= ((q >> 4) & 3) << (2 * (e % 16)),
+                        _ => {}
+                    }
                 }
             }
             GpuFormat::Q8 { .. } => {
@@ -577,7 +612,11 @@ pub fn repack(t: u32, bytes: &[u8], k: usize, rows: usize) -> Result<Packed, Str
             GpuFormat::F16 => unreachable!(),
         }
     }
-    Ok(Packed { codes, scales })
+    Ok(Packed {
+        codes,
+        high,
+        scales,
+    })
 }
 
 /// Expand a GPU-packed matrix back to floats (used by tests to check the layout).
@@ -585,10 +624,20 @@ pub fn unpack(fmt: GpuFormat, p: &Packed, n: usize) -> Vec<f32> {
     (0..n)
         .map(|e| match fmt {
             GpuFormat::F16 => f16_to_f32((p.codes[e / 2] >> (16 * (e % 2))) as u16),
-            GpuFormat::Q4 { offset, bias } => {
-                let g = e / 32 * (1 + bias as usize);
-                let code = ((p.codes[e / 8] >> (4 * (e % 8))) & 0xf) as f32 - offset as f32;
-                p.scales[g] * code + if bias { p.scales[g + 1] } else { 0.0 }
+            GpuFormat::Q4 {
+                group,
+                high,
+                offset,
+                bias,
+            } => {
+                let g = e / group as usize * (1 + bias as usize);
+                let mut q = (p.codes[e / 8] >> (4 * (e % 8))) & 0xf;
+                q |= match high {
+                    1 => ((p.high[e / 32] >> (e % 32)) & 1) << 4,
+                    2 => ((p.high[e / 16] >> (2 * (e % 16))) & 3) << 4,
+                    _ => 0,
+                };
+                p.scales[g] * (q as f32 - offset as f32) + if bias { p.scales[g + 1] } else { 0.0 }
             }
             GpuFormat::Q8 { group, bias } => {
                 let g = e / group as usize * (1 + bias as usize);

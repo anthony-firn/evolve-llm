@@ -16,11 +16,11 @@ async function ensureWasm() {
   await wasm;
 }
 
-async function describeAdapter() {
+async function describeAdapter(preference) {
   if (!('gpu' in navigator) || !navigator.gpu) return { ok: false, reason: 'no-webgpu' };
   let adapter = null;
   try {
-    adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    adapter = await navigator.gpu.requestAdapter({ powerPreference: preference === 'low-power' ? 'low-power' : 'high-performance' });
   } catch (e) {
     return { ok: false, reason: 'no-adapter', detail: String(e?.message || e) };
   }
@@ -192,13 +192,13 @@ async function readHeader(blob) {
   }
 }
 
-async function loadBlob(blob, wantCtx) {
+async function loadBlob(blob, wantCtx, lowPower) {
   const { bytes, model } = await readHeader(blob);
   post('inspected', { model });
   const ctx = Math.max(256, Math.min(wantCtx, model.config.ctx_train));
   let loader;
   try {
-    loader = await create_loader(bytes);
+    loader = await create_loader(bytes, lowPower);
   } catch (e) {
     throw new Error(`Could not start the model on the GPU: ${e?.message || e}`);
   }
@@ -285,13 +285,16 @@ async function generate({ messages, options, sampler, maxTokens }) {
 // ---- Messages from the page ----
 
 const handlers = {
-  async hello() {
-    const adapter = await describeAdapter();
+  async hello({ gpu }) {
+    const adapter = await describeAdapter(gpu);
     await ensureWasm();
     post('adapter', { adapter });
     post('cache', await listCached().catch(() => ({ models: [], supported: false })));
   },
-  async load({ source, ctx }) {
+  async adapter({ gpu }) {
+    post('adapter', { adapter: await describeAdapter(gpu) });
+  },
+  async load({ source, ctx, gpu }) {
     cancelLoad = false;
     unload();
     await ensureWasm();
@@ -302,7 +305,7 @@ const handlers = {
       blob = await download(source);
       post('cache', await listCached().catch(() => ({ models: [], supported: false })));
     }
-    const result = await loadBlob(blob, ctx);
+    const result = await loadBlob(blob, ctx, gpu === 'low-power');
     post('loaded', { ...result, source: source.kind === 'file' ? { kind: 'file', name: source.file.name } : { kind: 'hf', key: source.key, id: source.id } });
   },
   async generate(msg) {

@@ -141,9 +141,14 @@ pub struct Loader {
 
 /// Open the GPU and allocate weight buffers for the model whose header is given.
 #[wasm_bindgen]
-pub async fn create_loader(header: Vec<u8>) -> Result<Loader, JsValue> {
+pub async fn create_loader(header: Vec<u8>, low_power: bool) -> Result<Loader, JsValue> {
     let g = gguf::parse(&header).map_err(err)?;
-    let gpu = gpu::init().await.map_err(err)?;
+    let preference = if low_power {
+        wgpu::PowerPreference::LowPower
+    } else {
+        wgpu::PowerPreference::HighPerformance
+    };
+    let gpu = gpu::init_with(preference).await.map_err(err)?;
     let engine = Engine::new(gpu, &g).map_err(err)?;
     Ok(Loader {
         engine: Some(engine),

@@ -190,10 +190,16 @@ fn every_format_matches_the_cpu_reference_on_the_gpu() {
     };
     let mut device = Some(first);
     let tokens = [3u32, 141, 7, 300, 77, 12];
-    for (i, &t) in formats.iter().enumerate() {
-        let bytes = model(t, 0x9e37 + i as u64);
+    // Every format runs whole, then again with matrices split into 64-row shards, as on
+    // devices with small storage-binding limits.
+    let runs = formats
+        .iter()
+        .map(|&t| (t, None))
+        .chain(formats.iter().map(|&t| (t, Some(16 * 1024u64))));
+    for (i, (t, limit)) in runs.enumerate() {
+        let bytes = model(t, 0x9e37 + (i % formats.len()) as u64);
         let g = gguf::parse(&bytes).unwrap();
-        let mut engine = Engine::new(device.take().unwrap(), &g).unwrap();
+        let mut engine = Engine::with_binding_limit(device.take().unwrap(), &g, limit).unwrap();
         for p in engine.plan().to_vec() {
             engine
                 .upload(
@@ -240,8 +246,8 @@ fn every_format_matches_the_cpu_reference_on_the_gpu() {
             .fold(0.0, f32::max)
             / range;
         eprintln!(
-            "{:6}: logit range {scale:7.3}, one-token max error {:.2e}, batched {:.2e}",
-            quant::type_name(t),
+            "{:6} in {:3} buffers: logit range {scale:7.3}, one-token max error {:.2e}, batched {:.2e}",
+            quant::type_name(t), engine.shard_count(),
             worst,
             batched
         );

@@ -11,6 +11,7 @@ Needs: Python Playwright and Google Chrome. On Linux Chrome needs WebGPU flags, 
 import argparse
 import functools
 import http.server
+import os
 import subprocess
 import sys
 import threading
@@ -51,13 +52,14 @@ def serve(directory):
     return server
 
 
-def native_reply(model, prompt, n):
+def native_reply(model, prompt, n, low_power=False):
     """The same greedy reply from the native build of the engine (Vulkan, Metal or D3D12)."""
     cli = ROOT / "target/release/evolve-llm"
     if not cli.exists():
         return None
+    env = {**os.environ, "EVOLVE_LLM_POWER": "low" if low_power else "high"}
     out = subprocess.run([str(cli), "run", str(model), "--chat", "--prompt", prompt, "-n", str(n), "--temp", "0"],
-                         capture_output=True, text=True, timeout=600)
+                         capture_output=True, text=True, timeout=600, env=env)
     return out.stdout if out.returncode == 0 else None
 
 
@@ -70,6 +72,7 @@ def main():
     ap.add_argument("--model", type=Path, required=True)
     ap.add_argument("--download", action="store_true", help="also test a real Hugging Face download")
     ap.add_argument("--headed", action="store_true")
+    ap.add_argument("--low-power", action="store_true", help="ask the browser for its power-saving GPU")
     ap.add_argument("--screens", type=Path, help="save screenshots here")
     a = ap.parse_args()
     dist = ROOT / "dist"
@@ -81,7 +84,7 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(executable_path="/usr/bin/google-chrome", headless=not a.headed, args=FLAGS)
         ctx = browser.new_context(viewport={"width": 1360, "height": 900})
-        ctx.add_init_script(f"localStorage.setItem('evolve-llm-settings', JSON.stringify({{temperature: 0, maxTokens: {max_tokens}, ctx: 2048, thinking: false}}))")
+        ctx.add_init_script(f"localStorage.setItem('evolve-llm-settings', JSON.stringify({{temperature: 0, maxTokens: {max_tokens}, ctx: 2048, thinking: false, gpu: '{'low-power' if a.low_power else 'high-performance'}'}}))")
         page = ctx.new_page()
         # Fonts come from the evolvetech.dev site and are absent from a standalone build.
         page.on("console", lambda m: m.type in ("error", "warning") and "Failed to load resource" not in m.text and problems.append(f"console {m.type}: {m.text}"))
@@ -109,7 +112,7 @@ def main():
         assert reply.strip(), "empty reply"
 
         # Greedy decoding must reproduce the native Vulkan run of the same engine.
-        native = native_reply(a.model, prompt, max_tokens)
+        native = native_reply(a.model, prompt, max_tokens, a.low_power)
         if native is not None:
             same = letters(native) == letters(reply)
             print("matches the native greedy reply:", same)
@@ -127,14 +130,14 @@ def main():
         # Stop a long reply.
         page.evaluate("() => { const s = JSON.parse(localStorage.getItem('evolve-llm-settings')); s.maxTokens = 2048; localStorage.setItem('evolve-llm-settings', JSON.stringify(s)); }")
         page.click("#new-chat")
-        page.fill("#prompt", "Write a long story about a lighthouse keeper.")
+        page.fill("#prompt", "Count from 1 to 1000, one number per line, with no other text.")
         page.press("#prompt", "Enter")
-        page.wait_for_selector("#stop:not([hidden])", timeout=30000)
-        time.sleep(1.5)
-        page.click("#stop")
+        page.wait_for_selector(".msg.assistant .bubble .answer", timeout=60000)
+        page.click("#stop", timeout=5000)
         page.wait_for_selector(".msg.assistant .msg-stats", timeout=60000)
         stop_stats = page.inner_text(".msg.assistant .msg-stats")
         print("stopped:", stop_stats)
+        assert "stopped" in stop_stats, "Stop did not end the reply"
         if a.screens:
             page.screenshot(path=str(a.screens / "chat.png"))
             page.set_viewport_size({"width": 390, "height": 844})

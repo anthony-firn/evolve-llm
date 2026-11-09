@@ -24,25 +24,33 @@ tokenizes, samples and schedules work.
 
 GGUF blocks pack scales, minimums and bit planes into odd sizes (18, 22, 34 and 210 bytes).
 WGSL reads storage buffers as 32-bit words, so the engine decodes each block into integer codes
-plus a scale and an optional bias per group, with `value = scale * code + bias`. The arithmetic
-reproduces ggml's reference dequantization exactly.
+plus a scale and an optional bias per group, with `value = scale * (code - offset) + bias`. The
+arithmetic reproduces ggml's reference dequantization exactly.
+
+Codes of up to six bits are stored as a plane of 4-bit nibbles plus, for 5- and 6-bit formats,
+a second plane holding the extra one or two bits per value. Each matrix keeps both planes in one
+buffer, so a 32-value step reads one 16-byte nibble load and one or two extra words.
 
 | GPU layout | Source formats | Bits per weight on the GPU |
 |---|---|---|
-| 4-bit codes, groups of 32 | Q4_0, Q4_1, Q4_K | 5 to 6 |
-| 8-bit codes, groups of 16 or 32 | Q8_0, Q5_0, Q5_1, Q5_K, Q6_K, Q3_K, Q2_K, IQ4_NL, IQ4_XS | 9 to 12 |
+| 4-bit nibbles, groups of 32 | Q4_0, Q4_1, Q4_K | 5 to 6 |
+| Nibbles plus 1 extra bit, groups of 32 | Q5_0, Q5_1, Q5_K | 6 to 7 |
+| Nibbles plus 2 extra bits, groups of 16 | Q6_K | 8 |
+| Nibbles, groups of 16 | Q3_K, Q2_K | 6 to 8 |
+| 8-bit codes, groups of 32 | Q8_0, IQ4_NL, IQ4_XS (codebook values) | 9 |
 | Half floats | F16, BF16, F32 | 16 |
 
-Five- and six-bit formats are widened to 8-bit codes, which costs memory but keeps one fast
-kernel per layout. Native 5- and 6-bit planes are the next memory optimization.
+Scales stay in f32 so the GPU values equal the reference values. Storing them as f16 would save
+about one more bit per weight.
 
 ## Kernels
 
 `src/gpu/shaders.rs` generates WGSL per weight layout.
 
 - **Matrix-vector product** for one token. Four lanes cooperate on each output row and each lane
-  issues one 16-byte weight load per step. Four lanes per row measured fastest on the Intel GPU
-  and tied with the alternatives on the NVIDIA GPU, which was limited by memory bandwidth.
+  issues one 16-byte weight load per step. Four lanes per row measured 2.6 times faster than 16
+  on the Intel GPU and tied with every alternative on the power-capped NVIDIA GPU, where memory
+  bandwidth was the limit.
 - **Tiled matrix product** for prompts: 64 rows by 32 tokens per workgroup through shared memory,
   with weights dequantized while the tile loads.
 - **RMSNorm**, including per-head normalization of queries and keys for Qwen3.

@@ -90,19 +90,21 @@ that none of those files use still run through the GPU kernels.
 
 ## Measured speed
 
-Measured on a laptop whose power profile held the RTX 3050 Laptop GPU in its lowest performance
-state (210 MHz core, 405 MHz memory), so these are floor numbers rather than what the GPU can do.
-"Prompt" is tokens read per second for a 256-token prompt; "reply" is tokens generated per second.
+Measured on one laptop with its battery power profile active: an Intel Raptor Lake integrated
+GPU and an RTX 3050 Laptop GPU that the profile held at its lowest clocks (210 MHz core, 405 MHz
+memory). Expect more from a desktop GPU or a laptop on its performance profile. "Prompt" is
+tokens read per second for a 256-token prompt; "reply" is tokens generated per second.
 
-| Model | Native, RTX 3050 (capped) | Chrome WebGPU, RTX 3050 (capped) |
-|---|---|---|
-| SmolLM2 135M Q8_0 | prompt 661/s, reply 24/s | reply 26/s |
-| Qwen2.5 0.5B Q4_K_M | prompt 268/s, reply 11/s | reply 10.5/s |
-| Qwen3 0.6B Q8_0 | prompt 184/s, reply 8/s | reply 9/s |
-| Llama 3.2 1B Q4_K_M | prompt 109/s, reply 6/s | reply 6/s |
+| Model | Intel GPU, native | Intel GPU, Chrome | RTX 3050 (capped), Chrome |
+|---|---|---|---|
+| SmolLM2 135M Q8_0 | prompt 1,060/s, reply 82/s | reply 69 to 74/s | reply 26/s |
+| Qwen2.5 0.5B Q4_K_M | prompt 415/s, reply 40/s | reply 33 to 36/s | reply 12/s |
+| Qwen3 0.6B Q8_0 | prompt 294/s, reply 32/s | reply 30/s | reply 9/s |
+| Llama 3.2 1B Q4_K_M | prompt 166/s, reply 23/s | reply 22/s | reply 7/s |
 
-At these clocks the one-token kernel reads weights at the memory bandwidth the GPU was allowed.
-Browser and native speeds match, so WebAssembly and WebGPU add little overhead.
+Chrome is within about 15% of the native build, and matches it on the capped GPU, where memory
+bandwidth is the limit. The page's settings can ask
+for the power-saving GPU, which on this laptop selects the faster integrated one.
 
 ## Build and run
 

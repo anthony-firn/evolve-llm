@@ -166,9 +166,18 @@ fn floats(v: &[f32]) -> Vec<u8> {
 impl Engine {
     /// Allocate weight buffers for a model. Weights are uploaded afterwards with `upload`.
     pub fn new(gpu: Gpu, g: &Gguf) -> Result<Engine, String> {
+        Self::with_binding_limit(gpu, g, None)
+    }
+
+    /// Like `new`, with an optional lower cap on buffer size (tests use it to force row shards).
+    pub fn with_binding_limit(gpu: Gpu, g: &Gguf, limit: Option<u64>) -> Result<Engine, String> {
         let cfg = model::config(g)?;
         let device = &gpu.device;
-        let max_binding = gpu.info.max_storage_binding.min(gpu.info.max_buffer_size);
+        let max_binding = gpu
+            .info
+            .max_storage_binding
+            .min(gpu.info.max_buffer_size)
+            .min(limit.unwrap_or(u64::MAX));
         let mut mats = HashMap::new();
         let mut plan = Vec::new();
         let mut weight_bytes = 0u64;
@@ -190,10 +199,12 @@ impl Engine {
                 .min(rows)
                 .max(1);
             // Keep shard boundaries on multiples of 64 rows so matrix tiles never straddle them.
-            let per_shard = if per_shard < rows {
-                (per_shard / 64 * 64).max(1)
-            } else {
+            let per_shard = if per_shard >= rows {
                 rows
+            } else if per_shard >= 64 {
+                per_shard / 64 * 64
+            } else {
+                per_shard.max(1)
             };
             let mut shards = Vec::new();
             let mut row0 = 0;
@@ -284,6 +295,11 @@ impl Engine {
         Ok(e)
     }
 
+    /// Number of GPU buffer pairs holding weight matrices.
+    pub fn shard_count(&self) -> usize {
+        self.mats.values().map(|m| m.shards.len()).sum()
+    }
+
     pub fn plan(&self) -> &[TensorPlan] {
         &self.plan
     }
@@ -369,10 +385,14 @@ impl Engine {
                 let n = (s.row0 + s.rows - r).min(row0 + rows - r);
                 let src = &bytes[(r - row0) * rb..(r - row0 + n) * rb];
                 let packed = quant::repack(m.ggml_type, src, m.k, n)?;
-                let (cb, sb) = m.fmt.sizes(m.k, r - s.row0);
-                queue.write_buffer(&s.codes, cb, &words(&packed.codes));
+                let at = m.fmt.planes(m.k, r - s.row0);
+                let whole = m.fmt.planes(m.k, s.rows);
+                queue.write_buffer(&s.codes, at.low, &words(&packed.codes));
+                if !packed.high.is_empty() {
+                    queue.write_buffer(&s.codes, whole.low + at.high, &words(&packed.high));
+                }
                 if !packed.scales.is_empty() {
-                    queue.write_buffer(&s.scales, sb, &floats(&packed.scales));
+                    queue.write_buffer(&s.scales, at.scales, &floats(&packed.scales));
                 }
                 r += n;
             }

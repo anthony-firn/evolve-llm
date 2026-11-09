@@ -37,6 +37,11 @@ fn power_preference() -> wgpu::PowerPreference {
 }
 
 pub async fn init() -> Result<Gpu, String> {
+    init_with(power_preference()).await
+}
+
+/// Open a GPU with an explicit preference; laptops often have an integrated and a discrete one.
+pub async fn init_with(preference: wgpu::PowerPreference) -> Result<Gpu, String> {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     #[cfg(target_arch = "wasm32")]
     {
@@ -49,7 +54,7 @@ pub async fn init() -> Result<Gpu, String> {
     let instance = wgpu::Instance::new(desc);
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: power_preference(),
+            power_preference: preference,
             force_fallback_adapter: false,
             compatible_surface: None,
             apply_limit_buckets: false,

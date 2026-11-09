@@ -36,32 +36,62 @@ fn finish(t: u32, r: u32, acc: f32) {
 }
 "#;
 
-/// `load8(row, k)` for one weight format: eight consecutive values of a row.
-fn loader(fmt: GpuFormat) -> String {
-    match fmt {
-        GpuFormat::Q4 { offset, bias } => format!(
-            r#"
+/// Constants and the code decoder shared by every kernel for the nibble layouts.
+fn q4_common(group: u8, high: u8, offset: u8, bias: bool) -> String {
+    format!(
+        r#"
 const OFF: f32 = {offset}.0;
 const SB: bool = {bias};
 const STRIDE: u32 = {stride}u;
-fn load8(r: u32, k: u32) -> W8 {{
+const GROUP: u32 = {group}u;
+const HIGH: u32 = {high}u;
+// Four codes: nibbles of `w` from bit `ns`, plus extra bits of `h` from bit `hs`.
+fn vals(w: u32, ns: u32, h: u32, hs: u32) -> vec4<f32> {{
+    var q = vec4<u32>(w >> ns, w >> (ns + 4u), w >> (ns + 8u), w >> (ns + 12u)) & vec4<u32>(15u);
+    if (HIGH == 1u) {{
+        q |= (vec4<u32>(h >> hs, h >> (hs + 1u), h >> (hs + 2u), h >> (hs + 3u)) & vec4<u32>(1u)) << vec4<u32>(4u);
+    }} else if (HIGH == 2u) {{
+        q |= (vec4<u32>(h >> hs, h >> (hs + 2u), h >> (hs + 4u), h >> (hs + 6u)) & vec4<u32>(3u)) << vec4<u32>(4u);
+    }}
+    return vec4<f32>(q);
+}}
+"#,
+        stride = 1 + bias as u32
+    )
+}
+
+/// `load8(row, k)` for one weight format: eight consecutive values of a row.
+fn loader(fmt: GpuFormat) -> String {
+    match fmt {
+        GpuFormat::Q4 {
+            group,
+            high,
+            offset,
+            bias,
+        } => {
+            q4_common(group, high, offset, bias)
+                + r#"
+fn load8(r: u32, k: u32) -> W8 {
     let e = r * p.K + k;
     let w = wcodes[e >> 3u];
-    let g = (e >> 5u) * STRIDE;
+    let g = (e / GROUP) * STRIDE;
     let s = wscales[g];
-    let lo = vec4<f32>(vec4<u32>(w, w >> 4u, w >> 8u, w >> 12u) & vec4<u32>(15u)) - vec4<f32>(OFF);
-    let hi = vec4<f32>(vec4<u32>(w >> 16u, w >> 20u, w >> 24u, w >> 28u) & vec4<u32>(15u)) - vec4<f32>(OFF);
-    var o = W8(lo * s, hi * s);
-    if (SB) {{
+    let hb = p.N * (p.K >> 3u);
+    var h = 0u;
+    var hs = 0u;
+    var step = 0u;
+    if (HIGH == 1u) { h = wcodes[hb + (e >> 5u)]; hs = e & 31u; step = 4u; }
+    if (HIGH == 2u) { h = wcodes[hb + (e >> 4u)]; hs = (e & 15u) * 2u; step = 8u; }
+    var o = W8((vals(w, 0u, h, hs) - vec4<f32>(OFF)) * s, (vals(w, 16u, h, hs + step) - vec4<f32>(OFF)) * s);
+    if (SB) {
         let b = wscales[g + 1u];
         o.a += vec4<f32>(b);
         o.b += vec4<f32>(b);
-    }}
+    }
     return o;
-}}
-"#,
-            stride = 1 + bias as u32
-        ),
+}
+"#
+        }
         GpuFormat::Q8 { group, bias } => format!(
             r#"
 const SB: bool = {bias};
@@ -102,29 +132,52 @@ fn load8(r: u32, k: u32) -> W8 {
 /// Dot product of one 16-byte block of weight codes with the matching inputs.
 fn gemv_chunk(fmt: GpuFormat) -> String {
     match fmt {
-        GpuFormat::Q4 { offset, bias } => format!(
-            r#"
+        GpuFormat::Q4 {
+            group,
+            high,
+            offset,
+            bias,
+        } => {
+            q4_common(group, high, offset, bias)
+                + r#"
 const CHUNK: u32 = 32u;
-fn nib(w: u32, s: u32) -> vec4<f32> {{
-    return vec4<f32>(vec4<u32>(w >> s, w >> (s + 4u), w >> (s + 8u), w >> (s + 12u)) & vec4<u32>(15u));
-}}
-fn chunk_dot(row: u32, c: u32, xb: u32) -> f32 {{
-    let g = row * (p.K >> 5u) + c;
-    let w = wc4[g];
+fn word(i: u32) -> u32 {
+    return wc4[i >> 2u][i & 3u];
+}
+fn chunk_dot(row: u32, c: u32, xb: u32) -> f32 {
+    let ci = row * (p.K >> 5u) + c;
+    let w = wc4[ci];
+    let hb = p.N * (p.K >> 3u);
+    var h0 = 0u;
+    var h1 = 0u;
+    if (HIGH == 1u) { h0 = word(hb + ci); h1 = h0; }
+    if (HIGH == 2u) { h0 = word(hb + 2u * ci); h1 = word(hb + 2u * ci + 1u); }
+    // Bit position of the extra bits for each run of four values.
+    let st = select(4u, 8u, HIGH == 2u);
+    let b2 = select(16u, 0u, HIGH == 2u);
     let xi = xb + c * 8u;
     let x0 = x[xi]; let x1 = x[xi + 1u]; let x2 = x[xi + 2u]; let x3 = x[xi + 3u];
     let x4 = x[xi + 4u]; let x5 = x[xi + 5u]; let x6 = x[xi + 6u]; let x7 = x[xi + 7u];
-    let d = dot(nib(w.x, 0u), x0) + dot(nib(w.x, 16u), x1) + dot(nib(w.y, 0u), x2) + dot(nib(w.y, 16u), x3)
-          + dot(nib(w.z, 0u), x4) + dot(nib(w.z, 16u), x5) + dot(nib(w.w, 0u), x6) + dot(nib(w.w, 16u), x7);
+    let d0 = dot(vals(w.x, 0u, h0, 0u), x0) + dot(vals(w.x, 16u, h0, st), x1)
+           + dot(vals(w.y, 0u, h0, 2u * st), x2) + dot(vals(w.y, 16u, h0, 3u * st), x3);
+    let d1 = dot(vals(w.z, 0u, h1, b2), x4) + dot(vals(w.z, 16u, h1, b2 + st), x5)
+           + dot(vals(w.w, 0u, h1, b2 + 2u * st), x6) + dot(vals(w.w, 16u, h1, b2 + 3u * st), x7);
     let one = vec4<f32>(1.0);
-    let xs = dot(x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7, one);
-    var r = wscales[g * {stride}u] * (d - {offset}.0 * xs);
-    if ({bias}) {{ r += wscales[g * {stride}u + 1u] * xs; }}
+    let s0 = dot(x0 + x1 + x2 + x3, one);
+    let s1 = dot(x4 + x5 + x6 + x7, one);
+    if (GROUP == 32u) {
+        let g = ci * STRIDE;
+        var r = wscales[g] * (d0 + d1 - OFF * (s0 + s1));
+        if (SB) { r += wscales[g + 1u] * (s0 + s1); }
+        return r;
+    }
+    let g = 2u * ci * STRIDE;
+    var r = wscales[g] * (d0 - OFF * s0) + wscales[g + STRIDE] * (d1 - OFF * s1);
+    if (SB) { r += wscales[g + 1u] * s0 + wscales[g + STRIDE + 1u] * s1; }
     return r;
-}}
-"#,
-            stride = 1 + bias as u32
-        ),
+}
+"#
+        }
         GpuFormat::Q8 { group, bias } => format!(
             r#"
 const CHUNK: u32 = 16u;
