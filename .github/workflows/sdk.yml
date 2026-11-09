@@ -1,0 +1,23 @@
+name: Browser SDK contract
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm run typecheck
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install playwright==1.56.0
+      - run: python -m playwright install --with-deps chromium
+      - name: Check the actual module worker with a no-GPU protocol fixture
+        run: python tests/sdk_browser_test.py --runtime web --chromium

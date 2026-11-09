@@ -5,12 +5,12 @@ from playwright.sync_api import sync_playwright
 from browser_test import serve, FLAGS
 
 
-def check(runtime, model=None):
+def check(runtime, model=None, chromium=False):
     server=serve(runtime)
     base=f'http://127.0.0.1:{server.server_address[1]}/play/evolve-llm/'
     try:
         with sync_playwright() as p:
-            browser=p.chromium.launch(executable_path='/usr/bin/google-chrome',args=FLAGS)
+            browser=p.chromium.launch(**({} if chromium else {'executable_path':'/usr/bin/google-chrome','args':FLAGS}))
             page=browser.new_page();errors=[];remote=[]
             page.on('pageerror',lambda e:errors.append(str(e)))
             page.on('request',lambda r:remote.append(r.url) if not r.url.startswith(base) else None)
@@ -56,4 +56,5 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--runtime',type=Path,required=True)
     parser.add_argument('--model',type=Path)
-    args=parser.parse_args();check(args.runtime,args.model)
+    parser.add_argument('--chromium',action='store_true',help='Use Playwright Chromium for the no-GPU fixture in CI')
+    args=parser.parse_args();check(args.runtime,args.model,args.chromium)
