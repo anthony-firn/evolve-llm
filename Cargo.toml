@@ -42,6 +42,12 @@ debug = false
 lto = "thin"
 codegen-units = 4
 
+# The browser build: whole-program optimization for a smaller, faster engine.
+[profile.wasm]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 [profile.dev]
 debug = 0
 opt-level = 1
