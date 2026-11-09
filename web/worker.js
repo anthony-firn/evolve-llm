@@ -1,6 +1,7 @@
 // Runs the WebAssembly engine off the main thread: downloads, GPU upload and generation.
 import init, { create_loader, inspect, inspect_parts } from './pkg/evolve_llm.js';
 import { formatBytes } from './models.js';
+import { TOOL_SCHEMAS, parseToolCalls, runTool, webSearch } from './tools.js';
 
 const CHUNK = 16 << 20; // bytes read from the file per upload call
 const post = (type, data = {}) => self.postMessage({ type, ...data });
@@ -10,6 +11,8 @@ let chat = null;
 // Synchronous readers of the loaded model's files, kept open while it runs: weights that do not
 // fit on the GPU are read again from them.
 let readers = [];
+// Whether the loaded model's chat template offers tools to the model.
+let toolTemplate = false;
 let stopRequested = false;
 let cancelLoad = false;
 let downloadAbort = null;
@@ -329,6 +332,11 @@ async function loadModel(source, wantCtx, lowPower, budgetPref) {
     loader.set_source((file, offset, target) => files[file].read(offset, target));
     post('progress', { phase: 'prepare', loaded: total, total });
     chat = loader.finish(ctx);
+    try {
+      toolTemplate = chat.render(JSON.stringify([{ role: 'user', content: 'Hi' }]), JSON.stringify({ tools: TOOL_SCHEMAS })).includes('web_search');
+    } catch {
+      toolTemplate = false;
+    }
   } finally {
     loader.free();
   }
@@ -345,17 +353,13 @@ function unload() {
 
 // ---- Generation ----
 
-async function generate({ messages, options, sampler, maxTokens }) {
-  if (!chat) throw new Error('Load a model first.');
-  stopRequested = false;
-  chat.set_sampler(JSON.stringify(sampler));
-  const ctx = chat.context_length();
-  const opts = JSON.stringify(options || {});
+// One model turn: fit the conversation in the context, read it, and generate until the end.
+async function turn(messages, opts, maxTokens, ctx) {
   let msgs = messages;
   let tokens;
   let dropped = 0;
   for (;;) {
-    tokens = chat.prompt(JSON.stringify(msgs), opts);
+    tokens = chat.prompt(JSON.stringify(msgs), JSON.stringify(opts));
     if (tokens.length + Math.min(maxTokens, 256) < ctx) break;
     const first = msgs.findIndex((m) => m.role !== 'system');
     if (first === -1 || msgs.length - first <= 1) {
@@ -366,23 +370,89 @@ async function generate({ messages, options, sampler, maxTokens }) {
   }
   const t0 = performance.now();
   const pre = JSON.parse(await chat.prefill(tokens));
+  post('prefill', { ...pre, ms: performance.now() - t0, dropped, promptTokens: tokens.length });
   const t1 = performance.now();
-  post('prefill', { ...pre, ms: t1 - t0, dropped, promptTokens: tokens.length });
   const limit = Math.min(maxTokens, ctx - tokens.length - 1);
   let n = 0;
   let reason = 'length';
+  let text = '';
   while (n < limit) {
     if (stopRequested) { reason = 'stopped'; break; }
     const id = await chat.next();
     n++;
     if (chat.is_end(id)) { reason = 'end'; break; }
-    const text = chat.piece(id);
-    if (text) post('token', { text });
+    const piece = chat.piece(id);
+    if (piece) {
+      text += piece;
+      post('token', { text: piece });
+    }
   }
   const tail = chat.flush();
-  if (tail) post('token', { text: tail });
-  const t2 = performance.now();
-  post('done', { reason, tokens: n, ms: t2 - t1, used: chat.context_used(), context: ctx, stream: JSON.parse(chat.stats()) });
+  if (tail) {
+    text += tail;
+    post('token', { text: tail });
+  }
+  return { text, n, reason, ms: performance.now() - t1 };
+}
+
+const MAX_TOOL_ROUNDS = 3;
+
+async function generate({ messages, options, sampler, maxTokens, internet }) {
+  if (!chat) throw new Error('Load a model first.');
+  stopRequested = false;
+  chat.set_sampler(JSON.stringify(sampler));
+  const ctx = chat.context_length();
+  const opts = { ...(options || {}) };
+  const tools = { jinaKey: internet?.jinaKey || '' };
+  let msgs = messages;
+  if (internet?.enabled && toolTemplate) {
+    opts.tools = TOOL_SCHEMAS;
+  } else if (internet?.enabled) {
+    // The template has no tools: search for the question first and give the model the results.
+    const last = msgs[msgs.length - 1];
+    const query = last.content.replace(/\s+/g, ' ').trim().slice(0, 160);
+    post('tool', { name: 'web_search', args: { query } });
+    const res = await webSearch(query, tools);
+    post('tool-result', { name: 'web_search', args: { query }, sources: res.sources });
+    msgs = [...msgs.slice(0, -1), { role: last.role,
+      content: `Web search results that may help (cite them as [1], [2] when you use them):\n\n${res.text}\n\nQuestion: ${last.content}` }];
+  }
+  let tokens = 0;
+  let ms = 0;
+  let reason = 'end';
+  const done = new Set();
+  for (let round = 0; ; round++) {
+    const r = await turn(msgs, opts, maxTokens, ctx);
+    tokens += r.n;
+    ms += r.ms;
+    reason = r.reason;
+    if (!opts.tools || reason === 'stopped') break;
+    const calls = parseToolCalls(r.text);
+    if (!calls.length) break;
+    const fresh = calls.filter((c) => !done.has(JSON.stringify(c))).slice(0, 3);
+    if (fresh.length && round < MAX_TOOL_ROUNDS) {
+      msgs = [...msgs, { role: 'assistant', content: r.text }];
+      for (const c of fresh) {
+        done.add(JSON.stringify(c));
+        post('tool', c);
+        const res = await runTool(c, tools);
+        post('tool-result', { ...c, sources: res.sources });
+        msgs.push({ role: 'tool', content: res.text });
+      }
+      if (stopRequested) { reason = 'stopped'; break; }
+      post('round');
+      continue;
+    }
+    // The model repeats itself or used its rounds: answer from what was found, without tools.
+    delete opts.tools;
+    post('round');
+    const final = await turn(msgs, opts, maxTokens, ctx);
+    tokens += final.n;
+    ms += final.ms;
+    reason = final.reason;
+    break;
+  }
+  post('done', { reason, tokens, ms, used: chat.context_used(), context: ctx, stream: JSON.parse(chat.stats()) });
 }
 
 // ---- Messages from the page ----

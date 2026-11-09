@@ -232,3 +232,25 @@ button:disabled{cursor:not-allowed;opacity:.5}
   .msg.user .bubble{max-width:92%}
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+
+.list-title{padding:6px 6px 0;font-size:.95rem}
+.list-note{padding:0 6px;margin-top:-6px;color:var(--muted);font-size:.8rem;line-height:1.45}
+.hf-results{list-style:none;padding:0;margin-top:10px;display:flex;flex-direction:column;gap:6px;max-height:260px;overflow-y:auto}
+.hf-results button{display:flex;justify-content:space-between;gap:10px;width:100%;text-align:left;padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:var(--bg);font-size:.8rem}
+.hf-results button:hover{border-color:var(--line-3)}
+.hf-results .name{font-family:var(--mono);overflow-wrap:anywhere}
+.hf-results .size{flex:none;color:var(--muted)}
+.web-toggle{display:inline-flex;align-items:center;gap:6px;align-self:center;height:34px;padding:0 10px;border-radius:999px;border:1px solid var(--line-2);background:var(--tint);color:var(--muted);font-size:.8rem;font-weight:600}
+.web-toggle svg{width:16px;height:16px}
+.web-toggle[aria-pressed=true]{color:var(--text);border-color:rgba(255,155,74,.6);background:rgba(255,155,74,.14)}
+.web-toggle:disabled{opacity:.5}
+.settings fieldset.web{border:1px solid var(--line);border-radius:12px;padding:10px 12px 12px;gap:8px}
+.settings fieldset.web legend{padding:0 6px;font-weight:600}
+.settings input[type=password]{padding:9px 10px;border-radius:10px;border:1px solid var(--line-2);background:var(--bg);font:500 .84rem var(--mono)}
+.web-steps{list-style:none;padding:0;margin:0 0 10px;display:flex;flex-direction:column;gap:6px}
+.web-steps>li{border:1px solid var(--line);border-radius:11px;background:var(--tint);padding:7px 11px;font-size:.84rem;color:var(--muted)}
+.web-steps summary{cursor:pointer}
+.web-steps .running::after{content:'…'}
+.web-steps ol{margin:6px 0 2px 18px;display:flex;flex-direction:column;gap:3px}
+.web-steps a{color:var(--text-2);overflow-wrap:anywhere}
+@media (max-width:540px){.web-toggle span{display:none}.web-toggle{padding:0 8px}}

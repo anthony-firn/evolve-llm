@@ -22,6 +22,9 @@ pub struct Options {
     /// Qwen3-style switch; passed to the template when set.
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    /// Function schemas (OpenAI style) offered to models whose templates support tools.
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
 }
 
 /// ChatML, used when a model ships without a template.
@@ -125,6 +128,9 @@ impl ChatTemplate {
         });
         if let Some(t) = opts.enable_thinking {
             ctx["enable_thinking"] = t.into();
+        }
+        if let Some(t) = &opts.tools {
+            ctx["tools"] = t.clone();
         }
         tmpl.render(Serde(&ctx)).map_err(|e| {
             let mut msg = format!("chat template: {e}");

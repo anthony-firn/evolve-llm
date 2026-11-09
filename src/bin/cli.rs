@@ -196,6 +196,7 @@ fn main() {
                     &Options {
                         date: Some((2026, 11, 8)),
                         enable_thinking: Some(false),
+                        tools: None,
                     },
                 )
                 .unwrap()

@@ -64,6 +64,21 @@ BLOCKS = {
 }
 
 
+# The tools the browser app offers, and a conversation in the form it keeps: the model's raw
+# tool-call text as the assistant turn, then the tool's answer.
+TOOLS = [
+    {"type": "function", "function": {"name": "web_search", "description": "Search the web.",
+     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "open_url", "description": "Read a web page.",
+     "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
+]
+TOOL_CONVERSATION = [
+    {"role": "user", "content": "Who maintains WebGPU?"},
+    {"role": "assistant", "content": '<tool_call>\n{"name": "web_search", "arguments": {"query": "WebGPU maintainer"}}\n</tool_call>'},
+    {"role": "tool", "content": "[1] WebGPU - Wikipedia: developed by the W3C GPU for the Web working group."},
+]
+
+
 def quant_fixtures(rng):
     cases = []
     for t, (size, halves) in BLOCKS.items():
@@ -116,8 +131,12 @@ def model_fixture(key, models, tokdir, logits):
             text = hf.apply_chat_template(CONVERSATION, chat_template=template, tokenize=False,
                                           add_generation_prompt=True, date_string="08 Nov 2026", **extra)
             chats.append({"messages": CONVERSATION, "options": {"date": [2026, 11, 8], **extra}, "text": text})
-        fx["chat"] = chats
         prompt = chats[-1]["text"]
+        if key in ("qwen25", "qwen3", "llama32"):
+            text = hf.apply_chat_template(TOOL_CONVERSATION, tools=TOOLS, chat_template=template, tokenize=False,
+                                          add_generation_prompt=True, date_string="08 Nov 2026")
+            chats.append({"messages": TOOL_CONVERSATION, "options": {"date": [2026, 11, 8], "tools": TOOLS}, "text": text})
+        fx["chat"] = chats
     else:
         prompt = "Once upon a time, a little robot"
     ids = tok.encode(prompt, add_special_tokens=False).ids

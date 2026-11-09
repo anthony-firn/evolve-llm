@@ -329,6 +329,68 @@
     ]
    },
    "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 08 Nov 2026\n\nYou are a concise assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is WebGPU?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nA browser API for GPU graphics and compute.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nCan it run language models?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Who maintains WebGPU?"
+    },
+    {
+     "role": "assistant",
+     "content": "<tool_call>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"WebGPU maintainer\"}}\n</tool_call>"
+    },
+    {
+     "role": "tool",
+     "content": "[1] WebGPU - Wikipedia: developed by the W3C GPU for the Web working group."
+    }
+   ],
+   "options": {
+    "date": [
+     2026,
+     11,
+     8
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "web_search",
+       "description": "Search the web.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "open_url",
+       "description": "Read a web page.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "url": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "url"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "text": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nEnvironment: ipython\nCutting Knowledge Date: December 2023\nToday Date: 08 Nov 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nGiven the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.\n\nRespond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n{\n    \"type\": \"function\",\n    \"function\": {\n        \"name\": \"web_search\",\n        \"description\": \"Search the web.\",\n        \"parameters\": {\n            \"type\": \"object\",\n            \"properties\": {\n                \"query\": {\n                    \"type\": \"string\"\n                }\n            },\n            \"required\": [\n                \"query\"\n            ]\n        }\n    }\n}\n\n{\n    \"type\": \"function\",\n    \"function\": {\n        \"name\": \"open_url\",\n        \"description\": \"Read a web page.\",\n        \"parameters\": {\n            \"type\": \"object\",\n            \"properties\": {\n                \"url\": {\n                    \"type\": \"string\"\n                }\n            },\n            \"required\": [\n                \"url\"\n            ]\n        }\n    }\n}\n\nWho maintains WebGPU?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n<tool_call>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"WebGPU maintainer\"}}\n</tool_call><|eot_id|><|start_header_id|>ipython<|end_header_id|>\n\n\"[1] WebGPU - Wikipedia: developed by the W3C GPU for the Web working group.\"<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
   }
  ],
  "prompt_ids": [

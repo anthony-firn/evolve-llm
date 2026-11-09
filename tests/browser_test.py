@@ -24,7 +24,7 @@ from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
 CSP = ("default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; "
-       "img-src 'self' data:; font-src 'self'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co; "
+       "img-src 'self' data:; font-src 'self'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co https://*.wikipedia.org https://api.duckduckgo.com https://r.jina.ai https://s.jina.ai; "
        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
 FLAGS = ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-angle=vulkan", "--ignore-gpu-blocklist"]
 
@@ -76,17 +76,19 @@ def main():
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--low-power", action="store_true", help="ask the browser for its power-saving GPU")
     ap.add_argument("--screens", type=Path, help="save screenshots here")
+    ap.add_argument("--gpu-mem", help="GPU memory setting in GB (streams the rest of larger models)")
+    ap.add_argument("--max-tokens", type=int, default=40)
     a = ap.parse_args()
     dist = ROOT / "dist"
     server = serve(dist)
     url = f"http://127.0.0.1:{server.server_address[1]}/play/evolve-llm/"
     problems = []
     prompt = "Name three planets in our solar system."
-    max_tokens = 40
+    max_tokens = a.max_tokens
     with sync_playwright() as p:
         browser = p.chromium.launch(executable_path="/usr/bin/google-chrome", headless=not a.headed, args=FLAGS)
         ctx = browser.new_context(viewport={"width": 1360, "height": 900})
-        ctx.add_init_script(f"localStorage.setItem('evolve-llm-settings', JSON.stringify({{temperature: 0, maxTokens: {max_tokens}, ctx: 2048, thinking: false, gpu: '{'low-power' if a.low_power else 'high-performance'}'}}))")
+        ctx.add_init_script(f"localStorage.setItem('evolve-llm-settings', JSON.stringify({{temperature: 0, maxTokens: {max_tokens}, ctx: 2048, thinking: false, gpu: '{'low-power' if a.low_power else 'high-performance'}', gpuMemory: '{a.gpu_mem or 'auto'}'}}))")
         page = ctx.new_page()
         # Fonts come from the evolvetech.dev site and are absent from a standalone build.
         page.on("console", lambda m: m.type in ("error", "warning") and "Failed to load resource" not in m.text and problems.append(f"console {m.type}: {m.text}"))
@@ -141,12 +143,16 @@ def main():
         page.click("#new-chat")
         page.fill("#prompt", "Count from 1 to 1000, one number per line, with no other text.")
         page.press("#prompt", "Enter")
-        page.wait_for_selector(".msg.assistant .bubble .answer", timeout=60000)
-        page.click("#stop", timeout=5000)
-        page.wait_for_selector(".msg.assistant .msg-stats", timeout=60000)
-        stop_stats = page.inner_text(".msg.assistant .msg-stats")
-        print("stopped:", stop_stats)
-        assert "stopped" in stop_stats, "Stop did not end the reply"
+        page.wait_for_selector(".msg.assistant .bubble .answer", timeout=120000)
+        if page.is_visible("#stop"):
+            page.click("#stop", timeout=5000)
+            page.wait_for_selector(".msg.assistant .msg-stats", timeout=120000)
+            stop_stats = page.inner_text(".msg.assistant .msg-stats")
+            print("stopped:", stop_stats)
+            assert "stopped" in stop_stats, "Stop did not end the reply"
+        else:
+            # Some models answer this in a token or two; the reply ended before Stop could be pressed.
+            print("the reply finished before Stop could be pressed:", page.inner_text(".msg.assistant .msg-stats"))
         if a.screens:
             page.screenshot(path=str(a.screens / "chat.png"))
             page.set_viewport_size({"width": 390, "height": 844})

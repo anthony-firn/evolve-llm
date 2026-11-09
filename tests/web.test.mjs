@@ -76,3 +76,63 @@ test('catalog entries are complete and storage keys are stable', () => {
   assert.equal(formatBytes(491400032), '491 MB');
   assert.equal(formatBytes(2497280256), '2.50 GB');
 });
+
+import { openUrl, parseToolCalls, stripToolCalls, webSearch } from '../web/tools.js';
+
+test('reads tool calls in the forms models write them', () => {
+  assert.deepEqual(parseToolCalls('Let me look.\n<tool_call>\n{"name": "web_search", "arguments": {"query": "WebGPU"}}\n</tool_call>'),
+    [{ name: 'web_search', args: { query: 'WebGPU' } }]);
+  assert.deepEqual(parseToolCalls('{"name": "open_url", "parameters": {"url": "https://example.com"}}'),
+    [{ name: 'open_url', args: { url: 'https://example.com' } }]);
+  assert.deepEqual(parseToolCalls('<|python_tag|>{"name": "web_search", "parameters": {"query": "x"}}'), [{ name: 'web_search', args: { query: 'x' } }]);
+  assert.deepEqual(parseToolCalls('<tool_call>{"name": "rm_rf", "arguments": {}}</tool_call>'), []);
+  assert.deepEqual(parseToolCalls('The answer is {"name": "web_search"} in prose.'), []);
+  assert.equal(stripToolCalls('Sure.<tool_call>{"name": "web_search", "arguments": {"query": "a"}}</tool_call>'), 'Sure.');
+  assert.equal(stripToolCalls('Thinking <tool_call>{"name": "web'), 'Thinking ');
+  assert.equal(stripToolCalls('{"name": "web_search", "parameters": {"query": "a"}}'), '');
+  assert.equal(stripToolCalls('Plain answer.'), 'Plain answer.');
+});
+
+function fakeFetch(routes) {
+  const calls = [];
+  const fn = async (url, init) => {
+    calls.push({ url, init });
+    for (const [prefix, body] of routes) {
+      if (url.startsWith(prefix)) {
+        return { ok: true, status: 200, json: async () => body, text: async () => (typeof body === 'string' ? body : JSON.stringify(body)) };
+      }
+    }
+    return { ok: false, status: 503, json: async () => ({}), text: async () => '' };
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+test('web search merges Wikipedia and DuckDuckGo results with numbered links', async () => {
+  const fetchFn = fakeFetch([
+    ['https://en.wikipedia.org/w/api.php?action=query&list=search', { query: { search: [{ title: 'WebGPU', snippet: 'A <span class="searchmatch">graphics</span> API &amp; more' }] } }],
+    ['https://api.duckduckgo.com/', { Heading: 'WebGPU', AbstractText: 'WebGPU is a web API.', AbstractURL: 'https://en.wikipedia.org/wiki/WebGPU',
+      RelatedTopics: [{ Text: 'WGSL - shading language', FirstURL: 'https://duckduckgo.com/WGSL' }, { Topics: [{ Text: 'Vulkan - API', FirstURL: 'https://duckduckgo.com/Vulkan' }] }] }],
+  ]);
+  const r = await webSearch('webgpu', { fetchFn, lang: 'en' });
+  assert.deepEqual(r.sources.map((s) => s.url), ['https://en.wikipedia.org/wiki/WebGPU', 'https://duckduckgo.com/WGSL', 'https://duckduckgo.com/Vulkan']);
+  assert.match(r.text, /^\[1\] WebGPU \(Wikipedia\)\nhttps:\/\/en\.wikipedia\.org\/wiki\/WebGPU\nA graphics API & more/);
+  assert.match(r.text, /\[3\] Vulkan/);
+  assert.ok(fetchFn.calls.every((c) => !c.init?.headers?.Authorization), 'no key is sent without one');
+  const none = await webSearch('x', { fetchFn: fakeFetch([]), lang: 'en' });
+  assert.equal(none.text, 'The search services could not be reached.');
+});
+
+test('pages open through Wikipedia or Jina Reader, and only web addresses open', async () => {
+  const fetchFn = fakeFetch([
+    ['https://de.wikipedia.org/w/api.php?action=query&prop=extracts', { query: { pages: { 1: { title: 'WebGPU', extract: 'Text '.repeat(3000) } } } }],
+    ['https://r.jina.ai/https://example.com/a', 'Title: Example\n\nBody'],
+  ]);
+  const w = await openUrl('https://de.wikipedia.org/wiki/WebGPU', { fetchFn });
+  assert.equal(w.text.length, 6000);
+  assert.equal(w.sources[0].title, 'WebGPU (Wikipedia)');
+  const j = await openUrl('https://example.com/a', { fetchFn });
+  assert.equal(j.sources[0].title, 'Example');
+  assert.match((await openUrl('javascript:alert(1)', { fetchFn })).text, /Only http/);
+  assert.match((await openUrl('not a url', { fetchFn })).text, /not a web address/);
+});

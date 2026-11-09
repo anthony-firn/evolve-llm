@@ -1,11 +1,12 @@
 import { LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from './models.js';
 import { renderMarkdown, splitThinking } from './markdown.js';
+import { stripToolCalls } from './tools.js';
 
 const $ = (id) => document.getElementById(id);
 const app = $('app');
 const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 
-const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto' };
+const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', internet: false, jinaKey: '' };
 const SUGGESTIONS = [
   'Explain WebGPU to a curious 12-year-old.',
   'Write a haiku about running AI on my own laptop.',
@@ -331,9 +332,32 @@ function copyText(text, button) {
   navigator.clipboard?.writeText(text).then(done, () => {});
 }
 
+function safeHref(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:' || u.protocol === 'http:' ? u.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function stepNode(step) {
+  const what = step.name === 'web_search'
+    ? `Searched the web for “${step.args?.query || ''}”`
+    : `Read ${String(step.args?.url || '').replace(/^https?:\/\//, '').slice(0, 80)}`;
+  if (!step.done) return el('li', { class: 'running', text: what });
+  const links = (step.sources || []).map((s) => {
+    const href = safeHref(s.url);
+    return el('li', {}, href ? el('a', { href, target: '_blank', rel: 'noopener noreferrer', text: s.title || href }) : el('span', { text: s.title || '' }));
+  });
+  if (!links.length) return el('li', { text: `${what} · nothing found` });
+  return el('li', {}, el('details', {}, el('summary', { text: `${what} · ${links.length} ${links.length === 1 ? 'source' : 'sources'}` }), el('ol', {}, ...links)));
+}
+
 function fillAssistant(bubble, m) {
-  const parts = splitThinking(m.content);
+  const parts = splitThinking(stripToolCalls(m.content));
   const nodes = [];
+  if (m.steps?.length) nodes.push(el('ul', { class: 'web-steps', 'aria-label': 'Web activity' }, ...m.steps.map(stepNode)));
   for (const p of parts) {
     if (p.kind === 'think') {
       const words = p.text.trim().split(/\s+/).filter(Boolean).length;
@@ -396,8 +420,15 @@ function conversation() {
   const msgs = [];
   const system = state.settings.system.trim();
   if (system) msgs.push({ role: 'system', content: system });
-  for (const m of state.messages) if (!m.error && (m.role === 'user' || m.role === 'assistant')) msgs.push({ role: m.role, content: m.content });
+  for (const m of state.messages) if (!m.error && (m.role === 'user' || m.role === 'assistant')) msgs.push({ role: m.role, content: m.role === 'assistant' ? stripToolCalls(m.content) : m.content });
   return msgs;
+}
+
+function syncWebToggle() {
+  const on = Boolean(state.settings.internet);
+  const b = $('web-toggle');
+  b.setAttribute('aria-pressed', String(on));
+  b.title = on ? 'Web search is on: search terms go to Wikipedia, DuckDuckGo and Jina' : 'Let the model search the web';
 }
 
 function send(text) {
@@ -428,13 +459,27 @@ function runGeneration() {
     options: { date: [now.getFullYear(), now.getMonth() + 1, now.getDate()], enable_thinking: Boolean(s.thinking) },
     sampler: { temperature: Number(s.temperature), top_p: Number(s.top_p), top_k: Number(s.top_k), min_p: Number(s.min_p), repeat_penalty: Number(s.repeat_penalty), repeat_last_n: 64, seed: (Math.random() * 2 ** 32) >>> 0 },
     maxTokens: Number(s.maxTokens),
+    internet: { enabled: Boolean(s.internet), jinaKey: s.jinaKey || '' },
   });
 }
 
 function onPrefill(p) {
   if (!state.live) return;
-  state.live.prefill = p;
+  state.live.prefill ??= p;
   if (p.dropped) state.live.dropped = p.dropped;
+}
+
+function onTool(msg, done) {
+  const m = state.live;
+  if (!m) return;
+  m.steps ??= [];
+  if (done) {
+    const step = [...m.steps].reverse().find((s) => !s.done && s.name === msg.name) || m.steps[m.steps.length - 1];
+    if (step) Object.assign(step, { done: true, sources: msg.sources });
+  } else {
+    m.steps.push({ name: msg.name, args: msg.args, done: false });
+  }
+  scheduleLiveRender();
 }
 
 function onDone(d) {
@@ -496,6 +541,12 @@ worker.onmessage = (event) => {
         scheduleLiveRender();
       }
       break;
+    case 'tool': onTool(msg, false); break;
+    case 'tool-result': onTool(msg, true); break;
+    case 'round':
+      // The model's next turn after a tool result replaces the tool-call text.
+      if (state.live) { state.live.content = ''; scheduleLiveRender(); }
+      break;
     case 'done': onDone(msg); break;
     case 'error': onError(msg); break;
     case 'unloaded': break;
@@ -530,6 +581,14 @@ $('composer').addEventListener('submit', (e) => {
   send(text);
 });
 $('stop').addEventListener('click', () => worker.postMessage({ type: 'stop' }));
+$('web-toggle').addEventListener('click', () => {
+  state.settings.internet = !state.settings.internet;
+  saveSettings();
+  syncWebToggle();
+  $('status-line').textContent = state.settings.internet
+    ? 'Web search is on. Search terms and pages the model opens go to Wikipedia, DuckDuckGo and Jina Reader; the conversation stays here.'
+    : 'Web search is off. Nothing leaves this device.';
+});
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && state.phase === 'generating') worker.postMessage({ type: 'stop' });
 });
@@ -612,11 +671,16 @@ function fillSettings() {
   form.elements.gpu.value = s.gpu;
   form.elements.gpuMemory.value = String(s.gpuMemory);
   form.elements.thinking.checked = Boolean(s.thinking);
+  form.elements.internet.checked = Boolean(s.internet);
+  form.elements.jinaKey.value = s.jinaKey || '';
 }
 form.addEventListener('input', (e) => {
   const t = e.target;
   if (!t.name) return;
-  if (t.type === 'checkbox') state.settings[t.name] = t.checked;
+  if (t.type === 'checkbox') {
+    state.settings[t.name] = t.checked;
+    if (t.name === 'internet') syncWebToggle();
+  }
   else if (t.type === 'range') {
     state.settings[t.name] = Number(t.value);
     form.elements[`${t.name}Out`].value = t.value;
@@ -636,8 +700,10 @@ $('reset-settings').addEventListener('click', () => {
   state.settings = { ...DEFAULTS };
   saveSettings();
   fillSettings();
+  syncWebToggle();
   worker.postMessage({ type: 'adapter', gpu: state.settings.gpu });
 });
 
 setPhase('starting');
+syncWebToggle();
 worker.postMessage({ type: 'hello', gpu: state.settings.gpu });
