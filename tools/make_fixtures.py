@@ -59,6 +59,8 @@ BLOCKS = {
     Q.Q4_0: (18, [0]), Q.Q4_1: (20, [0, 2]), Q.Q5_0: (22, [0]), Q.Q5_1: (24, [0, 2]), Q.Q8_0: (34, [0]),
     Q.Q2_K: (84, [80, 82]), Q.Q3_K: (110, [108]), Q.Q4_K: (144, [0, 2]), Q.Q5_K: (176, [0, 2]),
     Q.Q6_K: (210, [208]), Q.IQ4_NL: (18, [0]), Q.IQ4_XS: (136, [0]),
+    Q.IQ2_XXS: (66, [0]), Q.IQ2_XS: (74, [0]), Q.IQ2_S: (82, [0]), Q.IQ3_XXS: (98, [0]), Q.IQ3_S: (110, [0]),
+    Q.IQ1_S: (50, [0]), Q.IQ1_M: (56, []), Q.TQ1_0: (54, [52]), Q.TQ2_0: (66, [64]), Q.MXFP4: (17, []),
 }
 
 
@@ -70,6 +72,15 @@ def quant_fixtures(rng):
             for h in halves:
                 v = np.float16(rng.uniform(-0.05, 0.05) if b else 0.01)
                 raw[b * size + h:b * size + h + 2] = v.tobytes()
+            if t == Q.MXFP4:
+                raw[b * size] = 115 + b * 3
+            if t == Q.IQ1_M:
+                # The f16 scale is spread over the top nibbles of the four 16-bit scale words.
+                d = int(np.float16(0.01 + 0.02 * b).view(np.uint16))
+                for i in range(4):
+                    at = b * size + 48 + 2 * i
+                    w = (raw[at] | raw[at + 1] << 8) & 0x0FFF | ((d >> (4 * i)) & 15) << 12
+                    raw[at:at + 2] = w.to_bytes(2, "little")
         values = dequantize(np.frombuffer(bytes(raw), dtype=np.uint8), t).astype(np.float32).reshape(-1)
         cases.append({"type": int(t), "name": t.name, "bytes": base64.b64encode(bytes(raw)).decode(),
                       "values": [float(v) for v in values]})
@@ -129,8 +140,9 @@ def model_fixture(key, models, tokdir, logits):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", type=Path, required=True)
-    ap.add_argument("--tokenizers", type=Path, required=True)
+    ap.add_argument("--models", type=Path)
+    ap.add_argument("--tokenizers", type=Path)
+    ap.add_argument("--quant-only", action="store_true", help="only rewrite quant.json")
     ap.add_argument("--skip-logits", action="store_true")
     ap.add_argument("--only", nargs="*")
     a = ap.parse_args()
@@ -138,6 +150,8 @@ def main():
     rng = np.random.default_rng(2026)
     (OUT / "quant.json").write_text(json.dumps(quant_fixtures(rng)))
     print("quant.json")
+    if a.quant_only:
+        return
     for key in a.only or MODELS:
         fx = model_fixture(key, a.models, a.tokenizers, not a.skip_logits)
         (OUT / f"{key}.json").write_text(json.dumps(fx, ensure_ascii=False, indent=1))

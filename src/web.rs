@@ -65,10 +65,9 @@ fn describe(g: &gguf::Gguf) -> Result<ModelInfo, String> {
             .entry(quant::type_name(t.ggml_type).to_string())
             .or_insert(0) += (rows * k) as u64;
         parameters += (rows * k) as u64;
-        let (c, s) = quant::GpuFormat::for_type(t.ggml_type)
+        gpu_weight_bytes += quant::GpuFormat::for_type(t.ggml_type)
             .unwrap()
-            .sizes(k, rows);
-        gpu_weight_bytes += c + s;
+            .bytes(k, rows);
         file_bytes += quant::row_bytes(t.ggml_type, k)? as u64 * rows as u64;
     }
     for (_, len) in model::vectors(&config) {

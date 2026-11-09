@@ -1,6 +1,7 @@
 //! WebGPU device access through wgpu. The same code drives Vulkan, Metal or
 //! D3D12 natively and the browser's WebGPU implementation from WebAssembly.
 
+pub mod blocks;
 pub mod engine;
 pub mod shaders;
 

@@ -4,6 +4,7 @@ pub mod chat;
 pub mod cpu;
 pub mod gguf;
 pub mod gpu;
+pub mod iq_tables;
 pub mod model;
 pub mod quant;
 pub mod sampler;

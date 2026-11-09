@@ -1,6 +1,7 @@
 //! WGSL compute kernels. Weight formats are compiled in as constants, so each
 //! matrix layout gets its own specialised matrix-vector and matrix-matrix kernel.
 
+use super::blocks;
 use crate::quant::GpuFormat;
 
 /// Bindings shared by every kernel: per-step values and per-dispatch parameters.
@@ -9,12 +10,19 @@ struct Step { n_tokens: u32, pos0: u32, kv_len: u32, last: u32 }
 @group(0) @binding(0) var<uniform> step: Step;
 "#;
 
+/// Binding 3 of the matrix kernels: f32 scales of an expanded layout, or the code books.
+fn binding3(fmt: GpuFormat) -> &'static str {
+    match fmt {
+        GpuFormat::Block(_) => "@group(0) @binding(3) var<storage, read> tabs: array<u32>;\n",
+        _ => "@group(0) @binding(3) var<storage, read> wscales: array<f32>;\n",
+    }
+}
+
 /// Matrix kernels: params, weight codes, weight scales, input, output, bias.
 const MATMUL_BINDINGS: &str = r#"
 struct P { K: u32, N: u32, out_stride: u32, out_offset: u32, mode: u32, has_bias: u32, x_offset: u32, pad: u32 }
 @group(0) @binding(1) var<uniform> p: P;
 @group(0) @binding(2) var<storage, read> wcodes: array<u32>;
-@group(0) @binding(3) var<storage, read> wscales: array<f32>;
 @group(0) @binding(4) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> y: array<f32>;
 @group(0) @binding(6) var<storage, read> bias: array<f32>;
@@ -117,6 +125,16 @@ fn load8(r: u32, k: u32) -> W8 {{
 "#,
             stride = 1 + bias as u32
         ),
+        GpuFormat::Block(t) => {
+            blocks::decoder(t)
+                + r#"
+fn load8(r: u32, k: u32) -> W8 {
+    let b = (r * ((p.K + BV - 1u) / BV) + k / BV) * BW;
+    let g = grp(b, (k % BV) >> 3u);
+    return W8(g.a * g.s + vec4<f32>(g.m), g.b * g.s + vec4<f32>(g.m));
+}
+"#
+        }
         GpuFormat::F16 => r#"
 fn load8(r: u32, k: u32) -> W8 {
     let e = (r * p.K + k) >> 1u;
@@ -129,7 +147,7 @@ fn load8(r: u32, k: u32) -> W8 {
     }
 }
 
-/// Dot product of one 16-byte block of weight codes with the matching inputs.
+/// Dot product of one chunk of a weight row with the matching inputs.
 fn gemv_chunk(fmt: GpuFormat) -> String {
     match fmt {
         GpuFormat::Q4 {
@@ -199,6 +217,31 @@ fn chunk_dot(row: u32, c: u32, xb: u32) -> f32 {{
 "#,
             stride = 1 + bias as u32
         ),
+        GpuFormat::Block(t) if blocks::chunk_dot(t).is_some() => {
+            let body = blocks::chunk_dot(t).unwrap();
+            let chunk = if body.contains("const CHUNK") { "" } else { "const CHUNK: u32 = 32u;\n" };
+            format!("{}\n{chunk}{body}", blocks::decoder(t))
+        }
+        GpuFormat::Block(t) => {
+            blocks::decoder(t)
+                + r#"
+const CHUNK: u32 = 32u;
+fn chunk_dot(row: u32, c: u32, xb: u32) -> f32 {
+    let e = c * 32u;
+    let b = (row * ((p.K + BV - 1u) / BV) + e / BV) * BW;
+    let j = (e % BV) >> 3u;
+    let xi = xb + c * 8u;
+    var r = 0.0;
+    for (var i = 0u; i < 4u; i++) {
+        let g = grp(b, j + i);
+        let x0 = x[xi + 2u * i];
+        let x1 = x[xi + 2u * i + 1u];
+        r += g.s * (dot(g.a, x0) + dot(g.b, x1)) + g.m * dot(x0 + x1, vec4<f32>(1.0));
+    }
+    return r;
+}
+"#
+        }
         GpuFormat::F16 => r#"
 const CHUNK: u32 = 8u;
 fn chunk_dot(row: u32, c: u32, xb: u32) -> f32 {
@@ -213,13 +256,18 @@ fn chunk_dot(row: u32, c: u32, xb: u32) -> f32 {
     }
 }
 
-/// One token: sixteen rows per workgroup, sixteen lanes per row, one
-/// 16-byte weight load per lane and step.
+/// One token: `256 / lanes` rows per workgroup, `lanes` lanes per row, one chunk per lane and step.
 pub fn gemv(fmt: GpuFormat, lanes: u32) -> String {
-    let bindings = MATMUL_BINDINGS.replace(
-        "var<storage, read> wcodes: array<u32>;",
-        "var<storage, read> wc4: array<vec4<u32>>;",
-    );
+    let bindings = match fmt {
+        // The same weights again as 16-byte vectors, for kernels whose code arrays are aligned.
+        GpuFormat::Block(_) => MATMUL_BINDINGS.to_string()
+            + binding3(fmt)
+            + "@group(0) @binding(7) var<storage, read> wv4: array<vec4<u32>>;\n",
+        _ => MATMUL_BINDINGS.replace(
+            "var<storage, read> wcodes: array<u32>;",
+            "var<storage, read> wc4: array<vec4<u32>>;",
+        ) + binding3(fmt),
+    };
     format!(
         "{COMMON}{bindings}{}{}{}",
         gemv_chunk(fmt),
@@ -258,7 +306,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 /// Several tokens: 64 rows x 32 tokens per workgroup, through shared-memory tiles.
 pub fn gemm(fmt: GpuFormat) -> String {
     format!(
-        "{COMMON}{MATMUL_BINDINGS}{}{}",
+        "{COMMON}{MATMUL_BINDINGS}{}{}{}",
+        binding3(fmt),
         loader(fmt),
         r#"
 const WS: u32 = 9u; // padded row stride in vec4s, avoids shared-memory bank conflicts
@@ -315,7 +364,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /// Token embedding lookup from a (possibly sharded) quantized table.
 pub fn embed(fmt: GpuFormat) -> String {
     format!(
-        "{COMMON}{MATMUL_BINDINGS}{}{}",
+        "{COMMON}{MATMUL_BINDINGS}{}{}{}",
+        binding3(fmt),
         loader(fmt),
         r#"
 @group(0) @binding(7) var<storage, read> tokens: array<u32>;

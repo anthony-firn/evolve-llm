@@ -18,14 +18,32 @@ pub const Q3_K: u32 = 11;
 pub const Q4_K: u32 = 12;
 pub const Q5_K: u32 = 13;
 pub const Q6_K: u32 = 14;
+pub const IQ2_XXS: u32 = 16;
+pub const IQ2_XS: u32 = 17;
+pub const IQ3_XXS: u32 = 18;
+pub const IQ1_S: u32 = 19;
 pub const IQ4_NL: u32 = 20;
+pub const IQ3_S: u32 = 21;
+pub const IQ2_S: u32 = 22;
 pub const IQ4_XS: u32 = 23;
+pub const IQ1_M: u32 = 29;
 pub const BF16: u32 = 30;
+pub const TQ1_0: u32 = 34;
+pub const TQ2_0: u32 = 35;
+pub const MXFP4: u32 = 39;
 
 /// Non-linear 4-bit code book shared by IQ4_NL and IQ4_XS.
 const IQ4: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
+
+/// E2M1 values of MXFP4, doubled (the shared E8M0 scale is halved to match).
+pub const MXFP4_VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// IQ4_NL code book as floats, for the GPU tables.
+pub fn iq4_values() -> [i8; 16] {
+    IQ4
+}
 
 pub fn type_name(t: u32) -> &'static str {
     match t {
@@ -77,6 +95,16 @@ pub fn block_info(t: u32) -> Option<(usize, usize)> {
         Q6_K => (256, 210),
         IQ4_NL => (32, 18),
         IQ4_XS => (256, 136),
+        IQ2_XXS => (256, 66),
+        IQ2_XS => (256, 74),
+        IQ2_S => (256, 82),
+        IQ3_XXS => (256, 98),
+        IQ3_S => (256, 110),
+        IQ1_S => (256, 50),
+        IQ1_M => (256, 56),
+        TQ1_0 => (256, 54),
+        TQ2_0 => (256, 66),
+        MXFP4 => (32, 17),
         _ => return None,
     })
 }
@@ -384,6 +412,220 @@ fn decode_block(t: u32, b: &[u8], out: &mut Block) {
     }
 }
 
+fn u16le(b: &[u8], at: usize) -> u32 {
+    u16::from_le_bytes([b[at], b[at + 1]]) as u32
+}
+
+fn u32le(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+/// Sign bits of an IQ2/IQ3 group: seven stored bits plus even parity in the eighth.
+fn ksign(i: u32) -> u32 {
+    i | ((i.count_ones() & 1) << 7)
+}
+
+fn signed(signs: u32, j: usize) -> f32 {
+    if (signs >> j) & 1 == 1 {
+        -1.0
+    } else {
+        1.0
+    }
+}
+
+/// Half of an E8M0 exponent scale, as ggml's MXFP4 uses with doubled E2M1 values.
+pub fn e8m0_half(e: u8) -> f32 {
+    f32::from_bits(if e < 2 {
+        0x0020_0000u32 << e
+    } else {
+        ((e as u32) - 1) << 23
+    })
+}
+
+/// Formats decoded straight to floats: code books, ternary and MXFP4.
+fn is_direct(t: u32) -> bool {
+    matches!(
+        t,
+        IQ2_XXS | IQ2_XS | IQ2_S | IQ3_XXS | IQ3_S | IQ1_S | IQ1_M | TQ1_0 | TQ2_0 | MXFP4
+    )
+}
+
+/// One block of a direct format, following ggml's reference dequantizers.
+fn decode_direct(t: u32, b: &[u8], y: &mut [f32]) {
+    use crate::iq_tables::*;
+    let byte = |g: u64, j: usize| ((g >> (8 * j)) & 255) as f32;
+    match t {
+        IQ2_XXS => {
+            let d = half(b, 0);
+            for ib in 0..8 {
+                let a0 = u32le(b, 2 + 8 * ib);
+                let a1 = u32le(b, 6 + 8 * ib);
+                let db = d * (0.5 + (a1 >> 28) as f32) * 0.25;
+                for l in 0..4 {
+                    let grid = IQ2XXS_GRID[((a0 >> (8 * l)) & 255) as usize];
+                    let signs = ksign((a1 >> (7 * l)) & 127);
+                    for j in 0..8 {
+                        y[ib * 32 + l * 8 + j] = db * byte(grid, j) * signed(signs, j);
+                    }
+                }
+            }
+        }
+        IQ2_XS => {
+            let d = half(b, 0);
+            for ib in 0..8 {
+                let sc = b[66 + ib] as u32;
+                for l in 0..4 {
+                    let q = u16le(b, 2 + 2 * (4 * ib + l));
+                    let db = d * (0.5 + ((sc >> (4 * (l / 2))) & 15) as f32) * 0.25;
+                    let grid = IQ2XS_GRID[(q & 511) as usize];
+                    let signs = ksign(q >> 9);
+                    for j in 0..8 {
+                        y[ib * 32 + l * 8 + j] = db * byte(grid, j) * signed(signs, j);
+                    }
+                }
+            }
+        }
+        IQ2_S => {
+            let d = half(b, 0);
+            let (qs, qh, sc) = (&b[2..66], &b[66..74], &b[74..82]);
+            for ib in 0..8 {
+                for l in 0..4 {
+                    let idx = qs[4 * ib + l] as u32 | (((qh[ib] as u32) << (8 - 2 * l)) & 0x300);
+                    let signs = qs[32 + 4 * ib + l] as u32;
+                    let db = d * (0.5 + ((sc[ib] as u32 >> (4 * (l / 2))) & 15) as f32) * 0.25;
+                    let grid = IQ2S_GRID[idx as usize];
+                    for j in 0..8 {
+                        y[ib * 32 + l * 8 + j] = db * byte(grid, j) * signed(signs, j);
+                    }
+                }
+            }
+        }
+        IQ3_XXS => {
+            let d = half(b, 0);
+            let (qs, sas) = (&b[2..66], &b[66..98]);
+            for ib in 0..8 {
+                let aux = u32le(sas, 4 * ib);
+                let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+                for l in 0..4 {
+                    let signs = ksign((aux >> (7 * l)) & 127);
+                    let g1 = IQ3XXS_GRID[qs[8 * ib + 2 * l] as usize] as u64;
+                    let g2 = IQ3XXS_GRID[qs[8 * ib + 2 * l + 1] as usize] as u64;
+                    for j in 0..4 {
+                        y[ib * 32 + l * 8 + j] = db * byte(g1, j) * signed(signs, j);
+                        y[ib * 32 + l * 8 + j + 4] = db * byte(g2, j) * signed(signs, j + 4);
+                    }
+                }
+            }
+        }
+        IQ3_S => {
+            let d = half(b, 0);
+            let (qs, qh, signs, sc) = (&b[2..66], &b[66..74], &b[74..106], &b[106..110]);
+            for ib in 0..8 {
+                let db = d * (1 + 2 * ((sc[ib / 2] as u32 >> (4 * (ib % 2))) & 15)) as f32;
+                let h = qh[ib] as u32;
+                for l in 0..4 {
+                    let i1 = qs[8 * ib + 2 * l] as u32 | ((h << (8 - 2 * l)) & 256);
+                    let i2 = qs[8 * ib + 2 * l + 1] as u32 | ((h << (7 - 2 * l)) & 256);
+                    let (g1, g2) = (IQ3S_GRID[i1 as usize] as u64, IQ3S_GRID[i2 as usize] as u64);
+                    let s = signs[4 * ib + l] as u32;
+                    for j in 0..4 {
+                        y[ib * 32 + l * 8 + j] = db * byte(g1, j) * signed(s, j);
+                        y[ib * 32 + l * 8 + j + 4] = db * byte(g2, j) * signed(s, j + 4);
+                    }
+                }
+            }
+        }
+        IQ1_S => {
+            let d = half(b, 0);
+            let qs = &b[2..34];
+            for ib in 0..8 {
+                let qh = u16le(b, 34 + 2 * ib);
+                let dl = d * (2 * ((qh >> 12) & 7) + 1) as f32;
+                let delta = if qh & 0x8000 != 0 { -0.125 } else { 0.125 };
+                for l in 0..4 {
+                    let idx = qs[4 * ib + l] as u32 | (((qh >> (3 * l)) & 7) << 8);
+                    let grid = IQ1S_GRID[idx as usize];
+                    for j in 0..8 {
+                        let g = (grid >> (8 * j)) as u8 as i8 as f32;
+                        y[ib * 32 + l * 8 + j] = dl * (g + delta);
+                    }
+                }
+            }
+        }
+        IQ1_M => {
+            let (qs, qh) = (&b[0..32], &b[32..48]);
+            let sc = [u16le(b, 48), u16le(b, 50), u16le(b, 52), u16le(b, 54)];
+            let bits = (sc[0] >> 12) | ((sc[1] >> 8) & 0xf0) | ((sc[2] >> 4) & 0xf00) | (sc[3] & 0xf000);
+            let d = f16_to_f32(bits as u16);
+            for ib in 0..8 {
+                let s = sc[ib / 2];
+                let dl1 = d * (2 * ((s >> (6 * (ib % 2))) & 7) + 1) as f32;
+                let dl2 = d * (2 * ((s >> (6 * (ib % 2) + 3)) & 7) + 1) as f32;
+                let (h0, h1) = (qh[2 * ib] as u32, qh[2 * ib + 1] as u32);
+                let idx = [
+                    qs[4 * ib] as u32 | ((h0 << 8) & 0x700),
+                    qs[4 * ib + 1] as u32 | ((h0 << 4) & 0x700),
+                    qs[4 * ib + 2] as u32 | ((h1 << 8) & 0x700),
+                    qs[4 * ib + 3] as u32 | ((h1 << 4) & 0x700),
+                ];
+                let flag = [h0 & 0x08, h0 & 0x80, h1 & 0x08, h1 & 0x80];
+                for l in 0..4 {
+                    let dl = if l < 2 { dl1 } else { dl2 };
+                    let delta = if flag[l] != 0 { -0.125 } else { 0.125 };
+                    let grid = IQ1S_GRID[idx[l] as usize];
+                    for j in 0..8 {
+                        let g = (grid >> (8 * j)) as u8 as i8 as f32;
+                        y[ib * 32 + l * 8 + j] = dl * (g + delta);
+                    }
+                }
+            }
+        }
+        MXFP4 => {
+            let d = e8m0_half(b[0]);
+            for j in 0..16 {
+                y[j] = MXFP4_VALUES[(b[1 + j] & 15) as usize] as f32 * d;
+                y[j + 16] = MXFP4_VALUES[(b[1 + j] >> 4) as usize] as f32 * d;
+            }
+        }
+        TQ1_0 => {
+            let d = half(b, 52);
+            let pow3 = [1u8, 3, 9, 27, 81, 243];
+            let tern = |q: u8, n: usize| (((q.wrapping_mul(pow3[n]) as u16) * 3) >> 8) as f32 - 1.0;
+            let mut o = 0;
+            for n in 0..5 {
+                for m in 0..32 {
+                    y[o] = tern(b[m], n) * d;
+                    o += 1;
+                }
+            }
+            for n in 0..5 {
+                for m in 0..16 {
+                    y[o] = tern(b[32 + m], n) * d;
+                    o += 1;
+                }
+            }
+            for n in 0..4 {
+                for j in 0..4 {
+                    y[o] = tern(b[48 + j], n) * d;
+                    o += 1;
+                }
+            }
+        }
+        TQ2_0 => {
+            let d = half(b, 64);
+            for jb in [0usize, 32] {
+                for l in 0..4 {
+                    for m in 0..32 {
+                        let q = (b[jb + m] >> (2 * l)) & 3;
+                        y[jb * 4 + l * 32 + m] = (q as f32 - 1.0) * d;
+                    }
+                }
+            }
+        }
+        _ => unreachable!("decode_direct called for {t}"),
+    }
+}
+
 fn float_value(t: u32, b: &[u8], i: usize) -> f32 {
     match t {
         F32 => f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap()),
@@ -410,6 +652,12 @@ pub fn dequantize(t: u32, bytes: &[u8], out: &mut [f32]) -> Result<(), String> {
         }
         return Ok(());
     }
+    if is_direct(t) {
+        for (bi, chunk) in out.chunks_mut(vals).enumerate() {
+            decode_direct(t, &bytes[bi * size..(bi + 1) * size], chunk);
+        }
+        return Ok(());
+    }
     let g = group_size(t);
     let mut block = Block::new();
     for (bi, chunk) in out.chunks_mut(vals).enumerate() {
@@ -421,9 +669,23 @@ pub fn dequantize(t: u32, bytes: &[u8], out: &mut [f32]) -> Result<(), String> {
     Ok(())
 }
 
+/// How to trade GPU memory for speed when choosing weight layouts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Layout {
+    /// Expanded layouts wherever a format has one: fastest, up to a third larger than the file.
+    #[default]
+    Fast,
+    /// File-sized blocks, except where the expanded layout costs under 15% more memory.
+    Compact,
+    /// File-sized blocks for every quantized format (tests use it).
+    Blocks,
+}
+
 /// The layout a weight matrix uses on the GPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GpuFormat {
+    // Expanded layouts: codes in planes with one f32 scale (and bias) per group. Fastest to
+    // read, but larger than the file; used when the model fits the GPU comfortably.
     /// Unsigned codes split into a plane of 4-bit nibbles (eight per word) and,
     /// for 5- and 6-bit formats, a plane of `high` extra bits per value:
     /// `code = nibble | high_bits << 4`, `value = scale * (code - offset) + bias`.
@@ -435,8 +697,52 @@ pub enum GpuFormat {
     },
     /// Signed 8-bit codes, four per word: `value = scale * code + bias`.
     Q8 { group: u8, bias: bool },
-    /// Two IEEE half floats per word.
+    /// Two IEEE half floats per word, for float tensors.
     F16,
+    /// GGUF blocks of this type with their fields moved to word-aligned offsets. Kernels
+    /// decode them in place, so a quantized matrix takes the same memory on the GPU as in the file.
+    Block(u32),
+}
+
+/// (values, 32-bit words, GGUF blocks) of one GPU block. Formats with 32-value blocks pair
+/// two of them so that their 18-, 22- and 34-byte blocks fill whole words without padding.
+pub fn gpu_block(t: u32) -> Option<(usize, usize, usize)> {
+    Some(match t {
+        Q4_0 | IQ4_NL | MXFP4 => (64, 9, 2),
+        Q5_0 => (64, 11, 2),
+        Q8_0 => (64, 17, 2),
+        Q4_1 => (32, 5, 1),
+        Q5_1 => (32, 6, 1),
+        Q2_K | IQ2_S => (256, 21, 1),
+        Q3_K | IQ3_S => (256, 28, 1),
+        Q4_K => (256, 36, 1),
+        Q5_K => (256, 44, 1),
+        Q6_K => (256, 53, 1),
+        IQ4_XS => (256, 34, 1),
+        IQ2_XXS | TQ2_0 => (256, 17, 1),
+        IQ2_XS => (256, 19, 1),
+        IQ3_XXS => (256, 25, 1),
+        IQ1_S => (256, 13, 1),
+        IQ1_M | TQ1_0 => (256, 14, 1),
+        _ => return None,
+    })
+}
+
+/// (source offset, length, destination offset) of each field of GGUF block `h` of a GPU block.
+fn field_moves(t: u32, h: usize) -> Vec<(usize, usize, usize)> {
+    match t {
+        Q4_0 | IQ4_NL => vec![(2, 16, 16 * h), (0, 2, 32 + 2 * h)],
+        MXFP4 => vec![(1, 16, 16 * h), (0, 1, 32 + h)],
+        Q5_0 => vec![(6, 16, 16 * h), (2, 4, 32 + 4 * h), (0, 2, 40 + 2 * h)],
+        Q8_0 => vec![(2, 32, 32 * h), (0, 2, 64 + 2 * h)],
+        IQ2_XXS => vec![(2, 64, 0), (0, 2, 64)],
+        IQ2_XS => vec![(2, 64, 0), (66, 8, 64), (0, 2, 72)],
+        IQ2_S => vec![(2, 64, 0), (66, 8, 64), (74, 8, 72), (0, 2, 80)],
+        IQ3_XXS => vec![(2, 96, 0), (0, 2, 96)],
+        IQ3_S => vec![(2, 64, 0), (66, 8, 64), (74, 32, 72), (106, 4, 104), (0, 2, 108)],
+        IQ1_S => vec![(2, 32, 0), (34, 16, 32), (0, 2, 48)],
+        _ => vec![(0, block_info(t).unwrap().1, 0)],
+    }
 }
 
 /// GPU bytes of one matrix: nibble or code plane, extra-bit plane, scales.
@@ -448,7 +754,21 @@ pub struct Planes {
 }
 
 impl GpuFormat {
+    /// The fastest layout for a type: expanded where one exists, else blocks.
     pub fn for_type(t: u32) -> Option<GpuFormat> {
+        Self::expanded(t).or_else(|| Self::compact(t))
+    }
+
+    /// The layout that takes the same memory as the file (half floats for float tensors).
+    pub fn compact(t: u32) -> Option<GpuFormat> {
+        match t {
+            F32 | F16 | BF16 => Some(GpuFormat::F16),
+            _ => gpu_block(t).map(|_| GpuFormat::Block(t)),
+        }
+    }
+
+    /// Expanded codes and scales, for the formats where that costs at most a third more memory.
+    pub fn expanded(t: u32) -> Option<GpuFormat> {
         let q4 = |group, high, offset, bias| GpuFormat::Q4 {
             group,
             high,
@@ -461,9 +781,7 @@ impl GpuFormat {
             Q5_0 => q4(32, 1, 16, false),
             Q5_1 | Q5_K => q4(32, 1, 0, true),
             Q6_K => q4(16, 2, 32, false),
-            Q3_K => q4(16, 0, 4, false),
-            Q2_K => q4(16, 0, 0, true),
-            Q8_0 | IQ4_NL | IQ4_XS => GpuFormat::Q8 {
+            Q8_0 => GpuFormat::Q8 {
                 group: 32,
                 bias: false,
             },
@@ -472,10 +790,28 @@ impl GpuFormat {
         })
     }
 
+    /// The layout for a type under a layout policy.
+    pub fn choose(t: u32, layout: Layout) -> Option<GpuFormat> {
+        let fast = Self::for_type(t)?;
+        let small = Self::compact(t)?;
+        match layout {
+            Layout::Fast => return Some(fast),
+            Layout::Blocks => return Some(small),
+            Layout::Compact => {}
+        }
+        let (fb, sb) = (fast.bytes(256, 1), small.bytes(256, 1));
+        Some(if fb * 100 <= sb * 115 { fast } else { small })
+    }
+
+    /// True for the expanded layouts, which keep scales in a second buffer.
+    pub fn has_scales(self) -> bool {
+        matches!(self, GpuFormat::Q4 { .. } | GpuFormat::Q8 { .. })
+    }
+
     pub fn group(self) -> usize {
         match self {
             GpuFormat::Q4 { group, .. } | GpuFormat::Q8 { group, .. } => group as usize,
-            GpuFormat::F16 => 0,
+            _ => 0,
         }
     }
 
@@ -483,7 +819,7 @@ impl GpuFormat {
     pub fn scale_stride(self) -> usize {
         match self {
             GpuFormat::Q4 { bias, .. } | GpuFormat::Q8 { bias, .. } => 1 + bias as usize,
-            GpuFormat::F16 => 0,
+            _ => 0,
         }
     }
 
@@ -497,10 +833,11 @@ impl GpuFormat {
             } => format!("q4g{group}h{high}o{offset}b{}", bias as u8),
             GpuFormat::Q8 { group, bias } => format!("q8g{group}b{}", bias as u8),
             GpuFormat::F16 => "f16".into(),
+            GpuFormat::Block(t) => type_name(t).to_ascii_lowercase(),
         }
     }
 
-    /// GPU bytes for a matrix of `rows` x `k` values.
+    /// GPU bytes for an expanded matrix of `rows` x `k` values, by plane.
     pub fn planes(self, k: usize, rows: usize) -> Planes {
         let n = (k * rows) as u64;
         match self {
@@ -514,8 +851,8 @@ impl GpuFormat {
                 high: 0,
                 scales: n / group as u64 * self.scale_stride() as u64 * 4,
             },
-            GpuFormat::F16 => Planes {
-                low: n * 2,
+            GpuFormat::F16 | GpuFormat::Block(_) => Planes {
+                low: self.bytes(k, rows),
                 high: 0,
                 scales: 0,
             },
@@ -527,6 +864,84 @@ impl GpuFormat {
         let p = self.planes(k, rows);
         (p.low + p.high, p.scales)
     }
+
+    /// GPU bytes of one row of `k` values, all planes together.
+    pub fn row_bytes(self, k: usize) -> u64 {
+        self.bytes(k, 1)
+    }
+
+    /// GPU bytes for a matrix of `rows` x `k` values, all planes together.
+    pub fn bytes(self, k: usize, rows: usize) -> u64 {
+        match self {
+            GpuFormat::F16 => (k * rows) as u64 * 2,
+            GpuFormat::Block(t) => {
+                let (vals, words, _) = gpu_block(t).unwrap();
+                (k.div_ceil(vals) * words * 4 * rows) as u64
+            }
+            _ => {
+                let (c, s) = self.sizes(k, rows);
+                c + s
+            }
+        }
+    }
+}
+
+/// Convert whole rows of a GGML tensor into their GPU layout (32-bit words).
+pub fn to_gpu(t: u32, bytes: &[u8], k: usize, rows: usize) -> Result<Vec<u32>, String> {
+    let fmt = GpuFormat::compact(t)
+        .ok_or_else(|| format!("{} tensors are not supported yet", type_name(t)))?;
+    let rb = row_bytes(t, k)?;
+    if bytes.len() != rb * rows {
+        return Err(format!(
+            "expected {} bytes for {rows} rows, got {}",
+            rb * rows,
+            bytes.len()
+        ));
+    }
+    if k % 8 != 0 {
+        return Err(format!("row length {k} does not fit the GPU layout"));
+    }
+    let mut out = vec![0u32; (fmt.bytes(k, rows) / 4) as usize];
+    match fmt {
+        GpuFormat::Q4 { .. } | GpuFormat::Q8 { .. } => unreachable!(),
+        GpuFormat::F16 => {
+            for i in 0..k * rows {
+                let h = match t {
+                    F16 => u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]),
+                    _ => f32_to_f16(float_value(t, bytes, i)),
+                };
+                out[i / 2] |= (h as u32) << (16 * (i % 2));
+            }
+        }
+        GpuFormat::Block(_) => {
+            let (vals, size) = block_info(t).unwrap();
+            let (gvals, words, pair) = gpu_block(t).unwrap();
+            let nb = k / vals;
+            let per_row = k.div_ceil(gvals);
+            let moves: Vec<_> = (0..pair).map(|h| field_moves(t, h)).collect();
+            let mut block = vec![0u8; words * 4];
+            for r in 0..rows {
+                for gb in 0..per_row {
+                    block.fill(0);
+                    for (h, mv) in moves.iter().enumerate() {
+                        let bi = gb * pair + h;
+                        if bi >= nb {
+                            continue;
+                        }
+                        let src = &bytes[r * rb + bi * size..r * rb + (bi + 1) * size];
+                        for &(from, len, to) in mv {
+                            block[to..to + len].copy_from_slice(&src[from..from + len]);
+                        }
+                    }
+                    let at = (r * per_row + gb) * words;
+                    for (w, c) in out[at..at + words].iter_mut().zip(block.chunks_exact(4)) {
+                        *w = u32::from_le_bytes(c.try_into().unwrap());
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub struct Packed {
@@ -539,8 +954,8 @@ pub struct Packed {
 
 /// Convert whole rows of a GGML tensor into its GPU layout.
 pub fn repack(t: u32, bytes: &[u8], k: usize, rows: usize) -> Result<Packed, String> {
-    let fmt = GpuFormat::for_type(t)
-        .ok_or_else(|| format!("{} tensors are not supported yet", type_name(t)))?;
+    let fmt = GpuFormat::expanded(t)
+        .ok_or_else(|| format!("{} has no expanded GPU layout", type_name(t)))?;
     let rb = row_bytes(t, k)?;
     if bytes.len() != rb * rows {
         return Err(format!(
@@ -609,7 +1024,7 @@ pub fn repack(t: u32, bytes: &[u8], k: usize, rows: usize) -> Result<Packed, Str
                     codes[e / 4] |= (block.codes[i] as u8 as u32) << (8 * (e % 4));
                 }
             }
-            GpuFormat::F16 => unreachable!(),
+            GpuFormat::F16 | GpuFormat::Block(_) => unreachable!(),
         }
     }
     Ok(Packed {
@@ -644,8 +1059,77 @@ pub fn unpack(fmt: GpuFormat, p: &Packed, n: usize) -> Vec<f32> {
                 let code = (p.codes[e / 4] >> (8 * (e % 4))) as u8 as i8 as f32;
                 p.scales[g] * code + if bias { p.scales[g + 1] } else { 0.0 }
             }
+            GpuFormat::Block(_) => panic!("use from_gpu for block layouts"),
         })
         .collect()
+}
+
+/// Values held by a GPU layout (tests use it to check that `to_gpu` loses nothing).
+pub fn from_gpu(t: u32, words: &[u32], k: usize, rows: usize) -> Result<Vec<f32>, String> {
+    let fmt = GpuFormat::compact(t).ok_or("unsupported type")?;
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    match fmt {
+        GpuFormat::Q4 { .. } | GpuFormat::Q8 { .. } => unreachable!(),
+        GpuFormat::F16 => Ok((0..k * rows)
+            .map(|i| half(&bytes, i * 2))
+            .collect()),
+        GpuFormat::Block(_) => {
+            let (vals, size) = block_info(t).unwrap();
+            let (gvals, words, pair) = gpu_block(t).unwrap();
+            let nb = k / vals;
+            let per_row = k.div_ceil(gvals);
+            let mut gguf = vec![0u8; rows * nb * size];
+            for r in 0..rows {
+                for bi in 0..nb {
+                    let (gb, h) = (bi / pair, bi % pair);
+                    let at = (r * per_row + gb) * words * 4;
+                    let dst = &mut gguf[(r * nb + bi) * size..(r * nb + bi + 1) * size];
+                    for (from, len, to) in field_moves(t, h) {
+                        dst[from..from + len].copy_from_slice(&bytes[at + to..at + to + len]);
+                    }
+                }
+            }
+            let mut out = vec![0f32; k * rows];
+            dequantize(t, &gguf, &mut out)?;
+            Ok(out)
+        }
+    }
+}
+
+/// Code books the block kernels index, as one table of 32-bit words.
+pub struct Tables;
+
+impl Tables {
+    pub const IQ4NL: usize = 0;
+    pub const MXFP4: usize = 16;
+    pub const IQ2XXS: usize = 32;
+    pub const IQ2XS: usize = Self::IQ2XXS + 512;
+    pub const IQ2S: usize = Self::IQ2XS + 1024;
+    pub const IQ3XXS: usize = Self::IQ2S + 2048;
+    pub const IQ3S: usize = Self::IQ3XXS + 256;
+    pub const IQ1S: usize = Self::IQ3S + 512;
+    pub const LEN: usize = Self::IQ1S + 4096;
+
+    pub fn words() -> Vec<u32> {
+        use crate::iq_tables::*;
+        let mut t = Vec::with_capacity(Self::LEN);
+        t.extend(IQ4.iter().map(|&v| (v as f32).to_bits()));
+        t.extend(MXFP4_VALUES.iter().map(|&v| (v as f32).to_bits()));
+        let split = |t: &mut Vec<u32>, g: &[u64]| {
+            for &v in g {
+                t.push(v as u32);
+                t.push((v >> 32) as u32);
+            }
+        };
+        split(&mut t, &IQ2XXS_GRID);
+        split(&mut t, &IQ2XS_GRID);
+        split(&mut t, &IQ2S_GRID);
+        t.extend_from_slice(&IQ3XXS_GRID);
+        t.extend_from_slice(&IQ3S_GRID);
+        split(&mut t, &IQ1S_GRID);
+        debug_assert_eq!(t.len(), Self::LEN);
+        t
+    }
 }
 
 #[cfg(test)]
@@ -687,8 +1171,11 @@ mod tests {
         dequantize(Q8_0, &b, &mut out).unwrap();
         assert_eq!(out[0], -8.0);
         assert_eq!(out[31], 7.5);
+        let w = to_gpu(Q8_0, &b, 32, 1).unwrap();
+        assert_eq!(w.len(), 17);
+        assert_eq!(from_gpu(Q8_0, &w, 32, 1).unwrap(), out);
         let p = repack(Q8_0, &b, 32, 1).unwrap();
-        assert_eq!(unpack(GpuFormat::for_type(Q8_0).unwrap(), &p, 32), out);
+        assert_eq!(unpack(GpuFormat::expanded(Q8_0).unwrap(), &p, 32), out);
     }
 
     #[test]
@@ -702,14 +1189,38 @@ mod tests {
         dequantize(Q4_0, &b, &mut out).unwrap();
         assert_eq!(out[0], -16.0);
         assert_eq!(out[16], 14.0);
+        let w = to_gpu(Q4_0, &b, 32, 1).unwrap();
+        assert_eq!(from_gpu(Q4_0, &w, 32, 1).unwrap(), out);
         let p = repack(Q4_0, &b, 32, 1).unwrap();
-        assert_eq!(unpack(GpuFormat::for_type(Q4_0).unwrap(), &p, 32), out);
+        assert_eq!(unpack(GpuFormat::expanded(Q4_0).unwrap(), &p, 32), out);
+    }
+
+    #[test]
+    fn gpu_blocks_fill_whole_words() {
+        for t in [Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS,
+                  IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M, TQ1_0, TQ2_0, MXFP4] {
+            let (vals, size) = block_info(t).unwrap();
+            let (gvals, words, pair) = gpu_block(t).unwrap();
+            assert_eq!(gvals, vals * pair, "{}", type_name(t));
+            assert!(words * 4 >= size * pair && words * 4 - size * pair < 4, "{}", type_name(t));
+            let mut used = vec![false; words * 4];
+            for h in 0..pair {
+                let total: usize = field_moves(t, h).iter().map(|m| m.1).sum();
+                assert_eq!(total, size, "{}", type_name(t));
+                for (_, len, to) in field_moves(t, h) {
+                    for u in &mut used[to..to + len] {
+                        assert!(!*u, "{} fields overlap", type_name(t));
+                        *u = true;
+                    }
+                }
+            }
+        }
     }
 
     #[test]
     fn rejects_partial_blocks() {
         assert!(row_bytes(Q4_K, 896).is_err());
         assert_eq!(row_bytes(Q8_0, 896).unwrap(), 28 * 34);
-        assert!(row_bytes(19, 256).unwrap_err().contains("IQ1_S"));
+        assert!(row_bytes(15, 256).unwrap_err().contains("Q8_K"));
     }
 }

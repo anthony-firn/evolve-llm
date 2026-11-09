@@ -3,7 +3,7 @@
 use evolve_llm::chat::{Message, Options};
 use evolve_llm::cpu::CpuModel;
 use evolve_llm::gguf;
-use evolve_llm::gpu::{self, engine::Engine};
+use evolve_llm::gpu::{self, engine::{Engine, Options as EngineOptions}};
 use evolve_llm::sampler::{argmax, SamplerConfig};
 use evolve_llm::session::Session;
 use evolve_llm::tokenizer::{StreamDecoder, Tokenizer};
@@ -61,7 +61,15 @@ fn load(bytes: &[u8], g: &gguf::Gguf, ctx: usize) -> Session {
         "GPU: {} ({}, {})",
         gpu.info.name, gpu.info.backend, gpu.info.driver
     );
-    let mut engine = Engine::new(gpu, g).unwrap();
+    let opts = EngineOptions {
+        binding_limit: None,
+        layout: match std::env::var("EVOLVE_LLM_LAYOUT").as_deref() {
+            Ok("compact") => evolve_llm::quant::Layout::Compact,
+            Ok("blocks") => evolve_llm::quant::Layout::Blocks,
+            _ => evolve_llm::quant::Layout::Fast,
+        },
+    };
+    let mut engine = Engine::with_options(gpu, g, opts).unwrap();
     for p in engine.plan().to_vec() {
         let start = p.offset as usize;
         engine

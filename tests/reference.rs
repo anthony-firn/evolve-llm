@@ -56,11 +56,17 @@ fn dequantization_matches_gguf_py() {
                 case["name"]
             );
         }
-        // The GPU layout must hold exactly the same values (F32 sources are rounded to f16 by design).
-        let fmt = quant::GpuFormat::for_type(t).unwrap();
+        // Both GPU layouts must hold exactly the same values (F32 sources are rounded to f16 by design).
         let k = want.len();
-        let packed = quant::repack(t, &bytes, k, 1).unwrap();
-        let unpacked = quant::unpack(fmt, &packed, k);
+        let packed = quant::to_gpu(t, &bytes, k, 1).unwrap();
+        let mut unpacked = quant::from_gpu(t, &packed, k, 1).unwrap();
+        if let Some(fmt) = quant::GpuFormat::expanded(t).filter(|f| f.has_scales()) {
+            let expanded = quant::unpack(fmt, &quant::repack(t, &bytes, k, 1).unwrap(), k);
+            for (i, (e, u)) in expanded.iter().zip(&unpacked).enumerate() {
+                assert!((e - u).abs() <= 1e-6 * u.abs().max(1e-3), "{} expanded value {i}", case["name"]);
+            }
+            unpacked = expanded;
+        }
         for (i, (u, g)) in unpacked.iter().zip(&got).enumerate() {
             let tol = if t == quant::BF16 {
                 1e-3 * g.abs()

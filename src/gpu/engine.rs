@@ -14,7 +14,17 @@ struct Shard {
     row0: usize,
     rows: usize,
     codes: wgpu::Buffer,
-    scales: wgpu::Buffer,
+    /// Per-group f32 scales of an expanded layout.
+    scales: Option<wgpu::Buffer>,
+}
+
+/// How weights are laid out on the GPU.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    /// Lower cap on buffer size (tests use it to force row shards).
+    pub binding_limit: Option<u64>,
+    /// Expanded layouts for speed, or file-sized blocks when memory is tight.
+    pub layout: quant::Layout,
 }
 
 struct Matrix {
@@ -96,6 +106,8 @@ pub struct Engine {
     layouts: Layouts,
     pipelines: HashMap<String, wgpu::ComputePipeline>,
     dummy: wgpu::Buffer,
+    /// Code books of the IQ and MXFP4 block formats.
+    tables: wgpu::Buffer,
     state: Option<State>,
     pub weight_bytes: u64,
 }
@@ -171,6 +183,18 @@ impl Engine {
 
     /// Like `new`, with an optional lower cap on buffer size (tests use it to force row shards).
     pub fn with_binding_limit(gpu: Gpu, g: &Gguf, limit: Option<u64>) -> Result<Engine, String> {
+        Self::with_options(
+            gpu,
+            g,
+            Options {
+                binding_limit: limit,
+                layout: quant::Layout::Fast,
+            },
+        )
+    }
+
+    pub fn with_options(gpu: Gpu, g: &Gguf, opts: Options) -> Result<Engine, String> {
+        let limit = opts.binding_limit;
         let cfg = model::config(g)?;
         let device = &gpu.device;
         let max_binding = gpu
@@ -184,7 +208,7 @@ impl Engine {
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
         for (name, rows, k) in model::matrices(&cfg) {
             let t = g.tensor(&name).unwrap();
-            let fmt = GpuFormat::for_type(t.ggml_type).unwrap();
+            let fmt = GpuFormat::choose(t.ggml_type, opts.layout).unwrap();
             let rb = quant::row_bytes(t.ggml_type, k)? as u64;
             plan.push(TensorPlan {
                 name: name.clone(),
@@ -217,11 +241,13 @@ impl Engine {
                     usage,
                     mapped_at_creation: false,
                 });
-                let scales = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&name),
-                    size: sb.max(16),
-                    usage,
-                    mapped_at_creation: false,
+                let scales = fmt.has_scales().then(|| {
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(&name),
+                        size: sb.max(16),
+                        usage,
+                        mapped_at_creation: false,
+                    })
                 });
                 weight_bytes += cb + sb;
                 shards.push(Shard {
@@ -278,6 +304,11 @@ impl Engine {
             usage,
             mapped_at_creation: false,
         });
+        let tables = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("code books"),
+            contents: &words(&quant::Tables::words()),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         let mut e = Engine {
             gpu,
             cfg,
@@ -288,6 +319,7 @@ impl Engine {
             layouts,
             pipelines: HashMap::new(),
             dummy,
+            tables,
             state: None,
             weight_bytes,
         };
@@ -384,15 +416,18 @@ impl Engine {
                     .unwrap();
                 let n = (s.row0 + s.rows - r).min(row0 + rows - r);
                 let src = &bytes[(r - row0) * rb..(r - row0 + n) * rb];
-                let packed = quant::repack(m.ggml_type, src, m.k, n)?;
-                let at = m.fmt.planes(m.k, r - s.row0);
-                let whole = m.fmt.planes(m.k, s.rows);
-                queue.write_buffer(&s.codes, at.low, &words(&packed.codes));
-                if !packed.high.is_empty() {
-                    queue.write_buffer(&s.codes, whole.low + at.high, &words(&packed.high));
-                }
-                if !packed.scales.is_empty() {
-                    queue.write_buffer(&s.scales, at.scales, &floats(&packed.scales));
+                if let Some(scales) = &s.scales {
+                    let packed = quant::repack(m.ggml_type, src, m.k, n)?;
+                    let at = m.fmt.planes(m.k, r - s.row0);
+                    let whole = m.fmt.planes(m.k, s.rows);
+                    queue.write_buffer(&s.codes, at.low, &words(&packed.codes));
+                    if !packed.high.is_empty() {
+                        queue.write_buffer(&s.codes, whole.low + at.high, &words(&packed.high));
+                    }
+                    queue.write_buffer(scales, at.scales, &floats(&packed.scales));
+                } else {
+                    let packed = quant::to_gpu(m.ggml_type, src, m.k, n)?;
+                    queue.write_buffer(&s.codes, m.fmt.bytes(m.k, r - s.row0), &words(&packed));
                 }
                 r += n;
             }
@@ -501,6 +536,7 @@ impl Engine {
         }
         let mut ops: Vec<Op> = Vec::new();
         let dummy = &self.dummy;
+        let tables = &self.tables;
 
         // y (+)= W x for every shard of a matrix.
         let matmul = |ops: &mut Vec<Op>,
@@ -529,11 +565,11 @@ impl Engine {
                         entry(0, &step),
                         entry(1, &p),
                         entry(2, &s.codes),
-                        entry(3, &s.scales),
+                        entry(3, s.scales.as_ref().unwrap_or(tables)),
                         entry(4, x),
                         entry(5, y),
                         entry(6, bias.unwrap_or(dummy)),
-                        entry(7, dummy),
+                        entry(7, if matches!(m.fmt, GpuFormat::Block(_)) { &s.codes } else { dummy }),
                     ],
                 });
                 ops.push(Op {
@@ -607,7 +643,7 @@ impl Engine {
                     entry(0, &step),
                     entry(1, &p),
                     entry(2, &s.codes),
-                    entry(3, &s.scales),
+                    entry(3, s.scales.as_ref().unwrap_or(tables)),
                     entry(4, dummy),
                     entry(5, &x),
                     entry(6, dummy),

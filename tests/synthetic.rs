@@ -4,7 +4,7 @@
 
 use evolve_llm::cpu::CpuModel;
 use evolve_llm::gguf;
-use evolve_llm::gpu::{self, engine::Engine};
+use evolve_llm::gpu::{self, engine::{Engine, Options}};
 use evolve_llm::quant::{self, block_info};
 
 const D: u64 = 256;
@@ -33,7 +33,23 @@ fn half_fields(t: u32) -> &'static [usize] {
         quant::Q2_K => &[80, 82],
         quant::Q3_K => &[108],
         quant::Q6_K => &[208],
+        quant::IQ2_XXS | quant::IQ2_XS | quant::IQ2_S | quant::IQ3_XXS | quant::IQ3_S | quant::IQ1_S => &[0],
+        quant::TQ1_0 => &[52],
+        quant::TQ2_0 => &[64],
         _ => &[],
+    }
+}
+
+/// Block scale that keeps weights around a few hundredths, given each format's largest code.
+fn unit_scale(t: u32) -> f32 {
+    match t {
+        quant::Q8_0 | quant::Q6_K => 0.0012,
+        quant::IQ4_NL | quant::IQ4_XS => 0.0006,
+        quant::IQ2_XXS | quant::IQ2_XS | quant::IQ2_S => 0.0003,
+        quant::IQ3_XXS | quant::IQ3_S => 0.0001,
+        quant::IQ1_S | quant::IQ1_M => 0.003,
+        quant::TQ1_0 | quant::TQ2_0 => 0.04,
+        _ => 0.006,
     }
 }
 
@@ -54,25 +70,32 @@ fn tensor_bytes(t: u32, k: u64, rows: u64, rng: &mut Rng) -> Vec<u8> {
             let blocks = n / vals;
             let mut b: Vec<u8> = (0..blocks * size).map(|_| rng.next() as u8).collect();
             // Scales small enough that activations stay in range through the layers.
-            let unit_scale = if matches!(t, quant::Q8_0 | quant::Q6_K) {
-                0.0012
-            } else if matches!(t, quant::IQ4_NL | quant::IQ4_XS) {
-                0.0006
-            } else {
-                0.006
-            };
-            let k_quant_super = vals == 256 && !matches!(t, quant::IQ4_XS);
+            let k_quant_super = vals == 256 && matches!(t, quant::Q2_K | quant::Q3_K | quant::Q4_K | quant::Q5_K | quant::Q6_K);
             for bi in 0..blocks {
+                let blk = &mut b[bi * size..(bi + 1) * size];
                 for (j, &at) in half_fields(t).iter().enumerate() {
                     // K-quant super-block scales multiply 6-bit sub-scales, so they are smaller.
                     let s = if k_quant_super {
-                        unit_scale / 24.0
+                        unit_scale(t) / 24.0
                     } else {
-                        unit_scale
+                        unit_scale(t)
                     } * (0.6 + 0.4 * rng.unit().abs());
                     let v = if j == 1 { s * 0.5 } else { s };
-                    b[bi * size + at..bi * size + at + 2]
-                        .copy_from_slice(&quant::f32_to_f16(v).to_le_bytes());
+                    blk[at..at + 2].copy_from_slice(&quant::f32_to_f16(v).to_le_bytes());
+                }
+                match t {
+                    // MXFP4: an E8M0 exponent near 2^-8.
+                    quant::MXFP4 => blk[0] = 117 + (rng.next() % 5) as u8,
+                    // IQ1_M spreads its f16 scale over the top nibbles of four 16-bit scale words.
+                    quant::IQ1_M => {
+                        let d = quant::f32_to_f16(unit_scale(t) * (0.6 + 0.4 * rng.unit().abs()));
+                        for i in 0..4 {
+                            let w = u16::from_le_bytes([blk[48 + 2 * i], blk[49 + 2 * i]]);
+                            let w = (w & 0x0fff) | (((d >> (4 * i)) & 15) << 12);
+                            blk[48 + 2 * i..50 + 2 * i].copy_from_slice(&w.to_le_bytes());
+                        }
+                    }
+                    _ => {}
                 }
             }
             b
@@ -167,6 +190,7 @@ fn model(t: u32, seed: u64) -> Vec<u8> {
 
 #[test]
 fn every_format_matches_the_cpu_reference_on_the_gpu() {
+    let only = std::env::var("EVOLVE_LLM_FORMAT").ok();
     let formats = [
         quant::Q4_0,
         quant::Q4_1,
@@ -180,6 +204,16 @@ fn every_format_matches_the_cpu_reference_on_the_gpu() {
         quant::Q6_K,
         quant::IQ4_NL,
         quant::IQ4_XS,
+        quant::IQ2_XXS,
+        quant::IQ2_XS,
+        quant::IQ2_S,
+        quant::IQ3_XXS,
+        quant::IQ3_S,
+        quant::IQ1_S,
+        quant::IQ1_M,
+        quant::TQ1_0,
+        quant::TQ2_0,
+        quant::MXFP4,
         quant::F16,
         quant::BF16,
         quant::F32,
@@ -190,16 +224,25 @@ fn every_format_matches_the_cpu_reference_on_the_gpu() {
     };
     let mut device = Some(first);
     let tokens = [3u32, 141, 7, 300, 77, 12];
-    // Every format runs whole, then again with matrices split into 64-row shards, as on
-    // devices with small storage-binding limits.
-    let runs = formats
-        .iter()
-        .map(|&t| (t, None))
-        .chain(formats.iter().map(|&t| (t, Some(16 * 1024u64))));
-    for (i, (t, limit)) in runs.enumerate() {
+    // Every format runs in its fast and its compact layout, whole and again with matrices split
+    // into 64-row shards, as on devices with small storage-binding limits.
+    let runs = [false, true].into_iter().flat_map(|compact| {
+        formats
+            .iter()
+            .map(move |&t| (t, None, compact))
+            .chain(formats.iter().map(move |&t| (t, Some(16 * 1024u64), compact)))
+    });
+    for (i, (t, limit, compact)) in runs.enumerate() {
+        if only.as_deref().is_some_and(|f| !quant::type_name(t).eq_ignore_ascii_case(f)) {
+            continue;
+        }
         let bytes = model(t, 0x9e37 + (i % formats.len()) as u64);
         let g = gguf::parse(&bytes).unwrap();
-        let mut engine = Engine::with_binding_limit(device.take().unwrap(), &g, limit).unwrap();
+        let opts = Options {
+            binding_limit: limit,
+            layout: if compact { quant::Layout::Blocks } else { quant::Layout::Fast },
+        };
+        let mut engine = Engine::with_options(device.take().unwrap(), &g, opts).unwrap();
         for p in engine.plan().to_vec() {
             engine
                 .upload(
@@ -246,8 +289,10 @@ fn every_format_matches_the_cpu_reference_on_the_gpu() {
             .fold(0.0, f32::max)
             / range;
         eprintln!(
-            "{:6} in {:3} buffers: logit range {scale:7.3}, one-token max error {:.2e}, batched {:.2e}",
-            quant::type_name(t), engine.shard_count(),
+            "{:7} {:8} in {:3} buffers: logit range {scale:7.3}, one-token max error {:.2e}, batched {:.2e}",
+            quant::type_name(t),
+            if compact { "compact" } else { "fast" },
+            engine.shard_count(),
             worst,
             batched
         );
