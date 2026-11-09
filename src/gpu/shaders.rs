@@ -977,3 +977,166 @@ pub fn mla_store() -> String {
 pub fn mla_attention() -> String {
     format!("{COMMON}{MLA_ATTENTION}")
 }
+
+/// Prompt tokens' expert projections as matrix-matrix products: one workgroup per (64 rows,
+/// 32 of the tokens routed to expert `wg.z`), using the per-expert token lists of `route_sort`.
+/// Gate/up write each pair's hidden row; `down` writes each pair's output row for `moe_sum`.
+pub fn gemm_id(fmt: GpuFormat) -> String {
+    // Word-addressed weights, as `load8` reads them.
+    let mut base = MATMUL_BINDINGS.to_string() + binding3(fmt);
+    if matches!(fmt, GpuFormat::Block(_)) {
+        base += "@group(0) @binding(7) var<storage, read> wv4: array<vec4<u32>>;\n";
+    }
+    let bindings = base
+        .replace(
+            "@group(0) @binding(6) var<storage, read> bias: array<f32>;",
+            "@group(0) @binding(6) var<storage, read> route: array<u32>;\n@group(0) @binding(8) var<storage, read> emap: array<u32>;",
+        )
+        .replace("    if (p.has_bias == 1u) { v += bias[p.out_offset + r]; }\n", "")
+        .replace(
+        "@group(0) @binding(8) var<storage, read> emap: array<u32>;",
+        "@group(0) @binding(8) var<storage, read> emap: array<u32>;\n// Per expert: token count, then list offset, then the pair indices grouped by expert.\n@group(0) @binding(9) var<storage, read> rsort: array<u32>;",
+    );
+    format!(
+        "{COMMON}{bindings}{}{}",
+        loader(fmt),
+        r#"
+const WS: u32 = 9u;
+var<workgroup> xs: array<vec4<f32>, 256>;
+var<workgroup> ws: array<vec4<f32>, 576>;
+var<workgroup> pairs: array<u32, 32>;
+var<workgroup> u_slot: u32;
+var<workgroup> u_count: u32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let e = wg.z;
+    let n_expert = p.pad1;
+    if (li == 0u) { u_slot = emap[p.map_offset + e]; u_count = rsort[e]; }
+    let slot = workgroupUniformLoad(&u_slot);
+    let count = workgroupUniformLoad(&u_count);
+    let t0 = wg.y * 32u;
+    if (slot == 0xffffffffu || slot < p.slot0 || slot >= p.slot0 + p.N / p.exp_rows || t0 >= count) { return; }
+    let off = rsort[n_expert + e];
+    if (li < 32u) {
+        var pr = 0xffffffffu;
+        if (t0 + li < count) { pr = rsort[2u * n_expert + off + t0 + li]; }
+        pairs[li] = pr;
+    }
+    workgroupBarrier();
+    let row0 = wg.x * 64u;
+    let wbase = (slot - p.slot0) * p.exp_rows;
+    let tr = li & 15u;
+    let tt = li >> 4u;
+    var a00 = 0.0; var a01 = 0.0; var a10 = 0.0; var a11 = 0.0;
+    var a20 = 0.0; var a21 = 0.0; var a30 = 0.0; var a31 = 0.0;
+    let xp = pairs[li >> 3u];
+    // Gate/up read the token's input row (x_offset 0); down reads the pair's hidden row (mode 3).
+    var xrow = 0u;
+    if (xp != 0xffffffffu) { xrow = select(xp / p.n_used, xp, p.mode == 3u); }
+    let wr = row0 + (li >> 2u);
+    let wslot = (li >> 2u) * WS + (li & 3u) * 2u;
+    for (var k0 = 0u; k0 < p.K; k0 += 32u) {
+        var xv = vec4<f32>(0.0);
+        if (xp != 0xffffffffu) { xv = x[((xrow * p.x_stride + k0) >> 2u) + (li & 7u)]; }
+        xs[li] = xv;
+        var w = W8(vec4<f32>(0.0), vec4<f32>(0.0));
+        if (wr < p.exp_rows) { w = load8(wbase + wr, k0 + (li & 3u) * 8u); }
+        ws[wslot] = w.a;
+        ws[wslot + 1u] = w.b;
+        workgroupBarrier();
+        for (var kv = 0u; kv < 8u; kv++) {
+            let x0 = xs[tt * 8u + kv];
+            let x1 = xs[(tt + 16u) * 8u + kv];
+            let w0 = ws[tr * WS + kv];
+            let w1 = ws[(tr + 16u) * WS + kv];
+            let w2 = ws[(tr + 32u) * WS + kv];
+            let w3 = ws[(tr + 48u) * WS + kv];
+            a00 += dot(w0, x0); a01 += dot(w0, x1);
+            a10 += dot(w1, x0); a11 += dot(w1, x1);
+            a20 += dot(w2, x0); a21 += dot(w2, x1);
+            a30 += dot(w3, x0); a31 += dot(w3, x1);
+        }
+        workgroupBarrier();
+    }
+    let pa = pairs[tt];
+    let pb = pairs[tt + 16u];
+    let r0 = row0 + tr;
+    put(pa, r0, a00); put(pb, r0, a01);
+    put(pa, r0 + 16u, a10); put(pb, r0 + 16u, a11);
+    put(pa, r0 + 32u, a20); put(pb, r0 + 32u, a21);
+    put(pa, r0 + 48u, a30); put(pb, r0 + 48u, a31);
+}
+
+fn put(pair: u32, r: u32, v: f32) {
+    if (pair == 0xffffffffu || r >= p.exp_rows) { return; }
+    let i = pair * p.out_stride + r;
+    if (p.mode == 2u) { let g = y[i]; y[i] = g / (1.0 + exp(-g)) * v; } else { y[i] = v; }
+}
+"#
+    )
+}
+
+/// Group a prompt's (token, expert) pairs by expert: counts, offsets and pair lists.
+pub const ROUTE_SORT: &str = r#"
+struct P { n_expert: u32, n_used: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> route: array<u32>;
+@group(0) @binding(3) var<storage, read_write> rsort: array<u32>;
+var<workgroup> cnt: array<atomic<u32>, 1024>;
+var<workgroup> cur: array<atomic<u32>, 1024>;
+var<workgroup> offs: array<u32, 1024>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_index) li: u32) {
+    let n = step.n_tokens * p.n_used;
+    for (var e = li; e < p.n_expert; e += 256u) { atomicStore(&cnt[e], 0u); atomicStore(&cur[e], 0u); }
+    workgroupBarrier();
+    for (var i = li; i < n; i += 256u) { atomicAdd(&cnt[route[i]], 1u); }
+    workgroupBarrier();
+    if (li == 0u) {
+        var run = 0u;
+        for (var e = 0u; e < p.n_expert; e++) { offs[e] = run; run += atomicLoad(&cnt[e]); }
+    }
+    workgroupBarrier();
+    for (var e = li; e < p.n_expert; e += 256u) { rsort[e] = atomicLoad(&cnt[e]); rsort[p.n_expert + e] = offs[e]; }
+    for (var i = li; i < n; i += 256u) {
+        let e = route[i];
+        rsort[2u * p.n_expert + offs[e] + atomicAdd(&cur[e], 1u)] = i;
+    }
+}
+"#;
+
+/// Weighted sum of each token's expert outputs (from `gemm_id` down) into the residual, for the
+/// experts resident in this pass.
+pub const MOE_SUM: &str = r#"
+struct P { n_embd: u32, n_used: u32, w_offset: u32, map_offset: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> route: array<u32>;
+@group(0) @binding(3) var<storage, read> emap: array<u32>;
+@group(0) @binding(4) var<storage, read> dout: array<f32>;
+@group(0) @binding(5) var<storage, read_write> x: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.y;
+    let r = wg.x * 256u + li;
+    if (r >= p.n_embd) { return; }
+    var acc = 0.0;
+    for (var s = 0u; s < p.n_used; s++) {
+        let pair = t * p.n_used + s;
+        if (emap[p.map_offset + route[pair]] != 0xffffffffu) {
+            acc += bitcast<f32>(route[p.w_offset + pair]) * dout[pair * p.n_embd + r];
+        }
+    }
+    x[t * p.n_embd + r] = x[t * p.n_embd + r] + acc;
+}
+"#;
+
+pub fn route_sort() -> String {
+    format!("{COMMON}{ROUTE_SORT}")
+}
+
+pub fn moe_sum() -> String {
+    format!("{COMMON}{MOE_SUM}")
+}

@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseBlocks, parseInline, splitThinking } from '../web/markdown.js';
-import { MODELS, cacheKey, formatBytes, hfUrl, parseHfReference } from '../web/models.js';
+import { LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from '../web/models.js';
 
 test('splits reasoning from the answer, including an unfinished thought', () => {
   assert.deepEqual(splitThinking('<think>a\nb</think>\n\nAnswer'), [
@@ -39,14 +39,34 @@ test('reads Hugging Face references in the forms people paste', () => {
   assert.deepEqual(parseHfReference('https://huggingface.co/bartowski/x-GGUF/blob/main/sub/m-Q4_K_M.gguf?download=true'), { repo: 'bartowski/x-GGUF', file: 'sub/m-Q4_K_M.gguf', revision: 'main' });
   assert.throws(() => parseHfReference('https://example.com/a/b/c.gguf'), /huggingface\.co/);
   assert.throws(() => parseHfReference('a/b/model.bin'), /\.gguf/);
-  assert.throws(() => parseHfReference('a/b/model-00001-of-00002.gguf'), /Split/);
+  assert.deepEqual(parseHfReference('a/b/model-00002-of-00003.gguf'), { repo: 'a/b', file: 'model-00002-of-00003.gguf', revision: 'main' });
+  assert.deepEqual(parseHfReference('unsloth/Kimi-K2-Instruct-0905-GGUF'), { repo: 'unsloth/Kimi-K2-Instruct-0905-GGUF', file: null, revision: 'main' });
   assert.throws(() => parseHfReference('a/b/../c.gguf'), /characters/);
   assert.equal(hfUrl('a/b', 'dir/m 1.gguf'), 'https://huggingface.co/a/b/resolve/main/dir/m%201.gguf');
 });
 
+test('split models are found and listed part by part', async () => {
+  assert.deepEqual(splitParts('Q2/m-00002-of-00003.gguf'), ['Q2/m-00001-of-00003.gguf', 'Q2/m-00002-of-00003.gguf', 'Q2/m-00003-of-00003.gguf']);
+  assert.equal(splitParts('m.gguf'), null);
+  const tree = [
+    { type: 'file', path: 'Q2/m-00002-of-00002.gguf', size: 0, lfs: { size: 20 } },
+    { type: 'file', path: 'Q2/m-00001-of-00002.gguf', size: 0, lfs: { size: 10 } },
+    { type: 'file', path: 'small.gguf', size: 5 },
+    { type: 'file', path: 'mmproj-f16.gguf', size: 1 },
+    { type: 'file', path: 'README.md', size: 1 },
+    { type: 'directory', path: 'Q2' },
+  ];
+  const fake = async () => ({ ok: true, status: 200, json: async () => tree });
+  const groups = await listRepo('a/b', 'main', fake);
+  assert.deepEqual(groups.map((g) => [g.file, g.bytes, g.parts.length]), [['small.gguf', 5, 1], ['Q2/m-00001-of-00002.gguf', 30, 2]]);
+  const r = await resolveParts('a/b', 'Q2/m-00002-of-00002.gguf', 'main', fake);
+  assert.deepEqual(r.parts.map((p) => p.file), ['Q2/m-00001-of-00002.gguf', 'Q2/m-00002-of-00002.gguf']);
+  assert.equal(r.parts[1].url, 'https://huggingface.co/a/b/resolve/main/Q2/m-00002-of-00002.gguf');
+});
+
 test('catalog entries are complete and storage keys are stable', () => {
   const ids = new Set();
-  for (const m of MODELS) {
+  for (const m of [...MODELS, ...LARGE]) {
     assert.ok(m.repo && m.file.endsWith('.gguf') && m.bytes > 1e8 && m.license && m.licenseUrl, m.id);
     assert.ok(!ids.has(m.id), `duplicate ${m.id}`);
     ids.add(m.id);

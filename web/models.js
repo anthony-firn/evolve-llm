@@ -3,6 +3,8 @@
 
 const LLAMA = { license: 'Llama 3.2 Community License', licenseUrl: 'https://www.llama.com/llama3_2/license/' };
 const APACHE = { license: 'Apache 2.0', licenseUrl: 'https://www.apache.org/licenses/LICENSE-2.0' };
+const MIT = { license: 'MIT', licenseUrl: 'https://opensource.org/license/mit' };
+const KIMI = { license: 'Modified MIT', licenseUrl: 'https://huggingface.co/moonshotai/Kimi-K2-Instruct-0905/blob/main/LICENSE' };
 
 export const MODELS = [
   { id: 'smollm2-135m', name: 'SmolLM2 135M', maker: 'Hugging Face', repo: 'bartowski/SmolLM2-135M-Instruct-GGUF',
@@ -29,14 +31,76 @@ export const MODELS = [
     file: 'Qwen3-4B-Q4_K_M.gguf', bytes: 2497280256, quant: 'Q4_K_M', note: 'Largest here. Needs about 3.5 GB of GPU memory.', thinking: true, ...APACHE },
 ];
 
+// Mixture-of-experts models. The ones larger than GPU memory keep their attention weights on the
+// GPU and read the experts each token chooses from browser storage, so they run slowly but run.
+// `bytes` is the download size; split models list their parts when they are chosen.
+export const LARGE = [
+  { id: 'olmoe-1b-7b', name: 'OLMoE 1B-7B', maker: 'Ai2', repo: 'allenai/OLMoE-1B-7B-0125-Instruct-GGUF',
+    file: 'OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf', bytes: 4210000000, quant: 'Q4_K_M', params: '7B, 1.3B active',
+    note: '64 experts, 8 per token. Fits on GPUs with about 5 GB.', ...APACHE },
+  { id: 'qwen3-30b-a3b', name: 'Qwen3 30B-A3B', maker: 'Qwen', repo: 'unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF',
+    file: 'Qwen3-30B-A3B-Instruct-2507-UD-Q2_K_XL.gguf', bytes: 11790000000, quant: 'UD-Q2_K_XL', params: '30B, 3.3B active',
+    note: 'Strong general model. Streams experts from storage when GPU memory is short.', ...APACHE },
+  { id: 'qwen3-235b-a22b', name: 'Qwen3 235B-A22B', maker: 'Qwen', repo: 'unsloth/Qwen3-235B-A22B-Instruct-2507-GGUF',
+    file: 'UD-Q2_K_XL/Qwen3-235B-A22B-Instruct-2507-UD-Q2_K_XL-00001-of-00002.gguf', bytes: 88770000000, quant: 'UD-Q2_K_XL', params: '235B, 22B active',
+    note: 'Two files. Needs about 90 GB of free browser storage; each token reads gigabytes, so replies are slow.', ...APACHE },
+  { id: 'qwen3-coder-480b', name: 'Qwen3 Coder 480B-A35B', maker: 'Qwen', repo: 'unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF',
+    file: 'Qwen3-Coder-480B-A35B-Instruct-UD-IQ1_M.gguf', bytes: 149720000000, quant: 'UD-IQ1_M', params: '480B, 35B active',
+    note: 'Needs about 150 GB of free browser storage. Slow: expect seconds per token.', ...APACHE },
+  { id: 'deepseek-v3.1', name: 'DeepSeek V3.1', maker: 'DeepSeek', repo: 'unsloth/DeepSeek-V3.1-GGUF',
+    file: 'UD-IQ1_S/DeepSeek-V3.1-UD-IQ1_S-00001-of-00004.gguf', bytes: 192310000000, quant: 'UD-IQ1_S', params: '671B, 37B active',
+    note: 'Four files, about 190 GB of storage. Latent attention keeps the context small. Slow.', ...MIT },
+  { id: 'kimi-k2', name: 'Kimi K2 Instruct', maker: 'Moonshot AI', repo: 'unsloth/Kimi-K2-Instruct-0905-GGUF',
+    file: 'UD-TQ1_0/Kimi-K2-Instruct-0905-UD-TQ1_0-00001-of-00006.gguf', bytes: 248610000000, quant: 'UD-TQ1_0', params: '1T, 32B active',
+    note: 'One trillion parameters in six files, about 250 GB of storage. Slow.', ...KIMI },
+];
+
+/** For `name-00001-of-00004.gguf`, every part's path; null for a single file. */
+export function splitParts(file) {
+  const m = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i.exec(file);
+  if (!m) return null;
+  const n = Number(m[3]);
+  return Array.from({ length: n }, (_, i) => `${m[1]}-${String(i + 1).padStart(5, '0')}-of-${m[3]}.gguf`);
+}
+
+/** GGUF files of a Hugging Face repository with their sizes, split parts grouped. */
+export async function listRepo(repo, revision = 'main', fetchFn = fetch) {
+  const res = await fetchFn(`https://huggingface.co/api/models/${repo}/tree/${encodeURIComponent(revision)}?recursive=1`);
+  if (res.status === 404 || res.status === 401) throw new Error('Hugging Face has no public repository with that name.');
+  if (!res.ok) throw new Error(`Hugging Face answered with HTTP ${res.status}.`);
+  const files = (await res.json()).filter((f) => f.type === 'file' && /\.gguf$/i.test(f.path) && !/mmproj/i.test(f.path));
+  const groups = new Map();
+  for (const f of files) {
+    const parts = splitParts(f.path);
+    const key = parts ? parts[0] : f.path;
+    const g = groups.get(key) || { file: key, parts: [], bytes: 0 };
+    g.parts.push({ file: f.path, bytes: f.lfs?.size ?? f.size ?? 0 });
+    g.bytes += f.lfs?.size ?? f.size ?? 0;
+    groups.set(key, g);
+  }
+  for (const g of groups.values()) g.parts.sort((a, b) => a.file.localeCompare(b.file));
+  return [...groups.values()].sort((a, b) => a.bytes - b.bytes);
+}
+
+/** Every part of a file (or split model) with sizes, from the repository listing. */
+export async function resolveParts(repo, file, revision = 'main', fetchFn = fetch) {
+  const groups = await listRepo(repo, revision, fetchFn);
+  const g = groups.find((x) => x.file === file || x.parts.some((p) => p.file === file));
+  if (!g) throw new Error(`${file} is not in ${repo}.`);
+  const want = splitParts(g.file)?.length || 1;
+  if (g.parts.length !== want) throw new Error(`Only ${g.parts.length} of the ${want} parts of this model are in the repository.`);
+  return { file: g.file, bytes: g.bytes, parts: g.parts.map((p) => ({ ...p, url: hfUrl(repo, p.file, revision) })) };
+}
+
 export function hfUrl(repo, file, revision = 'main') {
   const path = file.split('/').map(encodeURIComponent).join('/');
   return `https://huggingface.co/${repo}/resolve/${encodeURIComponent(revision)}/${path}`;
 }
 
 /**
- * Accepts "owner/repo/file.gguf", "owner/repo/sub/dir/file.gguf" or a huggingface.co URL
- * (resolve or blob form). Returns { repo, file, revision } or throws with a readable message.
+ * Accepts "owner/repo", "owner/repo/file.gguf", "owner/repo/sub/dir/file.gguf" or a huggingface.co
+ * URL (resolve or blob form). Returns { repo, file, revision }, with file null for a repository,
+ * or throws with a readable message. Any part of a split model stands for the whole model.
  */
 export function parseHfReference(input) {
   let text = String(input || '').trim();
@@ -55,10 +119,14 @@ export function parseHfReference(input) {
     text = [parts[0], parts[1], ...parts.slice(4)].join('/');
   }
   const parts = text.split('/').filter(Boolean);
-  if (parts.length < 3) throw new Error('Use owner/repository/file.gguf.');
+  if (parts.length === 2) {
+    // A whole repository: its files are listed to choose from.
+    if (!parts.every((p) => /^[\w.-]+$/.test(p))) throw new Error('That name has characters a Hugging Face path cannot contain.');
+    return { repo: `${parts[0]}/${parts[1]}`, file: null, revision };
+  }
+  if (parts.length < 3) throw new Error('Use owner/repository, or owner/repository/file.gguf.');
   const file = parts.slice(2).join('/');
   if (!/\.gguf$/i.test(file)) throw new Error('The file must be a .gguf model.');
-  if (/-\d{5}-of-\d{5}\.gguf$/i.test(file)) throw new Error('Split GGUF files are not supported yet. Choose a single-file model.');
   const valid = /^[\w.-]+$/;
   if (!valid.test(parts[0]) || !valid.test(parts[1]) || parts.slice(2).some((p) => !valid.test(p) || p === '..')) {
     throw new Error('That name has characters a Hugging Face path cannot contain.');

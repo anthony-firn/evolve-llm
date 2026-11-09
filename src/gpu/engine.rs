@@ -155,6 +155,20 @@ enum Grid {
     TokenRows { rows: u32 },
     /// One workgroup per token.
     Tokens,
+    /// Expert matrix-matrix products: (64-row blocks of `rows`, 32-token tiles, experts).
+    ExpertTiles { rows: u32, experts: u32 },
+    /// A single workgroup whatever the token count.
+    Single,
+    /// (256-value blocks of `width`, n_tokens).
+    Width(u32),
+}
+
+/// Which token counts an op runs for: some steps have a one-token and a prompt variant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum When {
+    Always,
+    OneToken,
+    Prompt,
 }
 
 #[derive(Clone)]
@@ -170,17 +184,23 @@ enum Kernel {
     TopK,
     MlaStore,
     MlaAttention,
+    MatmulIdGemm(GpuFormat),
+    RouteSort,
+    MoeSum,
 }
 
 struct Op {
     kernel: Kernel,
     grid: Grid,
     bind: wgpu::BindGroup,
+    when: When,
 }
 
 struct Layouts {
     matmul: wgpu::BindGroupLayout,
     matmul_id: wgpu::BindGroupLayout,
+    route_sort: wgpu::BindGroupLayout,
+    moe_sum: wgpu::BindGroupLayout,
     norm: wgpu::BindGroupLayout,
     norm_inplace: wgpu::BindGroupLayout,
     rope: wgpu::BindGroupLayout,
@@ -673,7 +693,9 @@ impl Engine {
             .collect();
         let layouts = Layouts {
             matmul: layout(device, "uurrrwrr"),
-            matmul_id: layout(device, "uurrrwrrr"),
+            matmul_id: layout(device, "uurrrwrrrr"),
+            route_sort: layout(device, "uurw"),
+            moe_sum: layout(device, "uurrrw"),
             norm: layout(device, "uurrw"),
             norm_inplace: layout(device, "uuwr"),
             rope: layout(device, "uuwrrwwr"),
@@ -780,6 +802,12 @@ impl Engine {
         for f in expert {
             self.pipeline(format!("gemv-id-{}", f.key()), shaders::gemv_id(f, lanes), &mi);
             self.pipeline(format!("gemv-id-down-{}", f.key()), shaders::gemv_id_down(f, lanes), &mi);
+            self.pipeline(format!("gemm-id-{}", f.key()), shaders::gemm_id(f), &mi);
+        }
+        if self.cfg.moe.is_some() {
+            let (rs, ms) = (self.layouts.route_sort.clone(), self.layouts.moe_sum.clone());
+            self.pipeline("route-sort".into(), shaders::route_sort(), &rs);
+            self.pipeline("moe-sum".into(), shaders::moe_sum(), &ms);
         }
         let ef = self.mats["token_embd.weight"].fmt;
         self.pipeline(format!("embed-{}", ef.key()), shaders::embed(ef), &mm);
@@ -873,7 +901,7 @@ impl Engine {
         let t = MAX_BATCH as u64;
         let mut acts = 2 * cfg.n_embd + 2 * cfg.q_dim() + 2 * cfg.kv_dim() + cfg.n_ff;
         if let Some(e) = &cfg.moe {
-            acts += e.n_expert + 2 * e.n_used + e.n_used * e.n_ff + e.n_ff_shared;
+            acts += e.n_expert + 3 * e.n_used + e.n_used * e.n_ff + e.n_ff_shared + e.n_used * cfg.n_embd;
         }
         if let Some(m) = &cfg.mla {
             acts += m.q_lora + m.kv_lora + m.rope + 2 * cfg.n_head * m.kv_lora + cfg.n_head * m.v_dim;
@@ -947,6 +975,13 @@ impl Engine {
                 )
             }
             None => (buf("unused", 4), buf("unused", 4), buf("unused", 4), buf("unused", 4)),
+        };
+        let (rsort, dout) = match &moe {
+            Some(e) => (
+                buf("route sort", 2 * e.n_expert + t * e.n_used),
+                buf("expert out", t * e.n_used * c.n_embd),
+            ),
+            None => (buf("unused", 4), buf("unused", 4)),
         };
         let (qa, kva, qlat, olat) = match &mla {
             Some(m) => (
@@ -1062,6 +1097,7 @@ impl Engine {
                     ],
                 );
                 ops.push(Op {
+                    when: When::Always,
                     kernel: Kernel::Matmul(m.fmt),
                     grid: Grid::Matmul {
                         n: s.rows as u32,
@@ -1071,7 +1107,9 @@ impl Engine {
                 });
             }
         };
-        // Expert projections of layer `l`: gate/up (`down` = false) or the weighted down sum.
+        // Expert projections of layer `l`: gate/up (`down` = false) or down. One token runs the
+        // matrix-vector kernels (down adds the weighted sum to x); a prompt runs matrix-matrix
+        // products per expert (down writes each pair's row for `moe_sum`).
         let matmul_id = |ops: &mut Vec<Op>,
                          l: usize,
                          name: &str,
@@ -1082,54 +1120,47 @@ impl Engine {
             let e = moe.as_ref().unwrap();
             let m = &self.mats[name];
             for s in &m.shards {
-                let p = params(&words(&[
-                    m.k as u32,
-                    s.rows as u32,
-                    if down { c.n_embd } else { m.rows } as u32,
-                    0,
-                    mode,
-                    0,
-                    0,
-                    if down { m.k } else { c.n_embd } as u32,
-                    0,
-                    0,
-                    e.n_used as u32,
-                    (s.row0 / m.rows) as u32,
-                    m.rows as u32,
-                    (l * e.n_expert) as u32,
-                    route_w,
-                    0,
-                ]));
+                let fields = |mode: u32| {
+                    params(&words(&[
+                        m.k as u32,
+                        s.rows as u32,
+                        if down { c.n_embd } else { m.rows } as u32,
+                        0,
+                        mode,
+                        0,
+                        0,
+                        if down { m.k } else { c.n_embd } as u32,
+                        0,
+                        0,
+                        e.n_used as u32,
+                        (s.row0 / m.rows) as u32,
+                        m.rows as u32,
+                        (l * e.n_expert) as u32,
+                        route_w,
+                        e.n_expert as u32,
+                    ]))
+                };
                 let codes4 = if matches!(m.fmt, GpuFormat::Block(_)) { &s.codes } else { dummy };
-                let b = bind(
-                    &self.layouts.matmul_id,
-                    name,
-                    &[
-                        &step,
-                        &p,
-                        &s.codes,
-                        s.scales.as_ref().unwrap_or(tables),
-                        x,
-                        y,
-                        &route,
-                        codes4,
-                        &emap,
-                    ],
-                );
+                let scales = s.scales.as_ref().unwrap_or(tables);
+                let one = fields(mode);
+                let b = bind(&self.layouts.matmul_id, name, &[&step, &one, &s.codes, scales, x, y, &route, codes4, &emap, &rsort]);
                 ops.push(Op {
-                    kernel: if down {
-                        Kernel::MatmulIdDown(m.fmt)
-                    } else {
-                        Kernel::MatmulId(m.fmt)
-                    },
+                    when: When::OneToken,
+                    kernel: if down { Kernel::MatmulIdDown(m.fmt) } else { Kernel::MatmulId(m.fmt) },
                     grid: if down {
                         Grid::TokenRows { rows: m.rows as u32 }
                     } else {
-                        Grid::Pairs {
-                            rows: m.rows as u32,
-                            used: e.n_used as u32,
-                        }
+                        Grid::Pairs { rows: m.rows as u32, used: e.n_used as u32 }
                     },
+                    bind: b,
+                });
+                let many = fields(if down { 3 } else { mode });
+                let target = if down { &dout } else { y };
+                let b = bind(&self.layouts.matmul_id, name, &[&step, &many, &s.codes, scales, x, target, &route, codes4, &emap, &rsort]);
+                ops.push(Op {
+                    when: When::Prompt,
+                    kernel: Kernel::MatmulIdGemm(m.fmt),
+                    grid: Grid::ExpertTiles { rows: m.rows as u32, experts: e.n_expert as u32 },
                     bind: b,
                 });
             }
@@ -1144,6 +1175,7 @@ impl Engine {
             data.extend(c.rms_eps.to_le_bytes());
             let p = params(&data);
             ops.push(Op {
+                when: When::Always,
                 kernel: Kernel::Norm,
                 grid: if last_only { Grid::One } else { Grid::Rows(1) },
                 bind: bind(&self.layouts.norm, "norm", &[&step, &p, src, w, dst]),
@@ -1155,6 +1187,7 @@ impl Engine {
             data.extend(c.rms_eps.to_le_bytes());
             let p = params(&data);
             ops.push(Op {
+                when: When::Always,
                 kernel: Kernel::NormInPlace,
                 grid: Grid::Rows(rows as u32),
                 bind: bind(&self.layouts.norm_inplace, "norm-inplace", &[&step, &p, b, w]),
@@ -1197,6 +1230,7 @@ impl Engine {
                 ],
             );
             ops.push(Op {
+                when: When::Always,
                 kernel: Kernel::Embed(emb.fmt),
                 grid: Grid::Embed { k: c.n_embd as u32 },
                 bind: b,
@@ -1241,6 +1275,12 @@ impl Engine {
             }
             None => (params(&[0u8; 32]), params(&[0u8; 32])),
         };
+        let sort_p = params(&words(&[
+            moe.as_ref().map_or(0, |e| e.n_expert) as u32,
+            moe.as_ref().map_or(0, |e| e.n_used) as u32,
+            0,
+            0,
+        ]));
         let topk_p = match &moe {
             Some(e) => {
                 let mut d = words(&[
@@ -1281,11 +1321,13 @@ impl Engine {
                 matmul(&mut ops, &n("attn_kv_a_mqa.weight"), &xn, &kva, 0, None, false, Input::rows(c.n_embd));
                 // Rotate the tail of every query head (the key's rotated part goes to the cache).
                 ops.push(Op {
+                    when: When::Always,
                     kernel: Kernel::Rope,
                     grid: Grid::Heads(c.n_head as u32),
                     bind: bind(&self.layouts.rope, "rope-q", &[&step, &rope_p, &q, dummy, dummy, &spare_a, &spare_b, &rope_table]),
                 });
                 ops.push(Op {
+                    when: When::Always,
                     kernel: Kernel::MlaStore,
                     grid: Grid::Tokens,
                     bind: bind(&self.layouts.mla, "mla-store", &[&step, &mla_store_p, &kva, &self.vecs[&n("attn_kv_a_norm.weight")], &rope_table, &kc[l]]),
@@ -1306,6 +1348,7 @@ impl Engine {
                     },
                 );
                 ops.push(Op {
+                    when: When::Always,
                     kernel: Kernel::MlaAttention,
                     grid: Grid::Heads((c.n_head / mla_heads(&c)) as u32),
                     bind: bind(&self.layouts.mla, "mla-attention", &[&step, &mla_attn_p, &qlat, &q, &kc[l], &olat]),
@@ -1345,11 +1388,13 @@ impl Engine {
                     norm_inplace(&mut ops, &k, &self.vecs[&n("attn_k_norm.weight")], c.head_dim, c.n_head_kv);
                 }
                 ops.push(Op {
+                    when: When::Always,
                     kernel: Kernel::Rope,
                     grid: Grid::Heads((c.n_head + c.n_head_kv) as u32),
                     bind: bind(&self.layouts.rope, "rope", &[&step, &rope_p, &q, &k, &v, &kc[l], &vc[l], &rope_table]),
                 });
                 ops.push(Op {
+                    when: When::Always,
                     kernel: Kernel::Attention,
                     grid: Grid::Heads(c.n_head as u32),
                     bind: bind(&self.layouts.attention, "attention", &[&step, &attn_p, &q, &kc[l], &vc[l], &att]),
@@ -1363,14 +1408,28 @@ impl Engine {
                     matmul(&mut ops, &n("ffn_gate_inp.weight"), &xn, &rlog, 0, None, false, input);
                     let bias = if e.probs_bias { &self.vecs[&n("exp_probs_b.bias")] } else { dummy };
                     ops.push(Op {
+                        when: When::Always,
                         kernel: Kernel::TopK,
                         grid: Grid::Tokens,
                         bind: bind(&self.layouts.topk, "topk", &[&step, &topk_p, &rlog, bias, &route]),
                     });
                     route_end = ops.len();
+                    ops.push(Op {
+                        when: When::Prompt,
+                        kernel: Kernel::RouteSort,
+                        grid: Grid::Single,
+                        bind: bind(&self.layouts.route_sort, "route-sort", &[&step, &sort_p, &route, &rsort]),
+                    });
                     matmul_id(&mut ops, l, &n("ffn_gate_exps.weight"), &xn, &hexp, 0, false);
                     matmul_id(&mut ops, l, &n("ffn_up_exps.weight"), &xn, &hexp, 2, false);
                     matmul_id(&mut ops, l, &n("ffn_down_exps.weight"), &hexp, &x, 1, true);
+                    let sum_p = params(&words(&[c.n_embd as u32, e.n_used as u32, route_w, (l * e.n_expert) as u32]));
+                    ops.push(Op {
+                        when: When::Prompt,
+                        kernel: Kernel::MoeSum,
+                        grid: Grid::Width(c.n_embd as u32),
+                        bind: bind(&self.layouts.moe_sum, "moe-sum", &[&step, &sum_p, &route, &emap, &dout, &x]),
+                    });
                     experts_end = ops.len();
                     if e.n_ff_shared > 0 {
                         matmul(&mut ops, &n("ffn_gate_shexp.weight"), &xn, &gate, 0, None, false, input);
@@ -1442,7 +1501,25 @@ impl Engine {
         self.state.as_ref().map(|s| s.bytes).unwrap_or(0)
     }
 
-    fn dispatch_of(op: &Op, t: u32) -> (String, (u32, u32)) {
+    fn dispatch_of(op: &Op, t: u32) -> (String, (u32, u32, u32)) {
+        let (key, (gx, gy)) = match (&op.kernel, op.grid) {
+            (Kernel::MatmulIdGemm(f), Grid::ExpertTiles { rows, experts }) => {
+                return (format!("gemm-id-{}", f.key()), (rows.div_ceil(64), t.div_ceil(32), experts));
+            }
+            _ => Self::dispatch_2d(op, t),
+        };
+        (key, (gx, gy, 1))
+    }
+
+    fn runs(op: &Op, t: u32) -> bool {
+        match op.when {
+            When::Always => true,
+            When::OneToken => t == 1,
+            When::Prompt => t > 1,
+        }
+    }
+
+    fn dispatch_2d(op: &Op, t: u32) -> (String, (u32, u32)) {
         let rows_per_wg = 256 / gemv_lanes();
         match (&op.kernel, op.grid) {
             (Kernel::Matmul(f), Grid::Matmul { n, gemv }) => {
@@ -1474,6 +1551,8 @@ impl Engine {
             (Kernel::MlaAttention, Grid::Heads(h)) => ("mla-attention".into(), (h, t)),
             (Kernel::TopK, Grid::Tokens) => ("topk".into(), (t, 1)),
             (Kernel::MlaStore, Grid::Tokens) => ("mla-store".into(), (t, 1)),
+            (Kernel::RouteSort, Grid::Single) => ("route-sort".into(), (1, 1)),
+            (Kernel::MoeSum, Grid::Width(w)) => ("moe-sum".into(), (w.div_ceil(256), t)),
             _ => unreachable!(),
         }
     }
@@ -1499,11 +1578,11 @@ impl Engine {
                 timestamp_writes: None,
             });
             let t = n_tokens as u32;
-            for op in &st.ops[range] {
-                let (key, (gx, gy)) = Self::dispatch_of(op, t);
+            for op in st.ops[range].iter().filter(|op| Self::runs(op, t)) {
+                let (key, (gx, gy, gz)) = Self::dispatch_of(op, t);
                 pass.set_pipeline(&self.pipelines[&key]);
                 pass.set_bind_group(0, &op.bind, &[]);
-                pass.dispatch_workgroups(gx, gy, 1);
+                pass.dispatch_workgroups(gx, gy, gz);
             }
         }
         if with_head {
@@ -1523,8 +1602,8 @@ impl Engine {
             &words(&[t, pos0 as u32, pos0 as u32 + t, t - 1]),
         );
         let mut totals: Vec<(String, usize, f64)> = Vec::new();
-        for op in &st.ops {
-            let (key, (gx, gy)) = Self::dispatch_of(op, t);
+        for op in st.ops.iter().filter(|op| Self::runs(op, t)) {
+            let (key, (gx, gy, gz)) = Self::dispatch_of(op, t);
             let run = |count: usize| {
                 let mut enc = self.gpu.device.create_command_encoder(&Default::default());
                 {
@@ -1532,7 +1611,7 @@ impl Engine {
                     pass.set_pipeline(&self.pipelines[&key]);
                     pass.set_bind_group(0, &op.bind, &[]);
                     for _ in 0..count {
-                        pass.dispatch_workgroups(gx, gy, 1);
+                        pass.dispatch_workgroups(gx, gy, gz);
                     }
                 }
                 self.gpu.queue.submit([enc.finish()]);
@@ -1780,11 +1859,11 @@ impl Engine {
                         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
                         {
                             let mut pass = enc.begin_compute_pass(&Default::default());
-                            for op in &st.ops[lo.start..lo.route_end] {
-                                let (key, (gx, gy)) = Self::dispatch_of(op, n as u32);
+                            for op in st.ops[lo.start..lo.route_end].iter().filter(|op| Self::runs(op, n as u32)) {
+                                let (key, (gx, gy, gz)) = Self::dispatch_of(op, n as u32);
                                 pass.set_pipeline(&self.pipelines[&key]);
                                 pass.set_bind_group(0, &op.bind, &[]);
-                                pass.dispatch_workgroups(gx, gy, 1);
+                                pass.dispatch_workgroups(gx, gy, gz);
                             }
                         }
                         let route_len = (n * n_used * 4) as u64;

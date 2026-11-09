@@ -34,21 +34,25 @@
         <p>Each model downloads once from Hugging Face, then runs from this browser.</p>
       </div>
       <ul class="model-list" id="model-list"></ul>
+      <h3 class="list-title" id="large-title">Large models</h3>
+      <p class="list-note">Mixture-of-experts models. When one does not fit on the GPU, its experts stay in browser storage and are read as each token needs them.</p>
+      <ul class="model-list" id="large-list" aria-labelledby="large-title"></ul>
       <details class="other" id="other-sources">
         <summary>Other models</summary>
         <form id="hf-form" class="hf-form" novalidate>
-          <label for="hf-input">Any single-file GGUF on Hugging Face</label>
+          <label for="hf-input">A Hugging Face repository or GGUF file</label>
           <div class="field-row">
-            <input id="hf-input" name="ref" autocomplete="off" spellcheck="false" placeholder="owner/repo/model.gguf" aria-describedby="hf-help">
+            <input id="hf-input" name="ref" autocomplete="off" spellcheck="false" placeholder="owner/repo or owner/repo/model.gguf" aria-describedby="hf-help">
             <button type="submit">Get</button>
           </div>
-          <p class="hint" id="hf-help">Llama, Mistral, Qwen2, Qwen3 and SmolLM layouts. Q4, Q5, Q6, Q8, IQ4 and F16 weights.</p>
+          <p class="hint" id="hf-help">Llama, Mistral, Qwen2, Qwen3, Qwen3-MoE, Mixtral, OLMoE, DeepSeek V2 and V3, and Kimi K2 layouts. Weights from 1-bit IQ1 to F16, split files included.</p>
+          <ul class="hf-results" id="hf-results" hidden></ul>
         </form>
         <label class="file-pick">
-          <input type="file" id="file-input" accept=".gguf,application/octet-stream">
-          <span>Open a GGUF file from this device</span>
+          <input type="file" id="file-input" accept=".gguf,application/octet-stream" multiple>
+          <span>Open GGUF files from this device</span>
         </label>
-        <p class="hint">Opened files are read in place and are not copied or uploaded.</p>
+        <p class="hint">Select every part of a split model. Opened files are read in place and are not copied or uploaded.</p>
       </details>
       <div class="storage" id="storage" hidden></div>
     </aside>
@@ -59,7 +63,7 @@
         <section class="welcome" id="welcome" aria-labelledby="welcome-title">
           <p class="eyebrow">Private by design</p>
           <h1 id="welcome-title">Run a language model on your own GPU.</h1>
-          <p class="lede">Choose a model to download it once. It then runs entirely in this tab: a Rust engine compiled to WebAssembly computes every token with WebGPU shaders. Your messages never leave this device.</p>
+          <p class="lede">Choose a model to download it once. It then runs entirely in this tab: a Rust engine compiled to WebAssembly computes every token with WebGPU shaders. Models larger than your GPU's memory run too, reading what does not fit from storage. Your messages never leave this device.</p>
           <ul class="points">
             <li><strong>No install, no account.</strong> A modern browser is all it takes.</li>
             <li><strong>Stays on your device.</strong> No server sees your prompts or replies.</li>
@@ -135,6 +139,22 @@
           <option value="low-power">Power saving</option>
         </select>
         <small>On laptops with two GPUs, power saving usually picks the integrated one. Used when a model loads.</small>
+      </label>
+      <label class="block">GPU memory for the model
+        <select name="gpuMemory">
+          <option value="auto">Auto (up to 4 GB)</option>
+          <option value="2">2 GB</option>
+          <option value="4">4 GB</option>
+          <option value="6">6 GB</option>
+          <option value="8">8 GB</option>
+          <option value="12">12 GB</option>
+          <option value="16">16 GB</option>
+          <option value="24">24 GB</option>
+          <option value="32">32 GB</option>
+          <option value="48">48 GB</option>
+          <option value="all">All of the model</option>
+        </select>
+        <small>Weights beyond this stay in browser storage and are read while the model runs: slower, but larger models fit. If the GPU runs out of memory, less is kept on it. Used when a model loads.</small>
       </label>
       <label class="check"><input type="checkbox" name="thinking"> Let reasoning models think before answering</label>
       <footer><button class="ghost" type="button" id="reset-settings">Restore defaults</button><button class="primary" value="close">Done</button></footer>
