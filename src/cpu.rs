@@ -44,7 +44,7 @@ impl<'a> CpuModel<'a> {
             .g
             .tensor(name)
             .unwrap_or_else(|| panic!("missing {name}"));
-        let start = (self.g.data_offset + t.offset) as usize;
+        let start = t.start() as usize;
         let len = quant::row_bytes(t.ggml_type, t.dims[0] as usize).unwrap()
             * (t.elements() / t.dims[0]) as usize;
         (&self.file[start..start + len], t.ggml_type, &t.dims)

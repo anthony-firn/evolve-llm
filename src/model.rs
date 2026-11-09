@@ -17,6 +17,8 @@ pub enum Arch {
     Qwen3Moe,
     /// DeepSeek V2, V3 and R1, Kimi K2 and Moonlight: multi-head latent attention and experts.
     Deepseek2,
+    /// OLMoE: experts, with RMSNorm over the whole query and key projections.
+    Olmoe,
 }
 
 /// How router scores become expert probabilities.
@@ -98,6 +100,8 @@ pub struct Config {
     pub tied_embeddings: bool,
     pub qkv_bias: bool,
     pub qk_norm: bool,
+    /// The query and key norms cover the whole projection rather than each head (OLMoE).
+    pub qk_norm_full: bool,
     pub moe: Option<Moe>,
     pub mla: Option<Mla>,
     pub yarn: Option<Yarn>,
@@ -151,9 +155,10 @@ pub fn arch_of(g: &Gguf) -> Result<Arch, String> {
         "qwen3" => Arch::Qwen3,
         "qwen3moe" => Arch::Qwen3Moe,
         "deepseek2" => Arch::Deepseek2,
+        "olmoe" => Arch::Olmoe,
         other => {
             return Err(format!(
-                "the {other} architecture is not supported yet (supported: llama, mistral, qwen2, qwen3, qwen3moe, deepseek2)"
+                "the {other} architecture is not supported yet (supported: llama, mistral, qwen2, qwen3, qwen3moe, deepseek2, olmoe)"
             ))
         }
     })
@@ -214,9 +219,10 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
                 n_ff,
                 n_ff_shared: shared,
                 gating,
-                // Llama (Mixtral) and Qwen3 always renormalise; DeepSeek says so in its metadata.
+                // Llama (Mixtral) and Qwen3 always renormalise, OLMoE never; DeepSeek says in its metadata.
                 norm: match arch {
                     Arch::Deepseek2 => g.bool(&key("expert_weights_norm")).unwrap_or(false),
+                    Arch::Olmoe => false,
                     _ => true,
                 },
                 scale: g.f64(&key("expert_weights_scale")).filter(|&v| v != 0.0).unwrap_or(1.0) as f32,
@@ -300,6 +306,7 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
         tied_embeddings: g.tensor("output.weight").is_none(),
         qkv_bias: g.tensor("blk.0.attn_q.bias").is_some(),
         qk_norm: g.tensor("blk.0.attn_q_norm.weight").is_some(),
+        qk_norm_full: arch == Arch::Olmoe,
         moe,
         mla,
         yarn,
@@ -445,8 +452,9 @@ pub fn vectors(c: &Config) -> Vec<(String, usize)> {
             v.push((format!("blk.{i}.attn_v.bias"), c.kv_dim()));
         }
         if c.qk_norm {
-            v.push((format!("blk.{i}.attn_q_norm.weight"), c.head_dim));
-            v.push((format!("blk.{i}.attn_k_norm.weight"), c.head_dim));
+            let (q, k) = if c.qk_norm_full { (c.q_dim(), c.kv_dim()) } else { (c.head_dim, c.head_dim) };
+            v.push((format!("blk.{i}.attn_q_norm.weight"), q));
+            v.push((format!("blk.{i}.attn_k_norm.weight"), k));
         }
         if let Some(a) = &c.mla {
             if a.q_lora > 0 {

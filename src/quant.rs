@@ -886,6 +886,53 @@ impl GpuFormat {
     }
 }
 
+/// True when a format's compact GPU layout is byte-for-byte the file layout, so streamed
+/// weights can go to the GPU without being rewritten.
+pub fn gpu_is_file_layout(t: u32) -> bool {
+    match (gpu_block(t), block_info(t)) {
+        (Some((_, words, 1)), Some((_, size))) => words * 4 == size && field_moves(t, 0) == vec![(0, size, 0)],
+        _ => false,
+    }
+}
+
+/// `to_gpu` as bytes, borrowing the input when the layouts already match.
+pub fn to_gpu_bytes(t: u32, bytes: &[u8], k: usize, rows: usize) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    if gpu_is_file_layout(t) && k % block_info(t).unwrap().0 == 0 {
+        if bytes.len() != row_bytes(t, k)? * rows {
+            return Err("weight rows have the wrong length".into());
+        }
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+    if let (Some(GpuFormat::Block(_)), Some((vals, size))) = (GpuFormat::compact(t), block_info(t)) {
+        // Copy each block's fields straight to their GPU offsets.
+        let rb = row_bytes(t, k)?;
+        if bytes.len() != rb * rows {
+            return Err("weight rows have the wrong length".into());
+        }
+        let (gvals, words, pair) = gpu_block(t).unwrap();
+        let nb = k / vals;
+        let per_row = k.div_ceil(gvals);
+        let gb_bytes = words * 4;
+        let moves: Vec<_> = (0..pair).map(|h| field_moves(t, h)).collect();
+        let mut out = vec![0u8; rows * per_row * gb_bytes];
+        for r in 0..rows {
+            let src_row = &bytes[r * rb..(r + 1) * rb];
+            let dst_row = &mut out[r * per_row * gb_bytes..(r + 1) * per_row * gb_bytes];
+            for bi in 0..nb {
+                let (gb, h) = (bi / pair, bi % pair);
+                let src = &src_row[bi * size..(bi + 1) * size];
+                let dst = &mut dst_row[gb * gb_bytes..(gb + 1) * gb_bytes];
+                for &(from, len, to) in &moves[h] {
+                    dst[to..to + len].copy_from_slice(&src[from..from + len]);
+                }
+            }
+        }
+        return Ok(std::borrow::Cow::Owned(out));
+    }
+    let w = to_gpu(t, bytes, k, rows)?;
+    Ok(std::borrow::Cow::Owned(w.iter().flat_map(|v| v.to_le_bytes()).collect()))
+}
+
 /// Convert whole rows of a GGML tensor into their GPU layout (32-bit words).
 pub fn to_gpu(t: u32, bytes: &[u8], k: usize, rows: usize) -> Result<Vec<u32>, String> {
     let fmt = GpuFormat::compact(t)
@@ -1215,6 +1262,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn file_layout_formats_stream_unchanged() {
+        for t in [Q2_K, Q4_K, Q5_K, IQ4_XS, IQ1_M, Q4_1, Q5_1] {
+            assert!(gpu_is_file_layout(t), "{}", type_name(t));
+        }
+        for t in [Q3_K, Q6_K, Q8_0, Q4_0, IQ2_XXS, MXFP4, F16] {
+            assert!(!gpu_is_file_layout(t), "{}", type_name(t));
+        }
+        let b: Vec<u8> = (0..144u32).map(|i| (i * 7) as u8).collect();
+        let w = to_gpu(Q4_K, &b, 256, 1).unwrap();
+        assert_eq!(&*to_gpu_bytes(Q4_K, &b, 256, 1).unwrap(), &words_bytes(&w)[..]);
+        // The byte path agrees with the word path for formats that move fields, rows of odd pairs too.
+        for (t, k) in [(Q6_K, 512), (Q8_0, 96), (IQ2_XS, 256), (MXFP4, 96), (Q3_K, 256)] {
+            let (vals, size) = block_info(t).unwrap();
+            let n = k / vals * size * 3;
+            let b: Vec<u8> = (0..n as u32).map(|i| (i * 13 + 5) as u8).collect();
+            let w = to_gpu(t, &b, k, 3).unwrap();
+            assert_eq!(&*to_gpu_bytes(t, &b, k, 3).unwrap(), &words_bytes(&w)[..], "{}", type_name(t));
+        }
+    }
+
+    fn words_bytes(w: &[u32]) -> Vec<u8> {
+        w.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
     #[test]

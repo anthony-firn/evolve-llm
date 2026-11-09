@@ -3,7 +3,9 @@
 use super::{read_back, shaders, Gpu};
 use crate::gguf::Gguf;
 use crate::model::{self, Config, Gating};
-use crate::quant::{self, GpuFormat};
+use crate::quant::{self, GpuFormat, Layout};
+use crate::source::WeightSource;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
@@ -21,6 +23,20 @@ struct Shard {
     scales: Option<wgpu::Buffer>,
 }
 
+/// Where a weight matrix lives while the model runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// Uploaded once at load.
+    Resident,
+    /// Read from storage before each use into a buffer it shares with the same matrix of other
+    /// layers (a ring of two, so one layer's weights can upload while the previous one runs).
+    Ring,
+    /// Experts: the chosen ones are read into slots of an expert cache shared by all layers.
+    Pool(usize),
+    /// Token embeddings looked up on the CPU, one row per token.
+    Cpu,
+}
+
 struct Matrix {
     fmt: GpuFormat,
     ggml_type: u32,
@@ -29,6 +45,63 @@ struct Matrix {
     rows: usize,
     experts: usize,
     shards: Vec<Shard>,
+    place: Place,
+}
+
+/// One buffer per expert matrix (gate, up, down) holding `n` cache slots from `slot0`.
+struct PoolPage {
+    slot0: usize,
+    n: usize,
+    bufs: [wgpu::Buffer; 3],
+}
+
+/// An expert cache for the layers whose experts share three weight formats.
+struct Pool {
+    types: [u32; 3],
+    /// (rows, k) of one expert's gate, up and down matrices.
+    shape: [(usize, usize); 3],
+    slots: usize,
+    pages: Vec<PoolPage>,
+}
+
+/// Least-recently-used slot ownership of one expert cache.
+struct Lru {
+    owner: Vec<Option<(usize, u32)>>,
+    used: Vec<u64>,
+    slot_of: HashMap<(usize, u32), usize>,
+}
+
+/// What streaming did since the counters were last read.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct StreamStats {
+    pub bytes_read: u64,
+    pub read_seconds: f64,
+    /// Rewriting blocks into their GPU layout and handing them to the GPU queue.
+    pub upload_seconds: f64,
+    pub expert_requests: u64,
+    pub expert_hits: u64,
+    pub expert_loads: u64,
+    pub passes: u64,
+}
+
+/// How the weights were placed, for the interface.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct Placement {
+    pub streaming: bool,
+    pub resident_bytes: u64,
+    pub streamed_bytes: u64,
+    pub resident_layers: usize,
+    pub streamed_layers: usize,
+    pub expert_slots: usize,
+    pub experts_total: usize,
+    pub cpu_embeddings: bool,
+}
+
+struct Stream {
+    lru: Vec<Lru>,
+    emap: Vec<u32>,
+    clock: u64,
+    stats: StreamStats,
 }
 
 impl Matrix {
@@ -44,17 +117,24 @@ pub struct Options {
     pub binding_limit: Option<u64>,
     /// Expanded layouts for speed, or file-sized blocks when memory is tight.
     pub layout: quant::Layout,
+    /// GPU memory for weights. Models larger than this keep only part of their weights on the
+    /// GPU and read the rest from storage while they run (None = no limit).
+    pub budget: Option<u64>,
 }
 
 /// Where a tensor lives in the file and how to upload it in row chunks.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct TensorPlan {
     pub name: String,
+    /// File of a split model.
+    pub file: usize,
     pub offset: u64,
     pub bytes: u64,
     pub row_bytes: u64,
     pub rows: u64,
     pub ggml_type: u32,
+    /// Uploaded at load; other tensors are read from storage while the model runs.
+    pub resident: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -109,6 +189,15 @@ struct Layouts {
     mla: wgpu::BindGroupLayout,
 }
 
+/// Op ranges of one layer: attention up to the expert choice, the expert projections, the rest.
+#[derive(Clone, Copy)]
+struct LayerOps {
+    start: usize,
+    route_end: usize,
+    experts_end: usize,
+    end: usize,
+}
+
 struct State {
     ctx: usize,
     step: wgpu::Buffer,
@@ -118,6 +207,12 @@ struct State {
     ops: Vec<Op>,
     /// Index of the first op that only matters for the last token (final norm + head).
     head_start: usize,
+    embed_end: usize,
+    layers: Vec<LayerOps>,
+    x: wgpu::Buffer,
+    route: wgpu::Buffer,
+    route_staging: wgpu::Buffer,
+    emap: wgpu::Buffer,
     bytes: u64,
 }
 
@@ -135,6 +230,16 @@ pub struct Engine {
     tables: wgpu::Buffer,
     state: Option<State>,
     pub weight_bytes: u64,
+    pools: Vec<Pool>,
+    /// Expert cache of each layer (None for dense layers and resident experts).
+    layer_pool: Vec<Option<usize>>,
+    /// Ring matrices to read before each layer, and before the output head.
+    ring_layers: Vec<Vec<String>>,
+    ring_head: Vec<String>,
+    plan_index: HashMap<String, usize>,
+    stream: RefCell<Stream>,
+    source: RefCell<Option<Box<dyn WeightSource>>>,
+    pub placement: Placement,
 }
 
 fn storage(ro: bool, binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -242,6 +347,7 @@ impl Engine {
             Options {
                 binding_limit: limit,
                 layout: quant::Layout::Fast,
+                budget: None,
             },
         )
     }
@@ -259,68 +365,264 @@ impl Engine {
             .max_storage_binding
             .min(gpu.info.max_buffer_size)
             .min(opts.binding_limit.unwrap_or(u64::MAX));
+        let mats_list = model::matrices(&cfg);
+        let vec_bytes: u64 = model::vectors(&cfg).iter().map(|v| v.1 as u64 * 4).sum();
+        let ty = |name: &str| g.tensor(name).unwrap().ggml_type;
+        let size_in = |layout: Layout, name: &str, rows: usize, k: usize| {
+            GpuFormat::choose(ty(name), layout).unwrap().bytes(k, rows)
+        };
+        let total = |layout: Layout| {
+            vec_bytes
+                + mats_list
+                    .iter()
+                    .map(|(n, r, k, e)| size_in(layout, n, r * e, *k))
+                    .sum::<u64>()
+        };
+        let budget = opts.budget.unwrap_or(u64::MAX);
+        let (wlayout, streaming) = if total(opts.layout) <= budget {
+            (opts.layout, false)
+        } else if total(Layout::Compact) <= budget {
+            (Layout::Compact, false)
+        } else {
+            (Layout::Blocks, true)
+        };
+        let blk_of = |name: &str| -> Option<usize> {
+            name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
+        };
+        let head_name = if cfg.tied_embeddings { "token_embd.weight" } else { "output.weight" };
+        let mut place: HashMap<String, Place> =
+            mats_list.iter().map(|m| (m.0.clone(), Place::Resident)).collect();
+        // Expert caches: one per combination of gate, up and down formats.
+        let mut pools: Vec<Pool> = Vec::new();
+        let mut layer_pool: Vec<Option<usize>> = vec![None; cfg.n_layer];
+        let mut placement = Placement {
+            streaming,
+            ..Default::default()
+        };
+        if streaming {
+            let mut used = vec_bytes;
+            if !cfg.tied_embeddings {
+                place.insert("token_embd.weight".into(), Place::Cpu);
+                placement.cpu_embeddings = true;
+            }
+            let compact = |name: &str, rows: usize, k: usize| size_in(Layout::Blocks, name, rows, k);
+            let mut pool_layers: Vec<usize> = Vec::new();
+            if let Some(e) = &cfg.moe {
+                for l in (0..cfg.n_layer).filter(|&l| cfg.is_moe(l)) {
+                    let names = ["gate", "up", "down"].map(|k| format!("blk.{l}.ffn_{k}_exps.weight"));
+                    let types = [ty(&names[0]), ty(&names[1]), ty(&names[2])];
+                    let shape = [(e.n_ff, cfg.n_embd), (e.n_ff, cfg.n_embd), (cfg.n_embd, e.n_ff)];
+                    let p = match pools.iter().position(|p| p.types == types) {
+                        Some(p) => p,
+                        None => {
+                            pools.push(Pool { types, shape, slots: 0, pages: Vec::new() });
+                            pool_layers.push(0);
+                            pools.len() - 1
+                        }
+                    };
+                    pool_layers[p] += 1;
+                    layer_pool[l] = Some(p);
+                    for n in &names {
+                        place.insert(n.clone(), Place::Pool(p));
+                    }
+                }
+                placement.experts_total = pool_layers.iter().sum::<usize>() * e.n_expert;
+            }
+            let unit = |p: &Pool| -> u64 {
+                (0..3)
+                    .map(|i| GpuFormat::compact(p.types[i]).unwrap().bytes(p.shape[i].1, p.shape[i].0))
+                    .sum()
+            };
+            let n_used = cfg.moe.as_ref().map_or(0, |e| e.n_used);
+            let min_slots = |p: usize| (2 * n_used).min(pool_layers[p] * cfg.moe.as_ref().unwrap().n_expert);
+            let pool_min: u64 = (0..pools.len()).map(|p| unit(&pools[p]) * min_slots(p) as u64).sum();
+            // Dense weights of each layer, then the head; experts get what is left.
+            let dense: Vec<(String, usize, usize, u64)> = mats_list
+                .iter()
+                .filter(|m| place[&m.0] == Place::Resident && m.0.starts_with("blk."))
+                .map(|m| (m.0.clone(), m.1 * m.3, m.2, compact(&m.0, m.1 * m.3, m.2)))
+                .collect();
+            let head = mats_list.iter().find(|m| m.0 == head_name).unwrap();
+            let head_bytes = compact(head_name, head.1 * head.3, head.2);
+            let dense_total: u64 = dense.iter().map(|d| d.3).sum();
+            if used + head_bytes + dense_total + pool_min <= budget {
+                used += head_bytes + dense_total;
+                placement.resident_layers = cfg.n_layer;
+            } else {
+                // Keep the head if it is small next to the budget; stream it otherwise.
+                if head_bytes * 4 <= budget.saturating_sub(used) {
+                    used += head_bytes;
+                } else {
+                    place.insert(head_name.into(), Place::Ring);
+                    used += head_bytes;
+                }
+                // Two ring slots per kind of layer matrix, then whole layers while they fit.
+                let kind = |n: &str| n.splitn(3, '.').nth(2).unwrap_or(n).to_string();
+                let mut ring_reserve: HashMap<(String, u32), u64> = HashMap::new();
+                for d in &dense {
+                    let e = ring_reserve.entry((kind(&d.0), ty(&d.0))).or_default();
+                    *e = (*e).max(d.3 * 2);
+                }
+                let reserve: u64 = ring_reserve.values().sum();
+                let mut l = 0;
+                while l < cfg.n_layer {
+                    let layer: u64 = dense.iter().filter(|d| blk_of(&d.0) == Some(l)).map(|d| d.3).sum();
+                    if used + layer + reserve + pool_min > budget {
+                        break;
+                    }
+                    used += layer;
+                    l += 1;
+                }
+                placement.resident_layers = l;
+                used += reserve;
+                for d in &dense {
+                    if blk_of(&d.0).unwrap_or(0) >= l {
+                        place.insert(d.0.clone(), Place::Ring);
+                    }
+                }
+            }
+            placement.streamed_layers = cfg.n_layer - placement.resident_layers;
+            // Share what is left among the expert caches by layer count.
+            let left = budget.saturating_sub(used);
+            let layers_total: usize = pool_layers.iter().sum();
+            for p in 0..pools.len() {
+                let share = left / layers_total.max(1) as u64 * pool_layers[p] as u64;
+                let cap = pool_layers[p] * cfg.moe.as_ref().unwrap().n_expert;
+                pools[p].slots = ((share / unit(&pools[p]).max(1)) as usize).clamp(min_slots(p).max(1), cap);
+                placement.expert_slots += pools[p].slots;
+            }
+        }
         let mut mats = HashMap::new();
         let mut plan = Vec::new();
         let mut weight_bytes = 0u64;
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        for (name, rows, k, experts) in model::matrices(&cfg) {
+        let new_buf = |label: &str, size: u64| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size.max(16),
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        // Expert cache pages: as many slots per buffer as the binding limit allows.
+        for pool in &mut pools {
+            let per_slot: Vec<u64> = (0..3)
+                .map(|i| GpuFormat::compact(pool.types[i]).unwrap().bytes(pool.shape[i].1, pool.shape[i].0))
+                .collect();
+            let per_page = ((max_binding / per_slot.iter().max().unwrap().max(&1)) as usize).max(1);
+            let mut slot0 = 0;
+            while slot0 < pool.slots {
+                let n = per_page.min(pool.slots - slot0);
+                let bufs = [0, 1, 2].map(|i| new_buf("expert cache", per_slot[i] * n as u64));
+                weight_bytes += per_slot.iter().sum::<u64>() * n as u64;
+                pool.pages.push(PoolPage { slot0, n, bufs });
+                slot0 += n;
+            }
+        }
+        // Ring slots, shared by the same matrix kind of the streamed layers.
+        let mut rings: HashMap<(String, u32, usize, usize), (Vec<wgpu::Buffer>, usize)> = HashMap::new();
+        let mut ring_layers: Vec<Vec<String>> = vec![Vec::new(); cfg.n_layer];
+        let mut ring_head = Vec::new();
+        for (name, rows, k, experts) in &mats_list {
+            let name = name.clone();
+            let (rows, k, experts) = (*rows, *k, *experts);
             let t = g.tensor(&name).unwrap();
-            let fmt = GpuFormat::choose(t.ggml_type, opts.layout).unwrap();
+            let pl = place[&name];
+            let fmt = match pl {
+                Place::Resident => GpuFormat::choose(t.ggml_type, wlayout).unwrap(),
+                _ => GpuFormat::compact(t.ggml_type).unwrap(),
+            };
             let total = rows * experts;
             let rb = quant::row_bytes(t.ggml_type, k)? as u64;
             plan.push(TensorPlan {
                 name: name.clone(),
-                offset: g.data_offset + t.offset,
+                file: t.file,
+                offset: t.start(),
                 bytes: rb * total as u64,
                 row_bytes: rb,
                 rows: total as u64,
                 ggml_type: t.ggml_type,
+                resident: pl == Place::Resident,
             });
-            let (codes_row, scales_row) = fmt.sizes(k, 1);
-            let fit = ((max_binding / codes_row.max(scales_row).max(1)) as usize)
-                .min(total)
-                .max(1);
-            // Shards hold whole experts (or head groups); otherwise multiples of 64 rows, so
-            // matrix tiles never straddle them.
-            let per_shard = if fit >= total {
-                total
-            } else if experts > 1 {
-                if fit < rows {
-                    return Err(format!("{name}: one expert does not fit in a GPU buffer"));
-                }
-                fit / rows * rows
-            } else if fit >= 64 {
-                fit / 64 * 64
-            } else {
-                fit
-            };
             let mut shards = Vec::new();
-            let mut row0 = 0;
-            while row0 < total {
-                let n = per_shard.min(total - row0);
-                let (cb, sb) = fmt.sizes(k, n);
-                let codes = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&name),
-                    size: cb,
-                    usage,
-                    mapped_at_creation: false,
-                });
-                let scales = fmt.has_scales().then(|| {
-                    device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some(&name),
-                        size: sb.max(16),
-                        usage,
-                        mapped_at_creation: false,
-                    })
-                });
-                weight_bytes += cb + sb;
-                shards.push(Shard {
-                    row0,
-                    rows: n,
-                    codes,
-                    scales,
-                });
-                row0 += n;
+            match pl {
+                Place::Resident => {
+                    let (codes_row, scales_row) = fmt.sizes(k, 1);
+                    let fit = ((max_binding / codes_row.max(scales_row).max(1)) as usize)
+                        .min(total)
+                        .max(1);
+                    // Shards hold whole experts (or head groups); otherwise multiples of 64 rows,
+                    // so matrix tiles never straddle them.
+                    let per_shard = if fit >= total {
+                        total
+                    } else if experts > 1 {
+                        if fit < rows {
+                            return Err(format!("{name}: one expert does not fit in a GPU buffer"));
+                        }
+                        fit / rows * rows
+                    } else if fit >= 64 {
+                        fit / 64 * 64
+                    } else {
+                        fit
+                    };
+                    let mut row0 = 0;
+                    while row0 < total {
+                        let n = per_shard.min(total - row0);
+                        let (cb, sb) = fmt.sizes(k, n);
+                        let codes = new_buf(&name, cb);
+                        let scales = fmt.has_scales().then(|| new_buf(&name, sb));
+                        weight_bytes += cb + sb;
+                        placement.resident_bytes += cb + sb;
+                        shards.push(Shard {
+                            row0,
+                            rows: n,
+                            codes,
+                            scales,
+                        });
+                        row0 += n;
+                    }
+                }
+                Place::Ring => {
+                    let bytes = fmt.bytes(k, total);
+                    if bytes > max_binding {
+                        return Err(format!("{name} is too large to stream through one GPU buffer"));
+                    }
+                    let kind = name.splitn(3, '.').nth(2).unwrap_or(&name).to_string();
+                    let key = (kind, t.ggml_type, k, total);
+                    let slots = if name == head_name { 1 } else { 2 };
+                    let entry = rings.entry(key).or_insert_with(|| {
+                        weight_bytes += bytes * slots as u64;
+                        ((0..slots).map(|_| new_buf("ring", bytes)).collect(), 0)
+                    });
+                    let codes = entry.0[entry.1 % entry.0.len()].clone();
+                    entry.1 += 1;
+                    placement.streamed_bytes += rb * total as u64;
+                    shards.push(Shard {
+                        row0: 0,
+                        rows: total,
+                        codes,
+                        scales: None,
+                    });
+                    match blk_of(&name) {
+                        Some(l) => ring_layers[l].push(name.clone()),
+                        None => ring_head.push(name.clone()),
+                    }
+                }
+                Place::Pool(p) => {
+                    let i = ["gate", "up", "down"].iter().position(|w| name.contains(&format!("ffn_{w}_exps"))).unwrap();
+                    placement.streamed_bytes += rb * total as u64;
+                    for page in &pools[p].pages {
+                        shards.push(Shard {
+                            row0: page.slot0 * rows,
+                            rows: page.n * rows,
+                            codes: page.bufs[i].clone(),
+                            scales: None,
+                        });
+                    }
+                }
+                Place::Cpu => {
+                    placement.streamed_bytes += rb * total as u64;
+                }
             }
             mats.insert(
                 name,
@@ -331,6 +633,7 @@ impl Engine {
                     rows,
                     experts,
                     shards,
+                    place: pl,
                 },
             );
         }
@@ -340,11 +643,13 @@ impl Engine {
             let rb = quant::row_bytes(t.ggml_type, len)? as u64;
             plan.push(TensorPlan {
                 name: name.clone(),
-                offset: g.data_offset + t.offset,
+                file: t.file,
+                offset: t.start(),
                 bytes: rb,
                 row_bytes: rb,
                 rows: 1,
                 ggml_type: t.ggml_type,
+                resident: true,
             });
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&name),
@@ -353,9 +658,19 @@ impl Engine {
                 mapped_at_creation: false,
             });
             weight_bytes += (len * 4) as u64;
+            placement.resident_bytes += (len * 4) as u64;
             vecs.insert(name, buf);
         }
-        plan.sort_by_key(|p| p.offset);
+        plan.sort_by_key(|p| (p.file, p.offset));
+        let plan_index = plan.iter().enumerate().map(|(i, p)| (p.name.clone(), i)).collect();
+        let lru = pools
+            .iter()
+            .map(|p| Lru {
+                owner: vec![None; p.slots],
+                used: vec![0; p.slots],
+                slot_of: HashMap::new(),
+            })
+            .collect();
         let layouts = Layouts {
             matmul: layout(device, "uurrrwrr"),
             matmul_id: layout(device, "uurrrwrrr"),
@@ -390,6 +705,19 @@ impl Engine {
             tables,
             state: None,
             weight_bytes,
+            pools,
+            layer_pool,
+            ring_layers,
+            ring_head,
+            plan_index,
+            stream: RefCell::new(Stream {
+                lru,
+                emap: Vec::new(),
+                clock: 0,
+                stats: StreamStats::default(),
+            }),
+            source: RefCell::new(None),
+            placement,
         };
         e.compile()?;
         Ok(e)
@@ -485,6 +813,9 @@ impl Engine {
     pub fn upload(&mut self, name: &str, row0: usize, bytes: &[u8]) -> Result<(), String> {
         let queue = &self.gpu.queue;
         if let Some(m) = self.mats.get(name) {
+            if m.place != Place::Resident {
+                return Ok(());
+            }
             let rb = quant::row_bytes(m.ggml_type, m.k)?;
             if bytes.len() % rb != 0 {
                 return Err(format!("{name}: upload is not a whole number of rows"));
@@ -597,8 +928,12 @@ impl Engine {
         let (rlog, route, hexp, emap) = match &moe {
             Some(e) => {
                 let ident: Vec<u32> = (0..c.n_layer)
-                    .flat_map(|_| 0..e.n_expert as u32)
+                    .flat_map(|l| {
+                        let cached = self.layer_pool[l].is_some();
+                        (0..e.n_expert as u32).map(move |i| if cached { ABSENT } else { i })
+                    })
                     .collect();
+                self.stream.borrow_mut().emap = ident.clone();
                 let emap = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("expert map"),
                     contents: &words(&ident),
@@ -827,7 +1162,8 @@ impl Engine {
         };
 
         let emb = &self.mats["token_embd.weight"];
-        for s in &emb.shards {
+        let gpu_embed = emb.place == Place::Resident;
+        for s in emb.shards.iter().filter(|_| gpu_embed) {
             let p = params(&words(&[
                 c.n_embd as u32,
                 s.rows as u32,
@@ -927,8 +1263,12 @@ impl Engine {
             }
             None => params(&[0u8; 48]),
         };
+        let embed_end = ops.len();
+        let mut layers = Vec::with_capacity(c.n_layer);
         for l in 0..c.n_layer {
             let n = |s: &str| format!("blk.{l}.{s}");
+            let start = ops.len();
+            let (mut route_end, mut experts_end) = (0, 0);
             norm(&mut ops, &x, &self.vecs[&n("attn_norm.weight")], &xn, c.n_embd, false);
             if let Some(m) = &mla {
                 if m.q_lora > 0 {
@@ -997,7 +1337,10 @@ impl Engine {
                 matmul(&mut ops, &n("attn_q.weight"), &xn, &q, 0, bias("attn_q.bias"), false, input);
                 matmul(&mut ops, &n("attn_k.weight"), &xn, &k, 0, bias("attn_k.bias"), false, input);
                 matmul(&mut ops, &n("attn_v.weight"), &xn, &v, 0, bias("attn_v.bias"), false, input);
-                if c.qk_norm {
+                if c.qk_norm_full {
+                    norm_inplace(&mut ops, &q, &self.vecs[&n("attn_q_norm.weight")], c.q_dim(), 1);
+                    norm_inplace(&mut ops, &k, &self.vecs[&n("attn_k_norm.weight")], c.kv_dim(), 1);
+                } else if c.qk_norm {
                     norm_inplace(&mut ops, &q, &self.vecs[&n("attn_q_norm.weight")], c.head_dim, c.n_head);
                     norm_inplace(&mut ops, &k, &self.vecs[&n("attn_k_norm.weight")], c.head_dim, c.n_head_kv);
                 }
@@ -1024,9 +1367,11 @@ impl Engine {
                         grid: Grid::Tokens,
                         bind: bind(&self.layouts.topk, "topk", &[&step, &topk_p, &rlog, bias, &route]),
                     });
+                    route_end = ops.len();
                     matmul_id(&mut ops, l, &n("ffn_gate_exps.weight"), &xn, &hexp, 0, false);
                     matmul_id(&mut ops, l, &n("ffn_up_exps.weight"), &xn, &hexp, 2, false);
                     matmul_id(&mut ops, l, &n("ffn_down_exps.weight"), &hexp, &x, 1, true);
+                    experts_end = ops.len();
                     if e.n_ff_shared > 0 {
                         matmul(&mut ops, &n("ffn_gate_shexp.weight"), &xn, &gate, 0, None, false, input);
                         matmul(&mut ops, &n("ffn_up_shexp.weight"), &xn, &gate, 2, None, false, input);
@@ -1039,6 +1384,17 @@ impl Engine {
                     matmul(&mut ops, &n("ffn_down.weight"), &gate, &x, 1, None, false, Input::rows(c.n_ff));
                 }
             }
+            let end = ops.len();
+            if route_end == 0 {
+                route_end = end;
+                experts_end = end;
+            }
+            layers.push(LayerOps {
+                start,
+                route_end,
+                experts_end,
+                end,
+            });
         }
         let head_start = ops.len();
         norm(&mut ops, &x, &self.vecs["output_norm.weight"], &xf, c.n_embd, true);
@@ -1050,6 +1406,12 @@ impl Engine {
         matmul(&mut ops, head, &xf, &logits, 0, None, true, Input::rows(c.n_embd));
 
         let bytes = Self::state_bytes(&c, ctx);
+        let route_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("route staging"),
+            size: route.size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         self.state = Some(State {
             ctx,
             step,
@@ -1058,6 +1420,12 @@ impl Engine {
             staging,
             ops,
             head_start,
+            embed_end,
+            layers,
+            x,
+            route,
+            route_staging,
+            emap,
             bytes,
         });
         match self.gpu.take_error() {
@@ -1112,6 +1480,13 @@ impl Engine {
 
     fn encode_chunk(&self, n_tokens: usize, with_head: bool) -> wgpu::CommandBuffer {
         let st = self.state.as_ref().unwrap();
+        let end = if with_head { st.ops.len() } else { st.head_start };
+        self.encode_range(0..end, n_tokens, with_head)
+    }
+
+    fn encode_range(&self, range: std::ops::Range<usize>, n_tokens: usize, copy_logits: bool) -> wgpu::CommandBuffer {
+        let st = self.state.as_ref().unwrap();
+        let with_head = copy_logits;
         let mut enc = self
             .gpu
             .device
@@ -1124,12 +1499,7 @@ impl Engine {
                 timestamp_writes: None,
             });
             let t = n_tokens as u32;
-            let end = if with_head {
-                st.ops.len()
-            } else {
-                st.head_start
-            };
-            for op in &st.ops[..end] {
+            for op in &st.ops[range] {
                 let (key, (gx, gy)) = Self::dispatch_of(op, t);
                 pass.set_pipeline(&self.pipelines[&key]);
                 pass.set_bind_group(0, &op.bind, &[]);
@@ -1188,6 +1558,9 @@ impl Engine {
 
     /// Run `tokens` at positions `pos0..` and return the logits after the last one.
     pub async fn forward(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, String> {
+        if self.placement.streaming {
+            return self.forward_streamed(tokens, pos0).await;
+        }
         let st = self.state.as_ref().ok_or("model is not loaded")?;
         if tokens.is_empty() {
             return Err("nothing to process".into());
@@ -1212,6 +1585,234 @@ impl Engine {
             let cmd = self.encode_chunk(chunk.len(), last);
             self.gpu.queue.submit([cmd]);
             pos += chunk.len();
+        }
+        let bytes = read_back(&self.gpu, &st.staging, st.staging.size()).await?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect())
+    }
+
+    /// Where weights that are not resident are read from (required when `placement.streaming`).
+    pub fn set_source(&self, source: Box<dyn WeightSource>) {
+        *self.source.borrow_mut() = Some(source);
+    }
+
+    /// Streaming counters since the last call.
+    pub fn take_stream_stats(&self) -> StreamStats {
+        std::mem::take(&mut self.stream.borrow_mut().stats)
+    }
+
+    fn read(&self, plan: &TensorPlan, offset: u64, len: usize) -> Result<Vec<u8>, String> {
+        let src = self.source.borrow();
+        let src = src.as_ref().ok_or("this model streams weights but has no weight source")?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let t0 = std::time::Instant::now();
+        let bytes = src.read(plan.file, plan.offset + offset, len)?;
+        let mut st = self.stream.borrow_mut();
+        st.stats.bytes_read += len as u64;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            st.stats.read_seconds += t0.elapsed().as_secs_f64();
+        }
+        Ok(bytes)
+    }
+
+    fn tensor(&self, name: &str) -> &TensorPlan {
+        &self.plan[self.plan_index[name]]
+    }
+
+    /// Read whole ring matrices into their slots before the ops that use them.
+    fn upload_rings(&self, names: &[String]) -> Result<u64, String> {
+        let mut bytes = 0;
+        for name in names {
+            let m = &self.mats[name];
+            let tp = self.tensor(name).clone();
+            let raw = self.read(&tp, 0, tp.bytes as usize)?;
+            #[cfg(not(target_arch = "wasm32"))]
+            let t0 = std::time::Instant::now();
+            let w = quant::to_gpu_bytes(m.ggml_type, &raw, m.k, m.total_rows())?;
+            self.gpu.queue.write_buffer(&m.shards[0].codes, 0, &w);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.stream.borrow_mut().stats.upload_seconds += t0.elapsed().as_secs_f64();
+            }
+            bytes += tp.bytes;
+        }
+        Ok(bytes)
+    }
+
+    /// Embedding rows of `tokens`, dequantized on the CPU.
+    fn embed_cpu(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        let tp = self.tensor("token_embd.weight").clone();
+        let k = self.cfg.n_embd;
+        let mut out = vec![0f32; tokens.len() * k];
+        for (i, &t) in tokens.iter().enumerate() {
+            if t as u64 >= tp.rows {
+                return Err(format!("token {t} is outside the vocabulary"));
+            }
+            let row = self.read(&tp, t as u64 * tp.row_bytes, tp.row_bytes as usize)?;
+            quant::dequantize(tp.ggml_type, &row, &mut out[i * k..(i + 1) * k])?;
+        }
+        Ok(out)
+    }
+
+    /// Read expert `e` of layer `l` into cache slot `slot` of pool `p`.
+    fn load_expert(&self, p: usize, slot: usize, l: usize, e: u32) -> Result<(), String> {
+        let pool = &self.pools[p];
+        let page = pool.pages.iter().find(|pg| slot >= pg.slot0 && slot < pg.slot0 + pg.n).unwrap();
+        for (i, kind) in ["gate", "up", "down"].iter().enumerate() {
+            let name = format!("blk.{l}.ffn_{kind}_exps.weight");
+            let tp = self.tensor(&name).clone();
+            let (rows, k) = pool.shape[i];
+            let len = rows * tp.row_bytes as usize;
+            let raw = self.read(&tp, e as u64 * len as u64, len)?;
+            let w = quant::to_gpu_bytes(tp.ggml_type, &raw, k, rows)?;
+            let at = GpuFormat::compact(tp.ggml_type).unwrap().bytes(k, rows) * (slot - page.slot0) as u64;
+            self.gpu.queue.write_buffer(&page.bufs[i], at, &w);
+        }
+        Ok(())
+    }
+
+    /// The experts layer `l` needs, grouped into passes that each fit the cache. Each pass is its
+    /// (expert, slot) map and the (slot, expert) loads to do before it runs: misses go to the least
+    /// recently used slots, so a later pass may reuse a slot an earlier pass read from.
+    #[allow(clippy::type_complexity)]
+    fn plan_experts(&self, l: usize, ids: &[u32]) -> Result<Vec<(Vec<(u32, usize)>, Vec<(usize, u32)>)>, String> {
+        let p = self.layer_pool[l].unwrap();
+        let mut need: Vec<u32> = ids.to_vec();
+        need.sort_unstable();
+        need.dedup();
+        let mut passes = Vec::new();
+        {
+            let mut st = self.stream.borrow_mut();
+            st.stats.expert_requests += need.len() as u64;
+            let slots = self.pools[p].slots;
+            while !need.is_empty() {
+                st.clock += 1;
+                let clock = st.clock;
+                let lru = &mut st.lru[p];
+                let mut pass: Vec<(u32, usize)> = Vec::new();
+                let mut locked = vec![false; slots];
+                let mut rest = Vec::new();
+                for &e in &need {
+                    match lru.slot_of.get(&(l, e)) {
+                        Some(&s) => {
+                            pass.push((e, s));
+                            locked[s] = true;
+                            lru.used[s] = clock;
+                        }
+                        None => rest.push(e),
+                    }
+                }
+                let hits = pass.len() as u64;
+                let mut loads: Vec<(usize, u32)> = Vec::new();
+                let mut left = Vec::new();
+                for e in rest {
+                    if pass.len() == slots {
+                        left.push(e);
+                        continue;
+                    }
+                    let s = (0..slots).filter(|&s| !locked[s]).min_by_key(|&s| lru.used[s]).unwrap();
+                    if let Some(old) = lru.owner[s].take() {
+                        lru.slot_of.remove(&old);
+                    }
+                    lru.owner[s] = Some((l, e));
+                    lru.slot_of.insert((l, e), s);
+                    lru.used[s] = clock;
+                    locked[s] = true;
+                    loads.push((s, e));
+                    pass.push((e, s));
+                }
+                st.stats.expert_hits += hits;
+                st.stats.expert_loads += loads.len() as u64;
+                st.stats.passes += 1;
+                passes.push((pass, loads));
+                need = left;
+            }
+        }
+        Ok(passes)
+    }
+
+    /// Forward pass for models that do not fit: layer by layer, reading streamed weights and
+    /// the experts each token chose.
+    async fn forward_streamed(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, String> {
+        let st = self.state.as_ref().ok_or("model is not loaded")?;
+        if tokens.is_empty() {
+            return Err("nothing to process".into());
+        }
+        if pos0 + tokens.len() > st.ctx {
+            return Err(format!("the conversation is longer than the {}-token context", st.ctx));
+        }
+        let q = &self.gpu.queue;
+        let n_expert = self.cfg.moe.as_ref().map_or(0, |e| e.n_expert);
+        let n_used = self.cfg.moe.as_ref().map_or(0, |e| e.n_used);
+        let chunks: Vec<&[u32]> = tokens.chunks(MAX_BATCH).collect();
+        let mut pos = pos0;
+        for (ci, chunk) in chunks.iter().enumerate() {
+            let n = chunk.len();
+            let last = ci + 1 == chunks.len();
+            q.write_buffer(&st.step, 0, &words(&[n as u32, pos as u32, (pos + n) as u32, n as u32 - 1]));
+            q.write_buffer(&st.tokens, 0, &words(chunk));
+            if self.placement.cpu_embeddings || st.embed_end == 0 {
+                q.write_buffer(&st.x, 0, &floats(&self.embed_cpu(chunk)?));
+            } else {
+                q.submit([self.encode_range(0..st.embed_end, n, false)]);
+            }
+            let mut queued = 0u64;
+            for (l, lo) in st.layers.iter().enumerate() {
+                queued += self.upload_rings(&self.ring_layers[l])?;
+                match self.layer_pool[l] {
+                    Some(_) => {
+                        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+                        {
+                            let mut pass = enc.begin_compute_pass(&Default::default());
+                            for op in &st.ops[lo.start..lo.route_end] {
+                                let (key, (gx, gy)) = Self::dispatch_of(op, n as u32);
+                                pass.set_pipeline(&self.pipelines[&key]);
+                                pass.set_bind_group(0, &op.bind, &[]);
+                                pass.dispatch_workgroups(gx, gy, 1);
+                            }
+                        }
+                        let route_len = (n * n_used * 4) as u64;
+                        enc.copy_buffer_to_buffer(&st.route, 0, &st.route_staging, 0, route_len);
+                        q.submit([enc.finish()]);
+                        let raw = read_back(&self.gpu, &st.route_staging, route_len).await?;
+                        let ids: Vec<u32> = raw.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+                        if ids.iter().any(|&e| e as usize >= n_expert) {
+                            return Err("expert routing produced an invalid expert".into());
+                        }
+                        let pool = self.layer_pool[l].unwrap();
+                        for (pass, loads) in self.plan_experts(l, &ids)? {
+                            // Queued after the previous pass's work, so reused slots are safe.
+                            for (slot, e) in loads {
+                                self.load_expert(pool, slot, l, e)?;
+                            }
+                            let mut map = vec![ABSENT; n_expert];
+                            for (e, s) in pass {
+                                map[e as usize] = s as u32;
+                            }
+                            q.write_buffer(&st.emap, (l * n_expert * 4) as u64, &words(&map));
+                            q.submit([self.encode_range(lo.route_end..lo.experts_end, n, false)]);
+                        }
+                        q.submit([self.encode_range(lo.experts_end..lo.end, n, false)]);
+                        queued = 0;
+                    }
+                    None => {
+                        q.submit([self.encode_range(lo.start..lo.end, n, false)]);
+                        // Bound the weight uploads waiting in the queue.
+                        if queued > 512 << 20 {
+                            super::wait_idle(&self.gpu).await?;
+                            queued = 0;
+                        }
+                    }
+                }
+            }
+            if last {
+                self.upload_rings(&self.ring_head)?;
+                q.submit([self.encode_range(st.head_start..st.ops.len(), n, true)]);
+            }
+            pos += n;
         }
         let bytes = read_back(&self.gpu, &st.staging, st.staging.size()).await?;
         Ok(bytes

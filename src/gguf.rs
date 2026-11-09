@@ -82,11 +82,20 @@ pub struct TensorInfo {
     pub ggml_type: u32,
     /// Offset relative to the start of the tensor data section.
     pub offset: u64,
+    /// File of a split model that holds the tensor (0 for single files).
+    pub file: usize,
+    /// Start of that file's tensor data section.
+    pub base: u64,
 }
 
 impl TensorInfo {
     pub fn elements(&self) -> u64 {
         self.dims.iter().product()
+    }
+
+    /// Byte offset of the tensor within its file.
+    pub fn start(&self) -> u64 {
+        self.base + self.offset
     }
 }
 
@@ -244,6 +253,8 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, ParseError> {
             dims,
             ggml_type,
             offset,
+            file: 0,
+            base: 0,
         });
     }
     let alignment = metadata
@@ -255,6 +266,9 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, ParseError> {
     }
     let pos = r.pos as u64;
     let data_offset = pos.div_ceil(alignment) * alignment;
+    for t in &mut tensors {
+        t.base = data_offset;
+    }
     Ok(Gguf {
         version,
         metadata,
@@ -286,11 +300,66 @@ impl Gguf {
     pub fn tensor_index(&self, name: &str) -> Option<usize> {
         self.tensors.iter().position(|t| t.name == name)
     }
+
+    /// Number of files of a split model (`model-00001-of-00004.gguf`), from the first file.
+    pub fn split_count(&self) -> usize {
+        self.u64("split.count").unwrap_or(1).max(1) as usize
+    }
+
+    /// Join the headers of every file of a split model, in order, into one directory whose
+    /// tensors remember their file. Metadata comes from the first file.
+    pub fn merge(parts: Vec<Gguf>) -> Result<Gguf, String> {
+        let mut it = parts.into_iter();
+        let mut first = it.next().ok_or("no files")?;
+        let count = first.split_count();
+        for (i, part) in it.enumerate() {
+            let file = i + 1;
+            if let Some(n) = part.u64("split.no") {
+                if n as usize != file {
+                    return Err(format!("file {} is split part {} of the model", file + 1, n + 1));
+                }
+            }
+            for mut t in part.tensors {
+                t.file = file;
+                first.tensors.push(t);
+            }
+        }
+        if count > 1 {
+            let have = first.tensors.iter().map(|t| t.file).max().unwrap_or(0) + 1;
+            if have != count {
+                return Err(format!("the model has {count} parts but {have} were given"));
+            }
+        }
+        Ok(first)
+    }
+}
+
+/// For `name-00001-of-00004.gguf`, the names of all parts; None for a single file.
+pub fn split_names(name: &str) -> Option<Vec<String>> {
+    let stem = name.strip_suffix(".gguf")?;
+    let (head, total) = stem.rsplit_once("-of-")?;
+    let (prefix, index) = head.rsplit_once('-')?;
+    let n: usize = total.parse().ok()?;
+    if index.len() != total.len() || index.parse::<usize>().ok()? == 0 || n < 2 {
+        return None;
+    }
+    let w = total.len();
+    Some((1..=n).map(|i| format!("{prefix}-{i:0w$}-of-{total}.gguf")).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_names_follow_llama_cpp() {
+        let n = split_names("Kimi-K2-UD-IQ1_S-00002-of-00005.gguf").unwrap();
+        assert_eq!(n.len(), 5);
+        assert_eq!(n[0], "Kimi-K2-UD-IQ1_S-00001-of-00005.gguf");
+        assert_eq!(n[4], "Kimi-K2-UD-IQ1_S-00005-of-00005.gguf");
+        assert!(split_names("model.gguf").is_none());
+        assert!(split_names("qwen-of-the-year.gguf").is_none());
+    }
 
     fn push_str(out: &mut Vec<u8>, s: &str) {
         out.extend((s.len() as u64).to_le_bytes());

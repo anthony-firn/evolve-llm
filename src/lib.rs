@@ -9,6 +9,7 @@ pub mod model;
 pub mod quant;
 pub mod sampler;
 pub mod session;
+pub mod source;
 pub mod tokenizer;
 
 #[cfg(target_arch = "wasm32")]

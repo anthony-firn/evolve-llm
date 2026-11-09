@@ -177,3 +177,15 @@ pub async fn read_back(gpu: &Gpu, buffer: &wgpu::Buffer, len: u64) -> Result<Vec
     }
     Ok(data)
 }
+
+/// Wait until the GPU has finished all submitted work.
+pub async fn wait_idle(gpu: &Gpu) -> Result<(), String> {
+    let (send, done) = oneshot();
+    gpu.queue.on_submitted_work_done(move || send(()));
+    #[cfg(not(target_arch = "wasm32"))]
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|e| e.to_string())?;
+    done.await;
+    Ok(())
+}

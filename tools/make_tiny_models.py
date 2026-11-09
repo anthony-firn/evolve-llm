@@ -37,6 +37,10 @@ SPECS = {
     "mixtral": ("MixtralConfig", "MixtralForCausalLM", dict(
         hidden_size=128, intermediate_size=64, num_local_experts=4, num_experts_per_tok=2, num_hidden_layers=2,
         num_attention_heads=4, num_key_value_heads=2, tie_word_embeddings=True, rope_theta=1e6, sliding_window=None)),
+    "olmoe": ("OlmoeConfig", "OlmoeForCausalLM", dict(
+        hidden_size=128, intermediate_size=64, num_experts=8, num_experts_per_tok=2, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=4, norm_topk_prob=False, tie_word_embeddings=False,
+        rope_theta=10000.0)),
     # DeepSeek V3 / R1 / Kimi K2 layout: query compression, sigmoid routing with a selection bias,
     # group-limited choice, a shared expert, a leading dense layer and YaRN.
     "deepseek3": ("DeepseekV3Config", "DeepseekV3ForCausalLM", dict(

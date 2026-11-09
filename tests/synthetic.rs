@@ -226,13 +226,17 @@ fn every_format_matches_the_cpu_reference_on_the_gpu() {
     let tokens = [3u32, 141, 7, 300, 77, 12];
     // Every format runs in its fast and its compact layout, whole and again with matrices split
     // into 64-row shards, as on devices with small storage-binding limits.
-    let runs = [false, true].into_iter().flat_map(|compact| {
-        formats
-            .iter()
-            .map(move |&t| (t, None, compact))
-            .chain(formats.iter().map(move |&t| (t, Some(16 * 1024u64), compact)))
-    });
-    for (i, (t, limit, compact)) in runs.enumerate() {
+    // Finally every layer streamed from storage (ring buffers, embeddings on the CPU).
+    let runs = [false, true]
+        .into_iter()
+        .flat_map(|compact| {
+            formats
+                .iter()
+                .map(move |&t| (t, None, compact, None))
+                .chain(formats.iter().map(move |&t| (t, Some(16 * 1024u64), compact, None)))
+        })
+        .chain(formats.iter().map(|&t| (t, None, true, Some(1u64))));
+    for (i, (t, limit, compact, budget)) in runs.enumerate() {
         if only.as_deref().is_some_and(|f| !quant::type_name(t).eq_ignore_ascii_case(f)) {
             continue;
         }
@@ -241,9 +245,11 @@ fn every_format_matches_the_cpu_reference_on_the_gpu() {
         let opts = Options {
             binding_limit: limit,
             layout: if compact { quant::Layout::Blocks } else { quant::Layout::Fast },
+            budget,
         };
         let mut engine = Engine::with_options(device.take().unwrap(), &g, opts).unwrap();
-        for p in engine.plan().to_vec() {
+        engine.set_source(Box::new(evolve_llm::source::MemorySource(vec![bytes.clone()])));
+        for p in engine.plan().to_vec().iter().filter(|p| p.resident) {
             engine
                 .upload(
                     &p.name,
@@ -291,7 +297,7 @@ fn every_format_matches_the_cpu_reference_on_the_gpu() {
         eprintln!(
             "{:7} {:8} in {:3} buffers: logit range {scale:7.3}, one-token max error {:.2e}, batched {:.2e}",
             quant::type_name(t),
-            if compact { "compact" } else { "fast" },
+            if budget.is_some() { "streamed" } else if compact { "compact" } else { "fast" },
             engine.shard_count(),
             worst,
             batched

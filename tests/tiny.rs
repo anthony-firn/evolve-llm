@@ -6,6 +6,7 @@
 use evolve_llm::gguf;
 use evolve_llm::gpu::{self, engine::{Engine, Options}};
 use evolve_llm::quant::Layout;
+use evolve_llm::source::MemorySource;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -58,16 +59,25 @@ fn run(name: &str, suffix: &str, tol: f32) {
     let positions: Vec<usize> = fx["positions"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
     let want: Vec<Vec<f32>> = fx["logits"].as_array().unwrap().iter().map(|v| b64f(v.as_str().unwrap())).collect();
     let range = fx["range"].as_f64().unwrap() as f32;
-    for layout in [Layout::Fast, Layout::Blocks] {
+    // Resident in both layouts, then streamed: a third of the weights on the GPU, and almost
+    // nothing (every layer streamed, an expert cache of a few slots, several passes per prompt).
+    let runs = [
+        (Layout::Fast, None),
+        (Layout::Blocks, None),
+        (Layout::Fast, Some(bytes.len() as u64 / 3)),
+        (Layout::Fast, Some(1)),
+    ];
+    for (layout, budget) in runs {
         let Ok(gpu) = pollster::block_on(gpu::init()) else {
             eprintln!("skipping {name}: no GPU adapter");
             return;
         };
-        let opts = Options { binding_limit: None, layout };
+        let opts = Options { binding_limit: None, layout, budget };
         let mut e = Engine::with_options(gpu, &g, opts).unwrap_or_else(|err| panic!("{name}: {err}"));
-        for p in e.plan().to_vec() {
+        for p in e.plan().to_vec().iter().filter(|p| p.resident) {
             e.upload(&p.name, 0, &bytes[p.offset as usize..(p.offset + p.bytes) as usize]).unwrap();
         }
+        e.set_source(Box::new(MemorySource(vec![bytes.clone()])));
         e.finish(64).unwrap();
         // The whole prompt in one batch (matrix-matrix kernels, causal attention within the batch).
         let batched = pollster::block_on(e.forward(&tokens, 0)).unwrap();
@@ -81,14 +91,22 @@ fn run(name: &str, suffix: &str, tol: f32) {
             }
         }
         let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        let st = e.take_stream_stats();
+        let mode = match budget {
+            None => format!("{layout:?}"),
+            Some(_) => format!(
+                "streamed ({} of {} layers resident, {} expert slots, {} passes)",
+                e.placement.resident_layers, e.cfg.n_layer, e.placement.expert_slots, st.passes
+            ),
+        };
         eprintln!(
-            "{name:14}{suffix:6} {layout:?}: {} weight MB, batched error {b_err:.2e}, step error {step_err:.2e} of a {range:.2} logit range",
-            e.weight_bytes / 1_000_000
+            "{name:14}{suffix:6} {mode}: {:.1} weight MB, batched error {b_err:.2e}, step error {step_err:.2e} of a {range:.2} logit range",
+            e.weight_bytes as f64 / 1e6
         );
         if suffix.is_empty() {
             assert_eq!(argmax(&batched), argmax(want.last().unwrap()), "{name}: different top token");
         }
-        assert!(b_err < tol && step_err < tol, "{name}{suffix} {layout:?}: GPU differs from transformers");
+        assert!(b_err < tol && step_err < tol, "{name}{suffix} {mode}: GPU differs from transformers");
     }
 }
 
@@ -100,6 +118,11 @@ fn qwen3_moe_matches_transformers() {
 #[test]
 fn mixtral_matches_transformers() {
     check("mixtral");
+}
+
+#[test]
+fn olmoe_matches_transformers() {
+    check("olmoe");
 }
 
 #[test]
