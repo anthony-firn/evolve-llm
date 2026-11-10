@@ -15,7 +15,7 @@ def check(runtime):
             page.on('pageerror',lambda e:errors.append(str(e)))
             page.on('request',lambda r:remote.append(r.url) if not r.url.startswith(base.split('/play/')[0]+'/') else None)
             page.goto(base);page.locator('#open-terminal').click()
-            page.wait_for_function("() => document.querySelector('#terminal-status').textContent.startsWith('Ready')")
+            page.wait_for_function("() => document.querySelector('#terminal-status')?.textContent.startsWith('Ready')")
             def command(text):
                 page.locator('#terminal-input').fill(text)
                 page.locator('.terminal-form button[type=submit]').click()
