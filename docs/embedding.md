@@ -2,7 +2,8 @@
 
 The browser SDK owns a dedicated module worker. It streams events from the existing Rust/WASM
 engine and releases the worker on disposal, cancellation or failure. It has no dependency on
-the chat UI. Internet search tools stay off in this API.
+the chat UI. Internet tools default to off; opt in per generation with `internet: { enabled: true }`.
+Tool events appear in the stream. See [public web permissions and providers](workbench.md).
 
 Download the runtime bundle from https://www.evolvetech.dev/developers/llm/. It contains the SDK,
 TypeScript declarations, worker, model catalog, WebAssembly engine, license and an example.
@@ -10,7 +11,7 @@ Serve the files from the **same origin** as your application: browsers reject a 
 Worker even when an imported JavaScript module itself is accessible.
 
 ```sh
-unzip evolve-llm-browser-0.2.0.zip -d evolve-llm
+unzip evolve-llm-browser-0.3.0.zip -d evolve-llm
 python3 -m http.server 8080 --directory evolve-llm
 # Open http://localhost:8080/examples/
 ```
@@ -87,3 +88,6 @@ See [the engine's verification and measured results](https://github.com/anthony-
 The SDK protocol tests use synthetic workers to check stream ordering, cancellation, bounded
 buffers, timeouts, late messages, failure cleanup and concurrent calls. The browser fixture
 checks the actual module Worker and async-iterator path without claiming to test GPU inference.
+
+The download also includes the complete chat app and browser Pi/WASM terminal. Open its root
+for the workbench or `examples/` for the SDK demo. See the included `WORKBENCH.md`.

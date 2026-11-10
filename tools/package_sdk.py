@@ -21,9 +21,15 @@ def package(runtime, out):
     subprocess.run(['git', 'diff', '--exit-code', engine_commit, 'HEAD', '--', 'src', 'Cargo.toml', 'Cargo.lock'], cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
     if subprocess.check_output(['git', 'status', '--porcelain', '--', 'src', 'Cargo.toml', 'Cargo.lock'], cwd=ROOT):
         raise ValueError('Engine sources have local changes')
-    files = {name: (ROOT / 'web' / name).read_bytes() for name in ['sdk.mjs', 'sdk.d.mts', 'worker.js', 'models.js', 'tools.js',
-        'examples/index.html', 'examples/example.mjs', 'examples/example.css', 'examples/fixture-worker.mjs']}
+    names = ['icon.svg', 'markdown.js', 'index.html', 'app.js', 'app.css', 'sdk.mjs', 'sdk.d.mts', 'worker.js', 'models.js', 'tools.js', 'network.js',
+        'workbench.mjs', 'shell-client.mjs', 'shell-worker.mjs', 'pi-agent.bundle.mjs', 'pi-agent.bundle.mjs.LEGAL.txt',
+        'shell-pkg/shell.js', 'shell-pkg/shell_bg.wasm', 'shell-pkg/pi-build.json', 'shell-pkg/PI-LICENSE.txt',
+        'examples/index.html', 'examples/example.mjs', 'examples/example.css', 'examples/fixture-worker.mjs']
+    files = {name: (ROOT / 'web' / name).read_bytes() for name in names if (ROOT / 'web' / name).is_file()}
+    for required in ['shell-pkg/shell_bg.wasm', 'pi-agent.bundle.mjs', 'network.js']:
+        if required not in files: raise ValueError('Build the workbench first: node tools/build_workbench.mjs')
     files.update({'pkg/' + name: (runtime / name).read_bytes() for name in ['evolve_llm.js', 'evolve_llm_bg.wasm', 'BUILD.json']})
+    files['WORKBENCH.md'] = (ROOT / 'docs/workbench.md').read_bytes()
     files['README.md'] = (ROOT / 'docs/embedding.md').read_bytes()
     for name in ['LICENSE', 'NOTICE']: files[name] = (ROOT / name).read_bytes()
     provenance = {'source': 'https://github.com/anthony-firn/evolve-llm',
@@ -32,7 +38,7 @@ def package(runtime, out):
         'engine_commit': engine_commit, 'wasm_sha256': digest,
         'files_sha256': {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
     out.mkdir(parents=True, exist_ok=True)
-    target = out / 'evolve-llm-browser-0.2.0.zip'
+    target = out / 'evolve-llm-browser-0.3.0.zip'
     with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as archive:
         for name, data in {**files, 'BUILD.json': (json.dumps(provenance, indent=2) + '\n').encode()}.items():
             entry = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0)); entry.compress_type = zipfile.ZIP_DEFLATED

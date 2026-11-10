@@ -69,3 +69,11 @@ test('GPU budget has explicit MB units and is converted to the runtime GB settin
   const { engine, workers } = setup(); const load = engine.load('smollm2-135m', { gpuMemoryMB: 512 });
   assert.equal(workers[0].messages[0].gpuMemory, 0.5); workers[0].emit({ type: 'loaded' }); await load; engine.dispose();
 });
+
+test('internet access requires an explicit per-generation opt-in and streams tool events',async()=>{
+ const {engine,workers}=setup();await loaded(engine,workers);
+ const run=engine.generate([{role:'user',content:'Find WebGPU documentation'}],{internet:{enabled:true}});
+ assert.equal(workers[0].messages.at(-1).internet.enabled,true);
+ workers[0].emit({type:'tool',name:'web_search'});workers[0].emit({type:'tool-result',sources:[]});workers[0].emit({type:'done'});
+ const events=[];for await(const event of run)events.push(event.type);assert.deepEqual(events,['tool','tool-result','done']);engine.dispose();
+});

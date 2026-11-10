@@ -41,6 +41,7 @@ def main():
     have = subprocess.run(["wasm-bindgen", "--version"], capture_output=True, text=True, check=True).stdout.split()[-1]
     if want and have != want:
         raise SystemExit(f"wasm-bindgen-cli {have} does not match the locked crate {want}: cargo install wasm-bindgen-cli --version {want}")
+    run("node", "tools/build_workbench.mjs")
     shutil.rmtree(out, ignore_errors=True)
     shutil.copytree(ROOT / "web", out)
     wasm = ROOT / "target/wasm32-unknown-unknown/wasm/evolve_llm.wasm"

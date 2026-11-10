@@ -3,3 +3,8 @@
 /models
 node_modules
 *.gguf
+
+/sandbox/target/
+/web/shell-pkg/
+/web/pi-agent.bundle.mjs
+/web/pi-agent.bundle.mjs.LEGAL.txt

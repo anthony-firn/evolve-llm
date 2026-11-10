@@ -1,3 +1,4 @@
+import { publicUrl, requestOptions, boundedText } from './network.js';
 // Internet access for the model, straight from the browser: no server of ours sees the
 // conversation. Search terms go to Wikipedia and DuckDuckGo (and Jina, with the person's own
 // key); pages the model opens are read through Jina Reader, or Wikipedia's API for articles.
@@ -12,14 +13,14 @@ export const TOOL_SCHEMAS = [
 const NAMES = new Set(TOOL_SCHEMAS.map((t) => t.function.name));
 const PAGE_CHARS = 6000;
 
-function call(obj) {
+function call(obj, allowed = NAMES) {
   if (!obj || typeof obj !== 'object') return null;
   const name = obj.name || obj.function?.name;
   let args = obj.arguments ?? obj.parameters ?? obj.function?.arguments ?? {};
   if (typeof args === 'string') {
     try { args = JSON.parse(args); } catch { args = {}; }
   }
-  return NAMES.has(name) && args && typeof args === 'object' ? { name, args } : null;
+  return allowed.has(name) && args && typeof args === 'object' ? { name, args } : null;
 }
 
 function parseJson(text) {
@@ -30,16 +31,16 @@ function parseJson(text) {
  * Tool calls in a model's reply: Qwen/Hermes `<tool_call>{json}</tool_call>` blocks, or a reply
  * that is one JSON call object as Llama 3 writes it (optionally after `<|python_tag|>`).
  */
-export function parseToolCalls(text) {
+export function parseToolCalls(text, allowed = NAMES) {
   const calls = [];
   for (const m of String(text).matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g)) {
-    const c = call(parseJson(m[1]));
+    const c = call(parseJson(m[1]), allowed);
     if (c) calls.push(c);
   }
   if (calls.length) return calls;
   const bare = String(text).replace(/^\s*<\|python_tag\|>/, '').trim();
   if (bare.startsWith('{') && bare.endsWith('}')) {
-    const c = call(parseJson(bare));
+    const c = call(parseJson(bare), allowed);
     if (c) calls.push(c);
   }
   return calls;
@@ -63,7 +64,8 @@ function language() {
 async function getJson(fetchFn, url, init) {
   const res = await fetchFn(url, init);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  if (!res.body && !res.text) return res.json();
+  return JSON.parse(await boundedText(res, 256 * 1024));
 }
 
 async function wikipediaSearch(query, { fetchFn, lang }) {
@@ -96,18 +98,22 @@ async function jinaSearch(query, { fetchFn, jinaKey }) {
 
 /** Numbered results for the model, and the same results as links for the page. */
 export async function webSearch(query, opts = {}) {
-  const o = { fetchFn: opts.fetchFn || fetch, lang: opts.lang || language(), jinaKey: opts.jinaKey || '' };
+  const baseFetch = opts.fetchFn || fetch;
+  const o = { fetchFn: (url, init) => { const policy=requestOptions(opts); return baseFetch(url, { ...policy, ...init, signal:policy.signal }); }, lang: opts.lang || language(), jinaKey: opts.jinaKey || '' };
   const q = String(query || '').trim().slice(0, 200);
   if (!q) return { text: 'The search query was empty.', sources: [] };
+  opts.signal?.throwIfAborted();
   const jobs = [wikipediaSearch(q, o), duckduckgo(q, o)];
   if (o.jinaKey) jobs.unshift(jinaSearch(q, o));
   const settled = await Promise.allSettled(jobs);
+  opts.signal?.throwIfAborted();
   const seen = new Set();
   const sources = [];
   for (const s of settled) {
     if (s.status !== 'fulfilled') continue;
     for (const r of s.value) {
       if (!r.url || seen.has(r.url)) continue;
+      try { r.url = publicUrl(r.url); } catch { continue; }
       seen.add(r.url);
       sources.push(r);
     }
@@ -125,30 +131,51 @@ export async function openUrl(url, opts = {}) {
   const fetchFn = opts.fetchFn || fetch;
   let u;
   try { u = new URL(String(url || '').trim()); } catch { return { text: 'That is not a web address.', sources: [] }; }
+  if (!['https:','http:'].includes(u.protocol)) return { text: 'Only http and https pages can be opened.', sources: [] };
+  try { u = new URL(publicUrl(u.href)); } catch { return { text: 'Private, local and credential-bearing URLs are unavailable.', sources: [] }; }
   if (u.protocol !== 'https:' && u.protocol !== 'http:') return { text: 'Only http and https pages can be opened.', sources: [] };
   const wiki = /^([a-z-]+)\.(m\.)?wikipedia\.org$/.exec(u.hostname);
   try {
     if (wiki && u.pathname.startsWith('/wiki/')) {
       const title = decodeURIComponent(u.pathname.slice(6));
-      const d = await getJson(fetchFn, `https://${wiki[1]}.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&redirects=1&format=json&origin=*&titles=${encodeURIComponent(title)}`);
+      const d = await getJson((url,init) => { const policy=requestOptions(opts); return fetchFn(url,{...policy,...init,signal:policy.signal}); }, `https://${wiki[1]}.wikipedia.org/w/api.php?action=query&prop=extracts&explaintext=1&redirects=1&format=json&origin=*&titles=${encodeURIComponent(title)}`);
       const page = Object.values(d.query?.pages || {})[0];
       if (!page?.extract) return { text: `Wikipedia has no article "${title}".`, sources: [] };
       return { text: page.extract.slice(0, PAGE_CHARS), sources: [{ title: `${page.title} (Wikipedia)`, url: u.href }] };
     }
     const headers = { Accept: 'text/plain' };
     if (opts.jinaKey) headers.Authorization = `Bearer ${opts.jinaKey}`;
-    const res = await fetchFn(`https://r.jina.ai/${u.href}`, { headers });
+    const res = await fetchFn(`https://r.jina.ai/${u.href}`, { ...requestOptions(opts), headers });
     if (!res.ok) return { text: `The page could not be read (HTTP ${res.status}).`, sources: [] };
-    const body = await res.text();
+    const body = await boundedText(res, 65536, true);
     const title = /^Title:\s*(.+)$/m.exec(body)?.[1] || u.hostname;
     return { text: body.slice(0, PAGE_CHARS), sources: [{ title, url: u.href }] };
   } catch {
+    opts.signal?.throwIfAborted();
     return { text: 'The page could not be reached.', sources: [] };
   }
 }
 
 export async function runTool(c, opts = {}) {
+  if (opts.enabled === false) return { text: 'Internet access is off.', sources: [] };
+  opts.signal?.throwIfAborted();
   if (c.name === 'web_search') return webSearch(c.args.query, opts);
   if (c.name === 'open_url') return openUrl(c.args.url, opts);
   return { text: `Unknown tool ${c.name}.`, sources: [] };
+}
+
+// Short-lived, per-worker cache. No persisted keys or private request data.
+export function createWebTools(fetchFn = globalThis.fetch) {
+  const cache = new Map();
+  return async (name, args, opts = {}) => {
+    if (!opts.enabled) throw new Error('Web access is off. Enable Web to use network commands.');
+    opts.signal?.throwIfAborted();
+    const key = JSON.stringify([name,args,opts.jinaKey || '',opts.lang || '']);
+    const old = cache.get(key);
+    if (old && Date.now() - old.time < 60000) return { ...old.result, cached: true };
+    const result = await runTool({name,args},{...opts,fetchFn});
+    opts.signal?.throwIfAborted();
+    if(result.sources.length) { cache.set(key,{time:Date.now(),result}); if(cache.size>32)cache.delete(cache.keys().next().value); }
+    return result;
+  };
 }

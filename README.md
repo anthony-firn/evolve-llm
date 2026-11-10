@@ -13,6 +13,13 @@ GGUF files, single or split. It is tested in Chrome on Linux with NVIDIA and Int
 against reference implementations (see [Verification](#verification)). The largest models in
 the catalog have not been run end to end yet; see [Limits](#limits).
 
+## Browser workspace and Pi
+
+Open **Terminal** for a persistent WASM text workspace with pipes and file redirects. Load a
+tool-capable model, then enter `pi <task>` to run Pi agent core with sandbox file and research
+tools. Web access is explicit; there is no host shell or server inference. See
+[commands, limits, permissions and self-hosting](docs/workbench.md).
+
 ## What it does
 
 - **Downloads a model once.** Choose from the catalog, browse any Hugging Face repository, or

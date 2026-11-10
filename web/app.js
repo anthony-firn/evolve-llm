@@ -4,7 +4,7 @@ import { stripToolCalls } from './tools.js';
 
 const $ = (id) => document.getElementById(id);
 const app = $('app');
-const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+let worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 
 const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', internet: false, jinaKey: '' };
 const SUGGESTIONS = [
@@ -63,6 +63,9 @@ function setPhase(phase) {
   app.dataset.phase = phase;
   const ready = phase === 'ready';
   const generating = phase === 'generating';
+  const agentBusy = phase === 'agent';
+  $('file-input').disabled = agentBusy;
+  $('hf-input').disabled = agentBusy;
   $('prompt').disabled = !(ready || generating);
   $('prompt').placeholder = state.loaded ? `Message ${state.loaded.label}` : 'Choose a model to start';
   $('send').disabled = !ready;
@@ -134,7 +137,7 @@ function catalogEntry(m) {
 const ALL = [...MODELS, ...LARGE];
 
 function renderModels() {
-  const busy = state.phase === 'loading' || state.phase === 'generating' || !state.adapter?.ok;
+  const busy = state.phase === 'loading' || state.phase === 'generating' || state.phase === 'agent' || !state.adapter?.ok;
   const item = (m) => {
     const key = cacheKey(m.repo, m.file);
     const cached = cachedEntry(key);
@@ -213,6 +216,7 @@ function renderStorage() {
 let loadStarted = 0;
 
 async function startLoad(source) {
+  if (state.phase === 'agent') { $('status-line').textContent = 'Stop the Pi task before loading another model.'; return; }
   if (!state.adapter?.ok) return;
   closeDrawer();
   if (state.phase === 'generating') return;
@@ -526,8 +530,15 @@ function onError({ during, message }) {
   $('status-line').textContent = message;
 }
 
-worker.onmessage = (event) => {
+function onWorkerMessage(event) {
   const msg = event.data;
+  if (msg.requestId) {
+    if (!agentRequest || msg.requestId !== agentRequest.id) return;
+    if (msg.type === 'agent_event' && msg.event.type === 'token') agentRequest.onToken?.(msg.event.text);
+    else if (msg.type === 'agent_done') finishAgent(agentRequest.aborted ? new Error('Pi model turn cancelled.') : null, msg);
+    else if (msg.type === 'error') finishAgent(new Error(msg.message));
+    return;
+  }
   switch (msg.type) {
     case 'adapter': showGpu(msg.adapter); break;
     case 'cache': state.cache = msg; renderModels(); break;
@@ -552,7 +563,9 @@ worker.onmessage = (event) => {
     case 'unloaded': break;
   }
 };
-worker.onerror = (e) => {
+function onWorkerError(e) {
+  if (agentRequest) finishAgent(new Error(e.message || 'Model worker failed.'));
+  state.loaded = null; setPhase('idle');
   showGpu({ ok: false, reason: 'no-adapter' });
   $('status-line').textContent = `The engine could not start: ${e.message || 'worker error'}`;
 };
@@ -583,6 +596,7 @@ $('composer').addEventListener('submit', (e) => {
 $('stop').addEventListener('click', () => worker.postMessage({ type: 'stop' }));
 $('web-toggle').addEventListener('click', () => {
   state.settings.internet = !state.settings.internet;
+  networkChanged();
   saveSettings();
   syncWebToggle();
   $('status-line').textContent = state.settings.internet
@@ -679,7 +693,7 @@ form.addEventListener('input', (e) => {
   if (!t.name) return;
   if (t.type === 'checkbox') {
     state.settings[t.name] = t.checked;
-    if (t.name === 'internet') syncWebToggle();
+    if (t.name === 'internet') { syncWebToggle(); networkChanged(); }
   }
   else if (t.type === 'range') {
     state.settings[t.name] = Number(t.value);
@@ -701,9 +715,53 @@ $('reset-settings').addEventListener('click', () => {
   saveSettings();
   fillSettings();
   syncWebToggle();
+  networkChanged();
   worker.postMessage({ type: 'adapter', gpu: state.settings.gpu });
 });
 
 setPhase('starting');
 syncWebToggle();
+
+// ---- Terminal and Pi: a lease on the existing model, not a second GPU copy ----
+let workbench=null, workbenchPromise=null, agentRequest=null, agentSequence=0;
+worker.onmessage=onWorkerMessage;worker.onerror=onWorkerError;
+const terminalButton=el('button',{class:'ghost',type:'button',id:'open-terminal',text:'Terminal',title:'WASM terminal and Pi coding agent'});
+$('open-settings').before(terminalButton);
+function finishAgent(error,value) {
+  const request=agentRequest;if(!request)return;agentRequest=null;clearTimeout(request.timer);clearTimeout(request.cancelTimer);request.signal?.removeEventListener('abort',request.abort);
+  error?request.reject(error):request.resolve(value);
+}
+function restartEngine(reason) {
+  worker.terminate();finishAgent(new Error(reason));state.loaded=null;state.loading=null;
+  worker=new Worker(new URL('./worker.js',import.meta.url),{type:'module'});worker.onmessage=onWorkerMessage;worker.onerror=onWorkerError;
+  setPhase('starting');worker.postMessage({type:'hello',gpu:state.settings.gpu});$('status-line').textContent=reason+' Choose a saved model to reload it.';
+}
+function agentTurn(messages,tools,{signal,onToken}={}) {
+  if(state.phase!=='agent'||agentRequest)return Promise.reject(new Error('The model is busy.'));
+  if(signal?.aborted)return Promise.reject(new Error('Pi model turn cancelled.'));
+  return new Promise((resolve,reject)=>{
+    const id=++agentSequence;
+    const abort=()=>{if(agentRequest?.id!==id)return;agentRequest.aborted=true;worker.postMessage({type:'stop'});agentRequest.cancelTimer=setTimeout(()=>restartEngine('Pi cancellation released an unresponsive worker.'),10000)};
+    agentRequest={id,resolve,reject,onToken,signal,abort,timer:setTimeout(()=>restartEngine('Pi model turn exceeded its two-minute limit.'),120000)};
+    signal?.addEventListener('abort',abort,{once:true});
+    worker.postMessage({type:'agent_turn',requestId:id,messages,tools,maxTokens:Math.min(512,Number(state.settings.maxTokens)),sampler:{temperature:0,top_p:.95,top_k:40,min_p:.05,repeat_penalty:1.1,repeat_last_n:64,seed:1}});
+  });
+}
+function networkChanged() {
+  worker.postMessage({type:'network_policy',enabled:Boolean(state.settings.internet)});workbench?.setNetwork();
+}
+terminalButton.addEventListener('click',async()=>{
+  terminalButton.disabled=true;
+  try {
+    workbenchPromise ||= import('./workbench.mjs').then(({mountWorkbench})=>mountWorkbench({
+      ready:()=>state.phase==='ready'&&Boolean(state.loaded),turn:agentTurn,modelName:()=>state.loaded?.label||'Local model',
+      lease:()=>{if(state.phase!=='ready'||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?'ready':'idle')}}},
+      getNetwork:()=>({enabled:Boolean(state.settings.internet),jinaKey:state.settings.jinaKey||''}),
+      setNetwork:enabled=>{state.settings.internet=enabled;saveSettings();syncWebToggle();networkChanged()},
+    })).catch(error=>{workbenchPromise=null;throw error});
+    workbench=await workbenchPromise;await workbench.open();
+  }catch(error){$('status-line').textContent=String(error.message||error)}
+  finally{terminalButton.disabled=false}
+});
+
 worker.postMessage({ type: 'hello', gpu: state.settings.gpu });

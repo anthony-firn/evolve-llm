@@ -5,7 +5,7 @@ export class EngineError extends Error {
 }
 const fail = (code, message) => new EngineError(code, message);
 
-/** One worker and one in-flight operation per engine. Internet tools stay off. */
+/** One worker and one in-flight operation per engine. Internet tools require explicit per-call opt-in. */
 export function createEngine({ workerURL = new URL('./worker.js', import.meta.url), workerFactory = url => new Worker(url, { type: 'module' }), timeoutMs = 120000 } = {}) {
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 3600000) throw new TypeError('timeoutMs must be 1–3600000');
   let worker = null, operation = null, loaded = false, disposed = false;
@@ -93,16 +93,17 @@ export function createEngine({ workerURL = new URL('./worker.js', import.meta.ur
       const result = await pending.promise;
       loaded = true; return result;
     },
-    generate(messages, { signal, maxTokens = 256, temperature = 0.7, seed = 1, thinking = false } = {}) {
+    generate(messages, { signal, maxTokens = 256, temperature = 0.7, seed = 1, thinking = false, internet = { enabled: false } } = {}) {
       if (disposed) throw fail('disposed', 'This engine has been disposed.');
       if (!loaded) throw fail('not_loaded', 'Load a model before generating.');
       if (!Array.isArray(messages) || !messages.length || !messages.every(m => m && ['system', 'user', 'assistant'].includes(m.role) && typeof m.content === 'string'))
         throw new TypeError('messages must contain system, user or assistant text messages.');
       if (!Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > 32768 || !Number.isFinite(temperature) || temperature < 0 || temperature > 2 || !Number.isInteger(seed) || seed < 0 || seed > 0xffffffff)
         throw new TypeError('Invalid token, temperature or seed setting.');
+      if (typeof internet?.enabled !== 'boolean' || (internet.jinaKey !== undefined && (typeof internet.jinaKey !== 'string' || internet.jinaKey.length > 512 || /[\r\n]/.test(internet.jinaKey)))) throw new TypeError('Invalid internet options.');
       return start({ type: 'generate', messages, options: { enable_thinking: thinking }, maxTokens,
-        sampler: { temperature, seed, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, repeat_last_n: 64 }, internet: { enabled: false } }, 'done',
-        { signal, stream: true, events: ['token', 'prefill', 'done'] });
+        sampler: { temperature, seed, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, repeat_last_n: 64 }, internet: { enabled: internet.enabled, ...(internet.jinaKey && {jinaKey:internet.jinaKey}) } }, 'done',
+        { signal, stream: true, events: ['token', 'prefill', 'done', 'tool', 'tool-result', 'round'] });
     },
     reset() {
       if (disposed) throw fail('disposed', 'This engine has been disposed.');
