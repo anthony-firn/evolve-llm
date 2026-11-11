@@ -99,6 +99,8 @@ runtime smoke check. `demo snake` copies the bundled Snake example to snake-exam
 opens it, with no model needed. This is a labeled example, not generated model output.
 Use arrow keys or its on-screen controls; Reload, Test, Full size and Show/hide log stay available.
 Pi automatically opens and checks the last HTML file it successfully writes or edits.
+The preview tool is the final action: a successful preview ends the task without another model
+turn. Use browser_test for intermediate checks and repairs, then preview when finished.
 
 Try `pi Make snake-example.html use a blue background, then browser_test it and preview it`.
 The Pi tokens selector defaults to 2,048 output tokens, with options for 1,024 or 4,096; the

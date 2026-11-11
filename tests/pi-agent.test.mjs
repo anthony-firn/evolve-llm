@@ -93,3 +93,20 @@ test('a JSON-only batch reads, edits, and checks the actual file sequentially',a
  const result=await task.run('Make the background blue');
  assert.deepEqual(operations,['read','edit','browser_test']);assert.equal(result.changes,1);assert.equal(result.errors,0);
 });
+
+test('a successful final preview stops inference and calls after preview are not executed',async()=>{
+ let generated=0,opened=0;
+ const task=createPiTask({workspace:{request:async()=>{throw Error('Must not write after preview')}},network:{options:()=>({enabled:false})},preview:async()=>{opened++;return{ok:true}},turn:async()=>{
+  generated++;assert.equal(generated,1,'Must not ask the model for another turn after preview');
+  return {text:[{name:'preview',arguments:{path:'/workspace/game.html'}},{name:'write',arguments:{path:'/workspace/game.html',text:'damaged'}}].map(call=>'<tool_call>'+JSON.stringify(call)+'</tool_call>').join('\n'),reason:'end'};
+ }});
+ const result=await task.run('Preview the game');assert.equal(opened,1);assert.equal(result.turns,1);assert.equal(result.calls,1);
+});
+
+test('a failed preview allows the model to continue repairing the app',async()=>{
+ let n=0,opened=0;
+ const task=createPiTask({workspace:{},network:{options:()=>({enabled:false})},preview:async()=>({ok:++opened===2}),turn:async()=>{
+  n++;return{text:'<tool_call>{"name":"preview","arguments":{"path":"/workspace/game.html"}}</tool_call>',reason:'end'};
+ }});
+ const result=await task.run('Preview the game');assert.equal(n,2);assert.equal(result.errors,1);assert.equal(result.lastToolFailed,false);
+});

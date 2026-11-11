@@ -41,14 +41,14 @@ def check(runtime):
     page.evaluate(r'''async()=>{
       const {mountWorkbench}=await import('./workbench.mjs');const html=await(await fetch('./examples/snake.html')).text();let round=0;
       const workbench=await mountWorkbench({ready:()=>true,lease:()=>()=>{},getNetwork:()=>({enabled:false}),setNetwork:()=>{},modelName:()=> 'Scripted transport fixture',turn:async()=>{
-        round++;return {text:round===1?'<tool_call>'+JSON.stringify({name:'write',arguments:{path:'/workspace/fixture-game.html',text:html}})+'</tool_call>':round===2?'<tool_call>'+JSON.stringify({name:'browser_test',arguments:{path:'/workspace/fixture-game.html'}})+'</tool_call>':'The runtime check passed.',reason:'end'};
+        round++;if(round>3)throw new Error('Model called after final preview');return {text:round===1?'<tool_call>'+JSON.stringify({name:'write',arguments:{path:'/workspace/fixture-game.html',text:html}})+'</tool_call>':round===2?'<tool_call>'+JSON.stringify({name:'browser_test',arguments:{path:'/workspace/fixture-game.html'}})+'</tool_call>':'<tool_call>'+JSON.stringify({name:'preview',arguments:{path:'/workspace/fixture-game.html'}})+'</tool_call>',reason:'end'};
       }});await workbench.open();
     }''')
     page.locator('#terminal-input').fill('pi Create and test a game');page.locator('.terminal-form button[type=submit]').click()
     page.wait_for_function("() => !document.querySelector('.terminal-form button[type=submit]').disabled",timeout=30000)
-    assert '2 tool calls' in page.locator('.terminal-log').text_content(),page.locator('.terminal-log').text_content()
+    assert '3 tool calls' in page.locator('.terminal-log').text_content(),page.locator('.terminal-log').text_content()
     assert page.frame_locator('.preview-host iframe').locator('canvas').is_visible()
-    print(kind.name+': Pi write → browser_test → auto-play integration passed.',flush=True)
+    print(kind.name+': Pi write → browser_test → final preview integration passed.',flush=True)
     browser.close()
  finally:server.shutdown();server.server_close()
 if __name__=='__main__':
