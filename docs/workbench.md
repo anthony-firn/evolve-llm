@@ -36,7 +36,7 @@ pi Read README.txt and write a short summary to summary.txt
 This integrates the real MIT-licensed **Pi agent core 1.5.1** from pi-mono, with a custom transport
 to the existing Rust/WASM/WebGPU model. It reuses the loaded weights. The Pi bundle and shell
 kernel load on demand when opening Terminal, with no second model or provider account.
-Pi gets sequential `bash`, `read`, `write`, `edit`, `web_search`, and `open_url` tools.
+Pi gets sequential `bash`, `read`, `write`, `edit`, `web_search`, `open_url`, `preview`, and `browser_test` tools.
 The UI displays tool arguments, actual results, and completion counts. Each task allows 6 model
 turns, 12 tools, 3 tools per model response, and 3 minutes total; tool output sent to the model is
 bounded. Stop cancels inference and outstanding reads. If inference will not stop, its worker is
@@ -67,7 +67,7 @@ memory for 60 seconds (32 entries). Pages and search results are untrusted input
 Never put passwords or private tokens in a query or public URL.
 
 The SDK also supports explicit `internet: { enabled: true }` in `generate()`; the default is off.
-To self-host the complete app, unzip browser runtime 0.3.1 and serve its directory over localhost
+To self-host the complete app, unzip browser runtime 0.4.0 and serve its directory over localhost
 or HTTPS, then open its root. No server-side execution is required.
 
 ## Build and check
@@ -88,3 +88,32 @@ CSP, the actual compiled shell and actual Pi core with a scripted model transpor
 not download weights. A local Chrome/Qwen3 0.6B GPU smoke test separately verified a two-tool
 write/read loop; this is functional evidence, not a model accuracy benchmark.
 Pi's upstream license is preserved in `vendor/PI-LICENSE.txt` and distributed beside the bundle.
+
+## Run and inspect HTML apps
+
+Enter `preview snake.html` to run a saved single-file HTML app, or `test snake.html` for a
+runtime smoke check. `demo snake` copies the bundled Snake example to snake-example.html and
+opens it, with no model needed. This is a labeled example, not generated model output.
+Use arrow keys or its on-screen controls; Reload, Test, Full size and Show/hide log stay available.
+Pi automatically opens and checks the last HTML file it successfully writes or edits.
+
+Try `pi Make snake-example.html use a blue background, then browser_test it and preview it`.
+The Pi tokens selector defaults to 2,048 output tokens, with options for 1,024 or 4,096; the
+loaded model context must also have room for the prompt and response. A compact game or
+small edits work better than generating a large app in one call. Truncated or invalid tool
+calls now report failure, rather than a successful completion. They never execute partially.
+
+The preview runs inline HTML/CSS/JavaScript in an opaque-origin iframe, with no same-origin
+permission, host execution, workspace API, storage, external assets, network requests, forms,
+popups or top navigation. Web access in the assistant does not grant network to preview apps.
+No npm, server programs or multi-file asset resolution is provided. Stop preview removes the
+frame. The runtime check waits about one second, collects exceptions, rejected promises,
+console errors and CSP violations, checks canvas dimensions/paint, dispatches two arrow keys
+and clicks a Restart button if present. Later script errors appear in the log. These checks
+and their in-frame reports are limited smoke evidence, not proof of scoring or collision logic.
+The frame executes DOM JavaScript through the browser; the shell and model use WASM.
+
+The app's own CSP stays strict. Only preview/ permits inline scripts, with HTTP sandbox
+allow-scripts and no connect or frame sources. The bundled preview also sets a restrictive
+meta CSP for localhost hosting; preserve the iframe sandbox attribute. Production host
+headers are in evolvetech.dev/public/_headers and mirrored by its Bunny deployment.

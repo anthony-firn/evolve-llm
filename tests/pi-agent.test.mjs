@@ -29,5 +29,17 @@ test('truncated tool calls are not executed and malformed arguments do not cross
  const task=createPiTask({workspace:{request:async()=>{executed++;return{ok:true}}},network:{options:()=>({enabled:false})},turn:async()=>{
   n++;return n===1?{text:'<tool_call>{"name":"write","arguments":{"path":"/workspace/a","text":"x"}}</tool_call>',reason:'length',n:1}:{text:'Stopped at the output limit.',reason:'end',n:1};
  }});
- await task.run('Write');assert.equal(executed,0);
+ await assert.rejects(task.run('Write'),/output\/context limit/);assert.equal(executed,0);
+});
+
+test('invalid tool JSON cannot be reported as successful execution',async()=>{
+ const task=createPiTask({workspace:{request:async()=>{throw Error('Must not execute')}},network:{options:()=>({enabled:false})},turn:async()=>({text:'<tool_call>{{"name":"write","arguments":{}}</tool_call>',reason:'end'})});
+ await assert.rejects(task.run('Create a file'),/invalid or incomplete/);
+});
+test('Pi can smoke-test and preview HTML and passes the selected output budget',async()=>{
+ let n=0;const calls=[];
+ const task=createPiTask({maxTokens:4096,workspace:{request:async()=>({ok:true})},network:{options:()=>({enabled:false})},preview:async(path,opts)=>{calls.push([path,opts.smoke]);return{ok:true,errors:[]}},turn:async(_,schemas,opts)=>{
+ assert.equal(opts.maxTokens,4096);assert(schemas.some(x=>x.function.name==='browser_test'));n++;
+ return {text:n===1?'<tool_call>{"name":"browser_test","arguments":{"path":"/workspace/game.html"}}</tool_call>':n===2?'<tool_call>{"name":"preview","arguments":{"path":"/workspace/game.html"}}</tool_call>':'Opened.',reason:'end'};
+ }});const completed=await task.run('Test and play');assert.equal(completed.messages.find(m=>m.role==='toolResult').isError,false);assert.deepEqual(calls,[['/workspace/game.html',true],['/workspace/game.html',false]]);
 });

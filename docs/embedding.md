@@ -11,7 +11,7 @@ Serve the files from the **same origin** as your application: browsers reject a 
 Worker even when an imported JavaScript module itself is accessible.
 
 ```sh
-unzip evolve-llm-browser-0.3.1.zip -d evolve-llm
+unzip evolve-llm-browser-0.4.0.zip -d evolve-llm
 python3 -m http.server 8080 --directory evolve-llm
 # Open http://localhost:8080/examples/
 ```

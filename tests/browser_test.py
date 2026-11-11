@@ -25,7 +25,8 @@ from playwright.sync_api import sync_playwright
 ROOT = Path(__file__).resolve().parents[1]
 CSP = ("default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; "
        "img-src 'self' data:; font-src 'self'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co https://*.wikipedia.org https://api.duckduckgo.com https://r.jina.ai https://s.jina.ai; "
-       "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+       "frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+PREVIEW_CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts"
 FLAGS = ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-angle=vulkan", "--ignore-gpu-blocklist"]
 
 
@@ -40,7 +41,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return str(Path(self.directory) / "__missing__")
 
     def end_headers(self):
-        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Content-Security-Policy", PREVIEW_CSP if "/preview/" in self.path else CSP)
+        self.send_header("X-Frame-Options", "SAMEORIGIN" if "/preview/" in self.path else "DENY")
         self.send_header("X-Content-Type-Options", "nosniff")
         super().end_headers()
 

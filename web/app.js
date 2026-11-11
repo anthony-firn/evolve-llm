@@ -736,7 +736,7 @@ function restartEngine(reason) {
   worker=new Worker(new URL('./worker.js',import.meta.url),{type:'module'});worker.onmessage=onWorkerMessage;worker.onerror=onWorkerError;
   setPhase('starting');worker.postMessage({type:'hello',gpu:state.settings.gpu});$('status-line').textContent=reason+' Choose a saved model to reload it.';
 }
-function agentTurn(messages,tools,{signal,onToken}={}) {
+function agentTurn(messages,tools,{signal,onToken,maxTokens=2048}={}) {
   if(state.phase!=='agent'||agentRequest)return Promise.reject(new Error('The model is busy.'));
   if(signal?.aborted)return Promise.reject(new Error('Pi model turn cancelled.'));
   return new Promise((resolve,reject)=>{
@@ -744,7 +744,7 @@ function agentTurn(messages,tools,{signal,onToken}={}) {
     const abort=()=>{if(agentRequest?.id!==id)return;agentRequest.aborted=true;worker.postMessage({type:'stop'});agentRequest.cancelTimer=setTimeout(()=>restartEngine('Pi cancellation released an unresponsive worker.'),10000)};
     agentRequest={id,resolve,reject,onToken,signal,abort,timer:setTimeout(()=>restartEngine('Pi model turn exceeded its two-minute limit.'),120000)};
     signal?.addEventListener('abort',abort,{once:true});
-    worker.postMessage({type:'agent_turn',requestId:id,messages,tools,maxTokens:Math.min(512,Number(state.settings.maxTokens)),sampler:{temperature:0,top_p:.95,top_k:40,min_p:.05,repeat_penalty:1.1,repeat_last_n:64,seed:1}});
+    worker.postMessage({type:'agent_turn',requestId:id,messages,tools,maxTokens:Math.max(64,Math.min(4096,Number(maxTokens)||2048)),sampler:{temperature:0,top_p:.95,top_k:40,min_p:.05,repeat_penalty:1.1,repeat_last_n:64,seed:1}});
   });
 }
 function networkChanged() {

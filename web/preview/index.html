@@ -1,0 +1,51 @@
+<!doctype html><meta charset="utf-8"><title>Isolated app preview</title><meta name="description" content="An isolated browser preview for local workspace apps."><meta name="robots" content="noindex"><link rel="canonical" href="https://www.evolvetech.dev/play/evolve-llm/preview/">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<h1>App preview</h1><p>Waiting for a workspace HTML file.</p>
+<script>
+// This route has its own restrictive response CSP and an opaque sandbox origin.
+// Its only input is the selected workspace HTML, never credentials or parent DOM access.
+function harness(id, smoke) {
+  const errors = [], violations = []; let frames = 0, reported = false;
+  const describe = value => String(value?.message || value).slice(0, 1000);
+  const add = value => { if (errors.length >= 12) return; const message=describe(value);errors.push(message);if(reported)parent.postMessage({type:'evolve-preview-error',id,message},'*'); };
+  addEventListener('error', e => add(e.message || 'Script/resource error'), true);
+  addEventListener('unhandledrejection', e => add(e.reason));
+  addEventListener('securitypolicyviolation', e => { if (violations.length < 12) violations.push(e.violatedDirective); });
+  const original = console.error; console.error = (...args) => { add(args.map(describe).join(' ')); original.apply(console, args); };
+  function tick() { frames++; if (frames < 120) requestAnimationFrame(tick); } requestAnimationFrame(tick);
+  addEventListener('load', () => {
+    let keysDispatched = 0, restartClicked = false;
+    setTimeout(() => {
+      if (!smoke) return;
+      for (const key of ['ArrowRight', 'ArrowDown']) {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key, code: key, bubbles: true }));
+        document.dispatchEvent(new KeyboardEvent('keyup', { key, code: key, bubbles: true })); keysDispatched++;
+      }
+      const restart = [...document.querySelectorAll('button')].find(b => /restart|play again/i.test(b.textContent));
+      if (restart) { restart.click(); restartClicked = true; }
+    }, 250);
+    setTimeout(() => {
+      const canvases = [...document.querySelectorAll('canvas')].slice(0, 8).map(c => {
+        let painted = null;
+        try { painted = c.getContext('2d').getImageData(0, 0, c.width, c.height).data.some((v, i) => i % 4 === 3 && v > 0); } catch {}
+        return { width: c.width, height: c.height, painted };
+      });
+      reported=true;
+      parent.postMessage({ type: 'evolve-preview-result', id, result: {
+        ok: errors.length === 0 && violations.length === 0, errors, violations, title: document.title.slice(0, 200),
+        canvases, buttons: [...document.querySelectorAll('button')].slice(0, 10).map(b => b.textContent.slice(0, 80)),
+        animationFrames: frames, keysDispatched, restartClicked,
+        scope: 'Runtime smoke check; synthetic input and canvas presence do not prove game correctness.'
+      } }, '*');
+    }, 1000);
+  }, { once: true });
+}
+addEventListener('message', event => {
+  const data = event.data;
+  if (event.source !== parent || data?.type !== 'evolve-preview-load' || typeof data.html !== 'string' || data.html.length > 524288 || !/^[a-zA-Z0-9-]{1,80}$/.test(data.id)) return;
+  const bootstrap = '(' + harness.toString() + ')(' + JSON.stringify(data.id) + ',' + Boolean(data.smoke) + ');';
+  const policy = document.querySelector('meta[http-equiv]').outerHTML;
+  document.open(); document.write('<!doctype html>' + policy + '<script>' + bootstrap + '</scr' + 'ipt>' + data.html); document.close();
+}, { once: true });
+parent.postMessage({ type: 'evolve-preview-ready' }, '*');
+</script>
