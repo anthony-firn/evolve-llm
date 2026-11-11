@@ -110,3 +110,16 @@ test('a failed preview allows the model to continue repairing the app',async()=>
  }});
  const result=await task.run('Preview the game');assert.equal(n,2);assert.equal(result.errors,1);assert.equal(result.lastToolFailed,false);
 });
+
+test('a failed edit must be corrected before final preview can finish the task',async()=>{
+ let n=0,opened=0;
+ const task=createPiTask({workspace:{request:async(name)=>name==='read'?{text:'red'}:{ok:true}},network:{options:()=>({enabled:false})},preview:async()=>{opened++;return{ok:true}},turn:async()=>{
+  n++;
+  const calls=n===1?[{name:'edit',arguments:{path:'/workspace/game.html',oldText:'red',newText:'blue'}},{name:'preview',arguments:{path:'/workspace/game.html'}}]:[
+   {name:'read',arguments:{path:'/workspace/game.html'}},{name:'edit',arguments:{path:'/workspace/game.html',oldText:'red',newText:'blue'}},{name:'preview',arguments:{path:'/workspace/game.html'}}
+  ];
+  assert(n<=2,'Model should stop after corrected final preview');
+  return{text:calls.map(call=>'<tool_call>'+JSON.stringify(call)+'</tool_call>').join('\n'),reason:'end'};
+ }});
+ const result=await task.run('Edit and preview');assert.equal(n,2);assert.equal(opened,1);assert.equal(result.changes,1);assert.equal(result.errors,2);
+});

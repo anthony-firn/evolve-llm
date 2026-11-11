@@ -11,7 +11,7 @@ const usage = (output,input=0) => ({input,output,cacheRead:0,cacheWrite:0,totalT
 const fields = properties => ({type:'object',properties,required:Object.keys(properties),additionalProperties:false});
 const string = (description,maxLength=16384) => ({type:'string',description,maxLength});
 export function createPiTask({ turn, workspace, network, onEvent = () => {}, modelName = 'Local model', preview, maxTokens = 2048 }) {
-  let turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, previewPath=null;const readFiles=new Map();
+  let turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, pendingChangeError=false, previewPath=null;const readFiles=new Map();
   const declarations=[
     ['bash','Run a supported shell command inside /workspace. No host processes. Run help for the supported subset.',fields({command:string('Command, with optional pipes and file redirects')})],
     ['read','Read a UTF-8 file in the sandbox.',fields({path:string('Workspace file path')})],
@@ -32,7 +32,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       result=await workspace.request(name,args,{signal});if(name==='read')readFiles.set(args.path,result.text);else readFiles.delete(args.path);
       if(['write','edit'].includes(name)){changes++;if(/\.html?$/i.test(args.path))previewPath=args.path;}
     }
-    else if(['preview','browser_test'].includes(name)){if(!preview)throw new Error('Preview is unavailable.');result=await preview(args.path,{signal,smoke:name==='browser_test'});if(name==='preview'&&result.ok===true)completedPreview=true;}
+    else if(['preview','browser_test'].includes(name)){if(!preview)throw new Error('Preview is unavailable.');if(name==='preview'&&pendingChangeError)throw new Error('A file change failed. Read the file and correct the failed write or edit before final preview.');result=await preview(args.path,{signal,smoke:name==='browser_test'});if(name==='preview'&&result.ok===true)completedPreview=true;}
     else result=await network.run(name,args,signal);
     const body=(name==='read'?`File: ${args.path}\n${result.text}`:JSON.stringify(result)).slice(0,LIMITS.result);
     return {content:[{type:'text',text:body}],details:{sandbox:true},isError:result.ok===false||Boolean(result.code)||(['web_search','open_url'].includes(name)&&!result.sources?.length)};
@@ -77,7 +77,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
   });
   agent.subscribe(event=>{
     if(event.type==='tool_execution_start')onEvent({type:'tool',name:event.toolName,args:event.args});
-    if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
+    if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
   return {async run(prompt){await agent.prompt(prompt);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
