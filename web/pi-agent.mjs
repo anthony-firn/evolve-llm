@@ -55,7 +55,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
             result=await turn(messages,schemas,{signal:options?.signal,maxTokens,onToken:delta=>onEvent({type:'token',text:delta})});
             options?.signal?.throwIfAborted();
             if(result.reason==='length')throw new Error('Pi reply reached its output/context limit. No tools from this incomplete reply were executed. Increase Pi output tokens and the model context in Settings, or ask for a smaller file.');
-            parsed=parseToolCalls(result.text,names).slice(0,1);
+            parsed=parseToolCalls(result.text,names).slice(0,3);
             const attempted=/<tool_call>|"name"\s*:/.test(result.text);
             const failure=attempted&&!parsed.length?'invalid or incomplete tool call':null;
             if(!failure)break;

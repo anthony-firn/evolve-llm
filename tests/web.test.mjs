@@ -87,6 +87,12 @@ test('reads tool calls in the forms models write them', () => {
   assert.deepEqual(parseToolCalls('<|python_tag|>{"name": "web_search", "parameters": {"query": "x"}}'), [{ name: 'web_search', args: { query: 'x' } }]);
   assert.deepEqual(parseToolCalls('<tool_call>{"name": "rm_rf", "arguments": {}}</tool_call>'), []);
   assert.deepEqual(parseToolCalls('The answer is {"name": "web_search"} in prose.'), []);
+  const fenced = '```json\n{"name":"web_search","arguments":{"query":"x"}}\n```';
+  assert.deepEqual(parseToolCalls(fenced), [{name:'web_search',args:{query:'x'}}]);
+  assert.deepEqual(parseToolCalls('For example:\n' + fenced), []);
+  assert.deepEqual(parseToolCalls(fenced + '\n' + fenced), [{name:'web_search',args:{query:'x'}},{name:'web_search',args:{query:'x'}}]);
+  assert.deepEqual(parseToolCalls(fenced + '\n```json\n{"name":"web_search"\n```'), []);
+  assert.deepEqual(parseToolCalls('```json\n{"name":"web_search","arguments":{\n```'), []);
   assert.equal(stripToolCalls('Sure.<tool_call>{"name": "web_search", "arguments": {"query": "a"}}</tool_call>'), 'Sure.');
   assert.equal(stripToolCalls('Thinking <tool_call>{"name": "web'), 'Thinking ');
   assert.equal(stripToolCalls('{"name": "web_search", "parameters": {"query": "a"}}'), '');

@@ -38,7 +38,7 @@ to the existing Rust/WASM/WebGPU model. It reuses the loaded weights. The Pi bun
 kernel load on demand when opening Terminal, with no second model or provider account.
 Pi gets sequential `bash`, `read`, `write`, `edit`, `web_search`, `open_url`, `preview`, and `browser_test` tools.
 The UI displays tool arguments, actual results, and completion counts. Each task allows 10 model
-turns, 12 tool calls, one tool per model response, and 3 minutes total; tool output sent to the model is
+turns, 12 tool calls, up to 3 tools per model response, and 3 minutes total; tool output sent to the model is
 bounded. Up to two format retries count toward the turn limit. Invalid or truncated calls never
 execute; failed tool calls are shown alongside the actual file-change count. Edits require a prior
 read and a nonempty exact substring from that read. Network tools are offered only with Web on.
@@ -106,7 +106,8 @@ loaded model context must also have room for the prompt and response. A compact 
 small edits work better than generating a large app in one call. Truncated or invalid tool
 calls report failure and never execute partially. For models with a broken double-braced JSON
 example in their GGUF tool template, Pi supplies valid tool instructions through the ordinary
-chat template. Qwen2.5 0.5B can still invent edits or ignore feedback; use a coding model and
+chat template. Complete JSON-only Markdown blocks are also accepted; prose examples and
+incomplete JSON are rejected. Qwen2.5 0.5B can still invent edits or ignore feedback; use a coding model and
 inspect the file-change count before trusting a completion claim.
 
 The preview runs inline HTML/CSS/JavaScript in an opaque-origin iframe, with no same-origin

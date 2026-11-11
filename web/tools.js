@@ -29,7 +29,7 @@ function parseJson(text) {
 
 /**
  * Tool calls in a model's reply: Qwen/Hermes `<tool_call>{json}</tool_call>` blocks, or a reply
- * that is one JSON call object as Llama 3 writes it (optionally after `<|python_tag|>`).
+ * that is one JSON call object (bare, fenced, or after `<|python_tag|>`).
  */
 export function parseToolCalls(text, allowed = NAMES) {
   const calls = [];
@@ -39,6 +39,14 @@ export function parseToolCalls(text, allowed = NAMES) {
   }
   if (calls.length) return calls;
   const bare = String(text).replace(/^\s*<\|python_tag\|>/, '').trim();
+  // A reply consisting entirely of complete JSON blocks is another call
+  // envelope. Prose, truncated blocks, and invalid calls reject the whole reply.
+  const fencePattern = /```(?:json)?\s*\n([\s\S]*?)\n```/g;
+  const fenced = [...bare.matchAll(fencePattern)];
+  if (fenced.length && !bare.replace(fencePattern, '').trim()) {
+    const parsed = fenced.map(m => call(parseJson(m[1]), allowed));
+    return parsed.every(Boolean) ? parsed : [];
+  }
   if (bare.startsWith('{') && bare.endsWith('}')) {
     const c = call(parseJson(bare), allowed);
     if (c) calls.push(c);

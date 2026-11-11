@@ -70,3 +70,26 @@ test('a failed tool followed by a confident answer still reports zero changes an
  const result=await task.run('Change the game');
  assert.equal(result.changes,0);assert.equal(result.errors,1);assert.equal(result.lastToolFailed,true);assert.equal(result.previewPath,null);
 });
+
+test('a complete fenced JSON call executes without a format retry',async()=>{
+ let n=0;
+ const task=createPiTask({workspace:{request:async()=>({text:'Actual file'})},network:{options:()=>({enabled:false})},turn:async()=>({
+  text:++n===1?'```json\n{"name":"read","arguments":{"path":"/workspace/a.txt"}}\n```':'Read the file.',reason:'end'
+ })});
+ const result=await task.run('Read a.txt');assert.equal(result.calls,1);assert.equal(result.repairs,0);
+});
+
+test('a JSON-only batch reads, edits, and checks the actual file sequentially',async()=>{
+ let n=0,source='background:red';const operations=[];
+ const task=createPiTask({workspace:{request:async(name,args)=>{
+  operations.push(name);
+  if(name==='read')return {text:source};
+  assert.equal(name,'edit');assert.equal(args.oldText,source);source=args.newText;return {ok:true};
+ }},network:{options:()=>({enabled:false})},preview:async()=>{operations.push('browser_test');assert.equal(source,'background:blue');return{ok:true}},turn:async()=>({text:++n===1?[
+  {name:'read',arguments:{path:'/workspace/game.html'}},
+  {name:'edit',arguments:{path:'/workspace/game.html',oldText:'background:red',newText:'background:blue'}},
+  {name:'browser_test',arguments:{path:'/workspace/game.html'}},
+ ].map(call=>'```json\n'+JSON.stringify(call)+'\n```').join('\n'):'Checked.',reason:'end'})});
+ const result=await task.run('Make the background blue');
+ assert.deepEqual(operations,['read','edit','browser_test']);assert.equal(result.changes,1);assert.equal(result.errors,0);
+});
