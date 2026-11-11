@@ -1,6 +1,7 @@
 // Runs the WebAssembly engine off the main thread: downloads, GPU upload and generation.
 import init, { create_loader, inspect, inspect_parts } from './pkg/evolve_llm.js';
 import { formatBytes } from './models.js';
+import { openModelReaders, storageError } from './model-readers.mjs';
 import { TOOL_SCHEMAS, parseToolCalls, runTool, webSearch } from './tools.js';
 
 const CHUNK = 16 << 20; // bytes read from the file per upload call
@@ -209,41 +210,7 @@ async function download(entry) {
 // ---- Reading model files ----
 
 // A synchronous random-access reader: an OPFS access handle for stored models, or
-// FileReaderSync for files opened from the device. Both fill a view of WebAssembly memory.
-async function openReaders(source) {
-  const out = [];
-  if (source.names) {
-    const dir = await modelsDir();
-    for (const name of source.names) {
-      const handle = await dir.getFileHandle(name);
-      let access;
-      try { access = await handle.createSyncAccessHandle({ mode: 'read-only' }); } catch { access = await handle.createSyncAccessHandle(); }
-      out.push({
-        size: access.getSize(),
-        read(offset, target) {
-          const n = access.read(target, { at: offset });
-          if (n !== target.length) throw new Error('The stored model is shorter than its header says.');
-        },
-        close() { access.close(); },
-      });
-    }
-  } else {
-    const sync = new FileReaderSync();
-    for (const file of source.files) {
-      out.push({
-        size: file.size,
-        read(offset, target) {
-          const buf = sync.readAsArrayBuffer(file.slice(offset, offset + target.length));
-          if (buf.byteLength !== target.length) throw new Error('The file is shorter than its header says. It may be incomplete.');
-          target.set(new Uint8Array(buf));
-        },
-        close() {},
-      });
-    }
-  }
-  return out;
-}
-
+// FileReaderSync slices when locks cannot be shared. Both fill WebAssembly memory.
 function closeReaders() {
   for (const r of readers) {
     try { r.close(); } catch { /* already closed */ }
@@ -275,7 +242,7 @@ function readHeader(reader) {
 }
 
 async function loadModel(source, wantCtx, lowPower, budgetPref) {
-  readers = await openReaders(source);
+  readers = await openModelReaders(source, modelsDir);
   const first = readHeader(readers[0]);
   if (first.result.error) throw new Error(first.result.error);
   const headers = [first.bytes];
@@ -540,7 +507,8 @@ self.onmessage = async (event) => {
   try {
     await handler(msg);
   } catch (e) {
-    const message = String(e?.message || e);
+    if (msg.type === 'load') unload();
+    const message = storageError(e);
     post('error', { during: msg.type, message, ...(msg.requestId && { requestId:msg.requestId }) });
   }
 };

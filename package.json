@@ -1,6 +1,6 @@
 {
   "name": "evolve-llm",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Run GGUF language models on your GPU from a web page with a Rust WebGPU engine compiled to WebAssembly.",
   "license": "Apache-2.0",

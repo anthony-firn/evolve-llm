@@ -22,7 +22,8 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install playwright==1.56.0
-      - run: python -m playwright install --with-deps chromium
+      - run: python -m playwright install --with-deps chromium firefox
+      - run: python tests/model_readers_browser_test.py
       - run: cargo test --locked --manifest-path sandbox/Cargo.toml
       - run: node tools/build_workbench.mjs
       - run: python tests/workbench_browser_test.py --runtime web

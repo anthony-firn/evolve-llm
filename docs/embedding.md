@@ -11,7 +11,7 @@ Serve the files from the **same origin** as your application: browsers reject a 
 Worker even when an imported JavaScript module itself is accessible.
 
 ```sh
-unzip evolve-llm-browser-0.3.0.zip -d evolve-llm
+unzip evolve-llm-browser-0.3.1.zip -d evolve-llm
 python3 -m http.server 8080 --directory evolve-llm
 # Open http://localhost:8080/examples/
 ```
@@ -91,3 +91,8 @@ checks the actual module Worker and async-iterator path without claiming to test
 
 The download also includes the complete chat app and browser Pi/WASM terminal. Open its root
 for the workbench or `examples/` for the SDK demo. See the included `WORKBENCH.md`.
+
+Saved models prefer read-only OPFS access. If another tab holds the file lock, a bounded
+FileReaderSync fallback reads the saved file without requesting write access. Failed loads
+close acquired readers. If a download needs exclusive storage, close the other tab and retry;
+do not delete saved weights as a first step.

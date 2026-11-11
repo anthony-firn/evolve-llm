@@ -67,7 +67,7 @@ memory for 60 seconds (32 entries). Pages and search results are untrusted input
 Never put passwords or private tokens in a query or public URL.
 
 The SDK also supports explicit `internet: { enabled: true }` in `generate()`; the default is off.
-To self-host the complete app, unzip browser runtime 0.3.0 and serve its directory over localhost
+To self-host the complete app, unzip browser runtime 0.3.1 and serve its directory over localhost
 or HTTPS, then open its root. No server-side execution is required.
 
 ## Build and check
