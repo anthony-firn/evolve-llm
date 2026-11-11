@@ -27,7 +27,10 @@ export function developmentSummary(result, check) {
   else if (check) lines.push('The app did not pass its runtime check. See the activity details.');
   if (result.error) lines.push(`Pi could not finish all of the work: ${result.error}`);
   else if (result.errors) lines.push(`${result.errors} tool error${result.errors === 1 ? '' : 's'} occurred. Review the saved result.`);
-  else if (!files.length && !result.removed?.length && !check) lines.push('Pi did not produce an artifact. Try a smaller task or a stronger coding model.');
+  else if (!files.length && !result.removed?.length && !check){
+    if(result.answer&&result.calls)lines.push('Pi’s response:\n\n'+result.answer);
+    else lines.push('Pi did not produce an artifact. Try a smaller task or a stronger coding model.');
+  }
   return lines.join('\n\n');
 }
 
@@ -69,7 +72,7 @@ export function createDevelopmentView({ openWorkspace }) {
   function event(e) {
     if(e.type==='starter')add('Created '+e.path.replace('/workspace/','')+' from the Snake starter');
     else if(e.type==='tool')add('Pi · '+e.name+(e.args?.path?' · '+e.args.path.replace('/workspace/',''):''),JSON.stringify(e.args,null,2));
-    else if(e.type==='tool-result'&&e.isError)add(e.name+' failed',JSON.stringify(e.result,null,2),true);
+    else if(e.type==='tool-result')add(e.name+(e.isError?' failed':' completed'),JSON.stringify(e.result,null,2),Boolean(e.isError));
     else if(e.type==='retry')add('Retrying the tool call',e.message);
     else if(e.type==='recovery')add(e.message,null,true);
   }

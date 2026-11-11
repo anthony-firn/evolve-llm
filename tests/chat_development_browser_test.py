@@ -51,6 +51,9 @@ def check(runtime):
     message.get_by_role('button',name='Play',exact=True).click()
     message.frame_locator('iframe').locator('canvas').wait_for()
     message.get_by_role('button',name='Exit full size',exact=True).click()
+    message=send('Read README.txt and summarize it')
+    assert 'Scripted summary of the saved workspace README.' in message.inner_text(),message.inner_text()
+    assert 'did not produce an artifact' not in message.inner_text()
     message=send('Explain how the code works')
     assert 'scripted chat answer' in message.inner_text()
     assert message.locator('.chat-development').count()==0

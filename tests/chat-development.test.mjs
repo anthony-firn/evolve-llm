@@ -25,6 +25,7 @@ test('development summaries describe actual artifacts and preserve partial failu
  const summary=developmentSummary({artifacts:[{path:'/workspace/snake.html'}],starterPath:'/workspace/snake.html',error:'Reply was truncated',errors:0},{ok:true});
  assert.match(summary,/included Snake starter/);assert.match(summary,/could not finish/);assert.match(summary,/truncated/);
  assert.match(developmentSummary({artifacts:[],errors:0},null),/did not produce an artifact/);
+ assert.match(developmentSummary({artifacts:[],calls:1,errors:0,answer:'A summary of the read file.'},null),/A summary of the read file/);
  assert.match(developmentSummary({artifacts:[],errors:1},{ok:false}),/did not pass/);
  const deleted=developmentSummary({artifacts:[],removed:['/workspace/old.txt'],errors:0},null);
  assert.match(deleted,/Deleted old.txt/);assert.doesNotMatch(deleted,/No workspace files changed|did not produce/);

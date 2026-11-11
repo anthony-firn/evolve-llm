@@ -11,6 +11,10 @@ def check(runtime,model):
    browser=p.chromium.launch(executable_path='/usr/bin/google-chrome',args=FLAGS)
    context=browser.new_context(viewport={'width':1280,'height':900})
    context.add_init_script("if(window===window.top)localStorage.setItem('evolve-llm-settings',JSON.stringify({temperature:0,maxTokens:1024,ctx:8192,thinking:false,gpu:'high-performance',gpuMemory:'auto'}))")
+   context.add_init_script("""if(window===window.top){
+    window.__piTokens=0;const NativeWorker=window.Worker;
+    window.Worker=class extends NativeWorker{constructor(...args){super(...args);this.addEventListener('message',({data})=>{if(data.type==='agent_event'&&data.event?.type==='token')window.__piTokens++;});}};
+   }""")
    page=context.new_page();errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
    page.goto(f'http://127.0.0.1:{server.server_address[1]}/play/evolve-llm/')
    page.wait_for_selector('#gpu-chip[data-state=ok]',timeout=30000)
@@ -23,6 +27,7 @@ def check(runtime,model):
    frame.locator('#restart').click();assert frame.locator('#score').inner_text()=='0'
    assert 'Snake starter' in page.locator('.chat-development').inner_text()
    assert not page.locator('#workbench').is_visible()
+   page.wait_for_function('() => window.__piTokens>0',timeout=90000)
    # The starter is already playable while the actual model runs Pi. Stop is
    # intentionally exercised rather than claiming a tiny model customized it.
    if page.locator('#stop').is_visible():page.locator('#stop').click()
@@ -32,7 +37,7 @@ def check(runtime,model):
    page.frame_locator('.chat-preview-host iframe').locator('canvas').wait_for(timeout=10000)
    page.screenshot(path='/tmp/llm-main-chat-real-model.png')
    assert not errors,errors
-   print('Real GGUF/WebGPU main chat: Auto → shared WASM workspace → labeled playable Snake starter → Pi cancellation and saved file passed.')
+   print('Real GGUF/WebGPU main chat: Auto → shared WASM workspace → labeled playable Snake starter → actual Pi model tokens → cancellation and saved file passed.')
    browser.close()
  finally:server.shutdown();server.server_close()
 

@@ -1,6 +1,6 @@
 import { AppPreview } from './preview-client.mjs';
 import { Workspace } from './shell-client.mjs';
-import { createWebTools } from './tools.js';
+import { createWebTools, stripToolCalls } from './tools.js';
 const node=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e};
 const button=(label,fn)=>{const e=node('button',label);e.type='button';e.addEventListener('click',fn);return e};
 async function database(mode, value) {
@@ -141,7 +141,9 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
         }
       }catch(error){problem||=String(error.message||error);}
       const removed=Object.keys(before).filter(path=>!Object.hasOwn(after,path));
-      const finished={...result,calls:result?.calls??calls,turns:result?.turns??turns,errors:result?.errors??errors,changes:artifacts.length+removed.length,artifacts,removed,starterPath,previewPath,error:problem};
+      const lastAnswer=result?.messages?.filter(m=>m.role==='assistant').at(-1);
+      const answer=stripToolCalls((lastAnswer?.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('\n')).trim();
+      const finished={...result,calls:result?.calls??calls,turns:result?.turns??turns,errors:result?.errors??errors,changes:artifacts.length+removed.length,artifacts,removed,starterPath,previewPath,answer,error:problem};
       record(problem?'Pi stopped':finished.calls?'Pi finished':'Pi answered · no tools ran',`${finished.turns} model turns · ${finished.calls} tool calls · ${finished.changes} file changes · ${finished.errors} tool errors`);
       return finished;
     }catch(error){

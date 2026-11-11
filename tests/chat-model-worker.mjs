@@ -24,7 +24,9 @@ self.onmessage=({data:m})=>{
    text=results.length?'unfinished':tool('write',{path,text:'<script>throw new Error("broken fixture")</script>'});
    emit('agent_done',{requestId:m.requestId,text,reason:results.length?'length':'end',n:20});return;
   }
-  if(/delete calculator/i.test(request)){
+  if(/read readme/i.test(request)){
+   text=results.length?'Scripted summary of the saved workspace README.':tool('read',{path:'/workspace/README.txt'});
+  }else if(/delete calculator/i.test(request)){
    text=results.length?'Deleted the file.':tool('bash',{command:'rm /workspace/calculator.html'});
   }else if(/blue background|background blue/i.test(request)){
    if(!results.length)text=tool('read',{path:'/workspace/snake.html'});
