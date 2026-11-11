@@ -1,4 +1,30 @@
-# Browser terminal and Pi
+# Main chat, browser terminal and Pi
+
+Ask the main chat **“Make me a Snake game I can play.”** No terminal command is needed.
+The mode selector beside the message box offers:
+
+- **Auto** (default): development requests use Pi; questions and explanations use ordinary chat.
+- **Chat**: replies without changing workspace files.
+- **Build**: always gives the request to Pi's workspace tools.
+
+Builds show activity, actual saved files, Source and Download buttons, and an isolated playable
+preview in the conversation. Ask for changes in the next message: Auto continues development
+requests against the same files. Recent conversation context is passed to Pi with the current
+file list. Select Chat for an explanation, or Build if Auto misses a task. Stop cancels the
+current task. New chat clears the conversation and previews; it keeps workspace files.
+
+Snake creation starts from the included working Snake starter, clearly labeled in the activity
+and result. It opens immediately while Pi applies customizations. The starter includes arrow
+keys, touch controls, food, scoring, collision handling and Restart. Existing files are preserved
+by giving each new starter an unused name. If Pi damages the starter and its runtime check
+fails or the canvas disappears, the working starter is restored and the partial failure is
+reported. Other apps rely on the loaded model to create their files. Small models still make
+incorrect tool choices; saved-file counts and runtime checks describe observed results, rather
+than trusting model completion claims. A runtime smoke check does not prove gameplay logic.
+
+Main chat and Terminal share one WASM workspace, task budget, network toggle and model lease.
+No second model or server inference is used. The mode selection is remembered on this device.
+
 
 Open [Evolve LLM](https://www.evolvetech.dev/play/evolve-llm/) and select **Terminal**.
 The shell works before loading a model. It runs a Rust kernel compiled to WebAssembly in a
@@ -84,12 +110,14 @@ node tools/build_workbench.mjs
 npm test
 npm run typecheck
 python3 tests/workbench_browser_test.py --runtime web
+python3 tests/chat_development_browser_test.py --runtime web
 ```
 
 The browser test requires Python Playwright and its Chromium installation. It uses production
 CSP, the actual compiled shell and actual Pi core with a scripted model transport, so it does
 not download weights. A local Chrome/Qwen3 0.6B GPU smoke test separately verified a two-tool
 write/read loop; this is functional evidence, not a model accuracy benchmark.
+For a real-GGUF main-chat check, run `python3 tests/chat_local_model_browser_test.py --runtime dist --model /path/to/model.gguf`. This checks the labeled starter and cancellation with the actual WebGPU model; it does not claim that a tiny model reliably customizes games.
 Pi's upstream license is preserved in `vendor/PI-LICENSE.txt` and distributed beside the bundle.
 
 ## Run and inspect HTML apps

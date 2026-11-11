@@ -28,5 +28,6 @@ jobs:
       - run: node tools/build_workbench.mjs
       - run: python tests/workbench_browser_test.py --runtime web
       - run: python tests/preview_browser_test.py --runtime web
+      - run: python tests/chat_development_browser_test.py --runtime web
       - name: Check the actual module worker with a no-GPU protocol fixture
         run: python tests/sdk_browser_test.py --runtime web --chromium

@@ -15,7 +15,7 @@ the catalog have not been run end to end yet; see [Limits](#limits).
 
 ## Browser workspace and Pi
 
-Open **Terminal** for a persistent WASM text workspace with pipes and file redirects.
+Ask the main chat to build an app or game, or open **Terminal** for a persistent WASM text workspace with pipes and file redirects.
 Enter `demo snake` to play the included example, or `preview game.html` to run your own
 single-file HTML app in an isolated frame. Pi can test apps, inspect runtime errors and edit them. Load a
 tool-capable model, then enter `pi <task>` to run Pi agent core with sandbox file and research

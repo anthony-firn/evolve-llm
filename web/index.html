@@ -97,6 +97,13 @@
       </div>
 
       <form class="composer" id="composer">
+        <label class="chat-mode-label" for="chat-mode">Mode
+          <select id="chat-mode" title="Auto uses Pi for development requests. Build always uses workspace tools.">
+            <option value="auto">Auto</option>
+            <option value="chat">Chat</option>
+            <option value="build">Build</option>
+          </select>
+        </label>
         <label class="sr-only" for="prompt">Message</label>
         <textarea id="prompt" rows="1" placeholder="Choose a model to start" disabled enterkeyhint="send"></textarea>
         <button class="web-toggle" type="button" id="web-toggle" aria-pressed="false" title="Let the model search the web">

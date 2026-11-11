@@ -18,7 +18,7 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   const head=node('header'),title=node('div');title.append(node('strong','Terminal & Pi'),node('small','WASM workspace · local model'));
   const tokenLabel=node('label'),tokenLimit=node('select');tokenLimit.id='pi-output-tokens';for(const value of [1024,2048,4096]){const option=node('option',String(value));option.value=value;tokenLimit.append(option)}tokenLimit.value='2048';tokenLabel.append(node('span','Pi tokens'),tokenLimit);
   const webLabel=node('label'),webToggle=node('input');webToggle.type='checkbox';webToggle.id='terminal-web';webLabel.append(webToggle,node('span','Web access'));
-  const close=button('Close',()=>{cancel();preview.stop();previewPanel.hidden=true;console.classList.remove('preview-expanded');root.hidden=true});head.append(title,tokenLabel,webLabel,close);
+  const close=button('Close',()=>{if(!externalTask)cancel();preview.stop();previewPanel.hidden=true;console.classList.remove('preview-expanded');root.hidden=true});head.append(title,tokenLabel,webLabel,close);
   const notice=node('p','Commands and files stay in a browser-only /workspace. Web searches and page URLs go to external services when enabled. This supports a shell subset, not host Bash.','workbench-note');
   const layout=node('div',undefined,'workbench-layout'),aside=node('aside'),files=node('div',undefined,'workbench-files');files.id='workspace-files';
   const actions=node('div',undefined,'workspace-actions');
@@ -35,7 +35,7 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   const preview=new AppPreview({container:previewHost,onResult:result=>{if(result.late)record('Preview runtime error',result.errors.join('\n'),'error')}});let previewPath=null;
   const console=node('div',undefined,'terminal-console');console.append(log,previewPanel,form,status);
   aside.append(node('h2','Workspace files'),actions,files);layout.append(aside,console);root.append(head,notice,layout,filePicker,restorePicker);document.body.append(root);
-  let initialized=false, initialization=null, task=null, busy=false, saving=Promise.resolve(), agent=null, abortWeb=new AbortController(), history=[],cursor=0;
+  let initialized=false, initialization=null, task=null, busy=false, externalTask=false, saving=Promise.resolve(), agent=null, abortWeb=new AbortController(), history=[],cursor=0;
   function record(label,text='',className='') {
     const row=node('section',undefined,'terminal-entry '+className),labelNode=node('strong',label),output=node('pre',String(text).slice(0,65536));row.append(labelNode,output);log.append(row);
     while(log.children.length>32)log.firstElementChild.remove();log.scrollTop=log.scrollHeight;return output;
@@ -59,11 +59,11 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   }
   previewActions.append(button('Show/hide log',()=>console.classList.toggle('preview-expanded')),button('Full size',()=>root.classList.toggle('preview-wide')),button('Reload',()=>run(()=>openPreview(previewPath,{signal:task.signal}))),button('Test',()=>run(()=>openPreview(previewPath,{signal:task.signal,smoke:true}))),button('Stop preview',()=>{preview.stop();previewPanel.hidden=true;console.classList.remove('preview-expanded')}));
   function setBusy(value){busy=value;submit.disabled=value;stop.disabled=!value;for(const control of actions.querySelectorAll('button'))control.disabled=value;for(const control of files.querySelectorAll('button'))control.disabled=value;}
-  async function run(fn) {
-    if(busy)return;setBusy(true);task=new AbortController();const deadline=setTimeout(()=>task?.abort(),180000);
-    try{await boot();await fn();await saving;status.textContent='Ready · files saved in this browser';}
-    catch(error){status.textContent=String(error.message||error);record('Error',String(error.message||error),'error')}
-    finally{clearTimeout(deadline);agent=null;task=null;setBusy(false);input.focus()}
+  async function run(fn,{rethrow=false}={}) {
+    if(busy){if(rethrow)throw new Error('Workspace is busy.');return;}externalTask=rethrow;setBusy(true);task=new AbortController();const deadline=setTimeout(()=>task?.abort(),180000);
+    try{await boot();const result=await fn();await saving;status.textContent='Ready · files saved in this browser';return result;}
+    catch(error){status.textContent=String(error.message||error);record('Error',String(error.message||error),'error');if(rethrow)throw error;}
+    finally{clearTimeout(deadline);agent=null;task=null;externalTask=false;setBusy(false);if(!root.hidden)input.focus()}
   }
   async function boot(){
     if(initialized)return;
@@ -83,25 +83,76 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
     if(/^(preview|test)\s+/.test(line)){const [operation,...parts]=line.split(/\s+/);await openPreview(parts.join(' '),{signal:task.signal,smoke:operation==='test'});return}
     if(/^pi(?:\s|$)/.test(line)){
       const question=line.slice(2).trim();if(!question){record('Pi','Use pi followed by a task. For coding, choose Qwen2.5 Coder 1.5B or larger; tiny chat models often fail tool tasks. Example: pi Create a compact Snake game in snake.html, run browser_test, fix any errors, then preview it. Use a coding model; each task allows 10 model turns and 12 tool calls.');return}
-      if(!ready())throw new Error('Load a model and wait until it is ready before running Pi. Shell commands work without a model.');
-      const release=lease();let output=record('Pi · '+modelName(),'');
-      try{
-        const {createPiTask}=await import('./pi-agent.bundle.mjs');
-        agent=createPiTask({turn,workspace,network,preview:openPreview,maxTokens:Number(tokenLimit.value),modelName:modelName(),onEvent:event=>{
-          if(event.type==='token'){if(output.textContent.length<65536)output.textContent+=event.text;log.scrollTop=log.scrollHeight}
-          else if(event.type==='tool'){record('Pi → '+event.name,JSON.stringify(event.args));output=record('Running…','')}
-          else if(event.type==='tool-result'){output.textContent=JSON.stringify(event.result,null,2).slice(0,65536);output=record('Pi','')}
-          else if(event.type==='retry'){record('Pi · format retry '+event.attempt,event.message+'\nModel output: '+event.output,'error');output=record('Pi · retry','')}
-          else if(event.type==='answer'&&event.error)status.textContent=event.error;
-        }});
-        const signal=task.signal,abort=()=>agent?.abort();signal.addEventListener('abort',abort,{once:true});
-        try{const result=await agent.run(question);record(result.lastToolFailed?'Pi stopped · last tool failed':result.calls?'Pi finished':'Pi answered · no tools ran',`${result.turns} model turns · ${result.calls} tool calls · ${result.changes} file changes · ${result.errors} tool errors`);if(result.previewPath)await openPreview(result.previewPath,{signal,smoke:true});status.textContent=`Pi finished · ${result.turns} model turns · ${result.calls} tool calls`;}
-        finally{signal.removeEventListener('abort',abort)}
-      }finally{release()}
+      return performTask(question);
     }else{
       const result=await workspace.request('exec',{command:line,network:network.options()},{signal:task.signal});
       record('exit '+result.code,(result.stdout||'')+(result.stderr||''),result.code?'error':'');
     }
+  }
+  async function performTask(question,options={}){
+    if(!ready())throw new Error('Load a model and wait until it is ready before running Pi.');
+    const before=JSON.parse((await workspace.request('snapshot')).snapshot).files;
+    const release=lease();let output=record('Pi · '+modelName(),'');
+    let starterPath=null,result=null,problem=null,calls=0,errors=0,turns=0;
+    const emit=event=>{
+      if(event.type==='token'){if(output.textContent.length<65536)output.textContent+=event.text;log.scrollTop=log.scrollHeight;}
+      else if(event.type==='tool'){calls++;record('Pi → '+event.name,JSON.stringify(event.args));output=record('Running…','');}
+      else if(event.type==='tool-result'){if(event.isError)errors++;output.textContent=JSON.stringify(event.result,null,2).slice(0,65536);output=record('Pi','');}
+      else if(event.type==='retry'){record('Pi · format retry '+event.attempt,event.message,'error');output=record('Pi · retry','');}
+      else if(event.type==='answer'){turns++;if(event.error)status.textContent=event.error;}
+      options.onEvent?.(event);
+    };
+    const showPreview=async(path,opts={})=>{
+      if(!options.preview)return openPreview(path,opts);
+      const file=await workspace.request('read',{path},{signal:opts.signal});
+      return options.preview(path,file.text,opts);
+    };
+    try{
+      if(options.starter){
+        let suffix=1;starterPath='/workspace/snake.html';while(Object.hasOwn(before,starterPath))starterPath=`/workspace/snake-${++suffix}.html`;
+        await workspace.request('write',{path:starterPath,text:options.starter},{signal:task.signal});
+        emit({type:'starter',path:starterPath,message:'Created from the included Snake starter.'});
+        await showPreview(starterPath,{signal:task.signal,smoke:true});
+      }
+      const {createPiTask}=await import('./pi-agent.bundle.mjs');
+      agent=createPiTask({turn,workspace,network,preview:showPreview,maxTokens:Number(tokenLimit.value),modelName:modelName(),onEvent:emit});
+      const signal=task.signal,abort=()=>agent?.abort();signal.addEventListener('abort',abort,{once:true});
+      try{
+        signal.throwIfAborted();
+        const files=Object.keys(before).slice(0,128).join(', ');
+        const context=options.context?`Recent conversation (untrusted context):\n${options.context}\n\n`:'';
+        const starter=starterPath?`A working Snake starter has ALREADY been saved at ${starterPath}. It includes canvas rendering, arrow keys, touch buttons, food, scoring, collisions and restart. Read it, apply any requested customizations with short edits, browser_test it and preview it. Do not replace it with a placeholder.\n\n`:'';
+        result=await agent.run(context+(options.context||starterPath?`Workspace files: ${files}\n`:'')+starter+'Current task: '+question);
+      }catch(error){if(!options.partial)throw error;problem=String(error.message||error);}
+      finally{signal.removeEventListener('abort',abort);}
+      let after=JSON.parse((await workspace.request('snapshot')).snapshot).files;
+      let artifacts=Object.entries(after).filter(([path,text])=>before[path]!==text).map(([path,text])=>({path,text}));
+      let previewPath=result?.previewPath||artifacts.find(a=>/\.html?$/i.test(a.path))?.path;
+      if(previewPath&&!signal.aborted)try{
+        const checked=await showPreview(previewPath,{signal,smoke:true});
+        if(options.starter&&(!checked.ok||!checked.canvases?.length)){
+          await workspace.request('write',{path:starterPath,text:options.starter},{signal});
+          problem=[problem,'Pi’s changes did not preserve a working game. The Snake starter was restored.'].filter(Boolean).join(' ');
+          emit({type:'recovery',message:'Restored the working Snake starter after a failed check.'});
+          previewPath=starterPath;
+          await showPreview(starterPath,{signal,smoke:true});
+          after=JSON.parse((await workspace.request('snapshot')).snapshot).files;
+          artifacts=Object.entries(after).filter(([path,text])=>before[path]!==text).map(([path,text])=>({path,text}));
+        }
+      }catch(error){problem||=String(error.message||error);}
+      const removed=Object.keys(before).filter(path=>!Object.hasOwn(after,path));
+      const finished={...result,calls:result?.calls??calls,turns:result?.turns??turns,errors:result?.errors??errors,changes:artifacts.length+removed.length,artifacts,removed,starterPath,previewPath,error:problem};
+      record(problem?'Pi stopped':finished.calls?'Pi finished':'Pi answered · no tools ran',`${finished.turns} model turns · ${finished.calls} tool calls · ${finished.changes} file changes · ${finished.errors} tool errors`);
+      return finished;
+    }catch(error){
+      if(!options.partial)throw error;
+      let after;
+      try{after=JSON.parse((await workspace.request('snapshot')).snapshot).files;}
+      catch{after=JSON.parse(workspace.checkpoint||'{"files":{}}').files;}
+      const artifacts=Object.entries(after).filter(([path,text])=>before[path]!==text).map(([path,text])=>({path,text}));
+      const removed=Object.keys(before).filter(path=>!Object.hasOwn(after,path));
+      return {calls,turns,errors,changes:artifacts.length+removed.length,artifacts,removed,starterPath,error:String(error.message||error)};
+    }finally{release();}
   }
   actions.append(button('Import text',()=>filePicker.click()),button('Export',()=>run(async()=>{
     const {snapshot}=await workspace.request('snapshot');const url=URL.createObjectURL(new Blob([snapshot],{type:'application/json'}));const a=node('a');a.href=url;a.download='evolve-workspace.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
@@ -117,5 +168,5 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   form.addEventListener('submit',e=>{e.preventDefault();const line=input.value.trim();if(!line||busy)return;input.value='';history.push(line);history=history.slice(-50);cursor=history.length;run(()=>command(line))});
   input.addEventListener('keydown',e=>{if(e.key==='ArrowUp'||e.key==='ArrowDown'){e.preventDefault();cursor=Math.max(0,Math.min(history.length,cursor+(e.key==='ArrowUp'?-1:1)));input.value=history[cursor]||''}if(e.ctrlKey&&e.key.toLowerCase()==='c'){e.preventDefault();cancel()}});
   webToggle.addEventListener('change',()=>setNetwork(webToggle.checked));
-  return {async open(){root.hidden=false;webToggle.checked=getNetwork().enabled;await boot();input.focus()},setNetwork(){if(busy)cancel();abortWeb.abort();abortWeb=new AbortController();webToggle.checked=getNetwork().enabled},dispose(){cancel();workspace.dispose();preview.dispose();root.remove()}};
+  return {runTask:(question,options)=>run(()=>performTask(question,options),{rethrow:true}),cancel,async open(){root.hidden=false;webToggle.checked=getNetwork().enabled;await boot();input.focus()},setNetwork(){if(busy)cancel();abortWeb.abort();abortWeb=new AbortController();webToggle.checked=getNetwork().enabled},dispose(){cancel();workspace.dispose();preview.dispose();root.remove()}};
 }

@@ -1,6 +1,7 @@
 import { LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from './models.js';
 import { renderMarkdown, splitThinking } from './markdown.js';
 import { stripToolCalls } from './tools.js';
+import { wantsDevelopment, wantsSnakeStarter, developmentSummary, createDevelopmentView } from './chat-development.mjs';
 
 const $ = (id) => document.getElementById(id);
 const app = $('app');
@@ -8,19 +9,20 @@ let worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module
 
 const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', internet: false, jinaKey: '' };
 const SUGGESTIONS = [
-  'Explain WebGPU to a curious 12-year-old.',
+  'Make me a Snake game I can play.',
   'Write a haiku about running AI on my own laptop.',
   'Give me three tips for writing clear Rust code.',
   'Plan a relaxed weekend in Lisbon in five bullet points.',
 ];
 
 const state = {
-  phase: 'starting', // starting | idle | loading | ready | generating
+  phase: 'starting', // starting | idle | loading | ready | generating | preparing | agent
   adapter: null,
   cache: { models: [], supported: true },
   loading: null, // { label, id, key }
   loaded: null, // { id, key, label, info, chat }
   messages: [], // { role, content, stats?, error? }
+  developmentActive: false,
   live: null, // the assistant message being written
   settings: loadSettings(),
 };
@@ -62,12 +64,13 @@ function setPhase(phase) {
   state.phase = phase;
   app.dataset.phase = phase;
   const ready = phase === 'ready';
-  const generating = phase === 'generating';
-  const agentBusy = phase === 'agent';
+  const agentBusy = phase === 'agent' || phase === 'preparing';
+  const generating = phase === 'generating' || (agentBusy && Boolean(state.live?.development));
+  $('chat-mode').disabled = agentBusy || phase === 'generating';
   $('file-input').disabled = agentBusy;
   $('hf-input').disabled = agentBusy;
-  $('prompt').disabled = !(ready || generating);
-  $('prompt').placeholder = state.loaded ? `Message ${state.loaded.label}` : 'Choose a model to start';
+  $('prompt').disabled = !(ready || phase === 'generating');
+  $('prompt').placeholder = state.loaded ? 'Ask a question or build…' : 'Choose a model to start';
   $('send').disabled = !ready;
   $('send').hidden = generating;
   $('stop').hidden = !generating;
@@ -137,7 +140,7 @@ function catalogEntry(m) {
 const ALL = [...MODELS, ...LARGE];
 
 function renderModels() {
-  const busy = state.phase === 'loading' || state.phase === 'generating' || state.phase === 'agent' || !state.adapter?.ok;
+  const busy = state.phase === 'loading' || state.phase === 'generating' || ['agent','preparing'].includes(state.phase) || !state.adapter?.ok;
   const item = (m) => {
     const key = cacheKey(m.repo, m.file);
     const cached = cachedEntry(key);
@@ -216,7 +219,7 @@ function renderStorage() {
 let loadStarted = 0;
 
 async function startLoad(source) {
-  if (state.phase === 'agent') { $('status-line').textContent = 'Stop the Pi task before loading another model.'; return; }
+  if (['agent','preparing'].includes(state.phase)) { $('status-line').textContent = 'Stop the Pi task before loading another model.'; return; }
   if (!state.adapter?.ok) return;
   closeDrawer();
   if (state.phase === 'generating') return;
@@ -226,7 +229,8 @@ async function startLoad(source) {
   const label = known ? known.name : source.kind === 'file' ? first.replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '') : source.name;
   state.loading = { label, key: known ? cacheKey(known.repo, known.file) : source.key, id: known ? known.id : source.id, kind: source.kind };
   state.loaded = null;
-  state.messages = [];
+  for(const m of state.messages)m.developmentView?.dispose();
+  state.messages = [];state.developmentActive=false;
   renderMessages();
   $('loading-title').textContent = label;
   for (const li of $('loading-steps').children) li.dataset.state = '';
@@ -322,7 +326,9 @@ function formatParams(n) {
 
 function renderMessages() {
   const list = $('messages');
-  list.replaceChildren(...state.messages.map((m, i) => messageNode(m, i)));
+  const nodes=state.messages.map((m,i)=>messageNode(m,i));
+  for(const child of [...list.children])if(!nodes.includes(child))child.remove();
+  nodes.forEach((node,i)=>{if(list.children[i]!==node)list.insertBefore(node,list.children[i]||null);});
   $('ready').hidden = !(state.loaded && !state.messages.length && state.phase !== 'loading');
 }
 
@@ -359,6 +365,7 @@ function stepNode(step) {
 }
 
 function fillAssistant(bubble, m) {
+  if(m.development){const answer=el('div',{class:'answer'});answer.append(renderMarkdown(document,m.content,copyText));bubble.replaceChildren(answer);return;}
   const parts = splitThinking(stripToolCalls(m.content));
   const nodes = [];
   if (m.steps?.length) nodes.push(el('ul', { class: 'web-steps', 'aria-label': 'Web activity' }, ...m.steps.map(stepNode)));
@@ -386,14 +393,16 @@ function fillAssistant(bubble, m) {
 
 function messageNode(m, i) {
   if (m.error) {
-    return el('li', { class: 'msg error' }, el('div', { class: 'bubble', text: m.content }));
+    return m.element ||= el('li', { class: 'msg error' }, el('div', { class: 'bubble', text: m.content }));
   }
   if (m.role === 'user') {
-    return el('li', { class: 'msg user' }, el('div', { class: 'bubble', text: m.content }));
+    return m.element ||= el('li', { class: 'msg user' }, el('div', { class: 'bubble', text: m.content }));
   }
-  const bubble = el('div', { class: 'bubble' });
-  fillAssistant(bubble, m);
-  const li = el('li', { class: 'msg assistant', 'data-index': i }, el('span', { class: 'who', text: state.loaded?.label || 'Model' }), bubble);
+  const bubble=m.element?.querySelector('.bubble')||el('div',{class:'bubble'});
+  fillAssistant(bubble,m);
+  const li=m.element ||= el('li',{class:'msg assistant','data-index':i},el('span',{class:'who',text:state.loaded?.label||'Model'}),bubble);
+  li.querySelector(':scope > .msg-foot')?.remove();li.querySelector(':scope > .trimmed')?.remove();
+  if(m.developmentView&&m.developmentView.root.parentElement!==li)li.append(m.developmentView.root);
   if (m !== state.live) {
     const last = i === state.messages.length - 1;
     li.append(el('div', { class: 'msg-foot' },
@@ -439,13 +448,44 @@ function send(text) {
   text = text.trim();
   if (!text || state.phase !== 'ready') return;
   state.messages.push({ role: 'user', content: text });
-  runGeneration();
+  runResponse();
 }
 
 function regenerate() {
   if (state.phase !== 'ready') return;
-  while (state.messages.length && state.messages[state.messages.length - 1].role !== 'user') state.messages.pop();
-  if (state.messages.length) runGeneration();
+  while (state.messages.length && state.messages[state.messages.length - 1].role !== 'user') state.messages.pop().developmentView?.dispose();
+  if (state.messages.length) runResponse();
+}
+
+function runResponse(){
+  const question=state.messages.at(-1)?.content||'';
+  if(wantsDevelopment(question,$('chat-mode').value,state.developmentActive))runDevelopment(question);
+  else runGeneration();
+}
+
+async function runDevelopment(question){
+  const context=state.messages.slice(0,-1).filter(m=>!m.error).slice(-6).map(m=>`${m.role}: ${m.content}`).join('\n').slice(-6000);
+  const m={role:'assistant',content:'Preparing your workspace…',development:true,started:performance.now()};
+  m.developmentView=createDevelopmentView({openWorkspace:async()=>{try{await(await ensureWorkbench()).open();}catch(error){$('status-line').textContent=error.message;}}});
+  state.live=m;state.messages.push(m);state.developmentActive=true;setPhase('preparing');renderMessages();
+  $('scroll').scrollTop=$('scroll').scrollHeight;
+  try{
+    const session=await ensureWorkbench();
+    if(m.cancelRequested)throw new Error('Task cancelled.');
+    let starter;
+    if(wantsSnakeStarter(question)){
+      const response=await fetch(new URL('./examples/snake.html',import.meta.url));
+      if(!response.ok)throw new Error('The Snake starter could not be loaded.');
+      starter=await response.text();
+    }
+    if(m.cancelRequested)throw new Error('Task cancelled.');
+    m.content='Pi is working on your request…';scheduleLiveRender();
+    const result=await session.runTask(question.replace(/^\s*pi\s+/i,''),{context,starter,partial:true,onEvent:e=>{m.developmentView.event(e);if(e.type==='starter'){m.content='Your Snake starter is ready below. Pi is applying your request…';scheduleLiveRender();}},preview:(...args)=>m.developmentView.preview(...args)});
+    m.content=developmentSummary(result,m.developmentView.check);
+    m.stats=`Pi · ${result.calls} tool call${result.calls===1?'':'s'} · ${result.changes} file${result.changes===1?'':'s'} changed · ${result.errors} tool errors`;
+    m.developmentView.finish(result);
+  }catch(error){m.content='The development task stopped: '+String(error.message||error);m.developmentView.finish({error:m.content,artifacts:[]});}
+  finally{state.live=null;setPhase(state.loaded?'ready':'idle');renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;$('status-line').textContent='Files stay in your browser. Ask for changes here, or open the workspace.';}
 }
 
 function runGeneration() {
@@ -593,7 +633,8 @@ $('composer').addEventListener('submit', (e) => {
   autosize();
   send(text);
 });
-$('stop').addEventListener('click', () => worker.postMessage({ type: 'stop' }));
+function stopCurrent(){if(state.live?.development){state.live.cancelRequested=true;workbench?.cancel();}else worker.postMessage({type:'stop'});}
+$('stop').addEventListener('click',stopCurrent);
 $('web-toggle').addEventListener('click', () => {
   state.settings.internet = !state.settings.internet;
   networkChanged();
@@ -604,12 +645,13 @@ $('web-toggle').addEventListener('click', () => {
     : 'Web search is off. Nothing leaves this device.';
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && state.phase === 'generating') worker.postMessage({ type: 'stop' });
+  if(e.key==='Escape'&&['generating','agent','preparing'].includes(state.phase))stopCurrent();
 });
 $('cancel-load').addEventListener('click', () => worker.postMessage({ type: 'cancel' }));
 $('new-chat').addEventListener('click', () => {
   if (state.phase !== 'ready') return;
-  state.messages = [];
+  for(const m of state.messages)m.developmentView?.dispose();
+  state.messages = [];state.developmentActive=false;
   worker.postMessage({ type: 'reset' });
   renderMessages();
   setPhase('ready');
@@ -750,18 +792,22 @@ function agentTurn(messages,tools,{signal,onToken,maxTokens=2048}={}) {
 function networkChanged() {
   worker.postMessage({type:'network_policy',enabled:Boolean(state.settings.internet)});workbench?.setNetwork();
 }
+async function ensureWorkbench(){
+  workbenchPromise ||= import('./workbench.mjs').then(({mountWorkbench})=>mountWorkbench({
+    ready:()=>['ready','preparing'].includes(state.phase)&&Boolean(state.loaded),turn:agentTurn,modelName:()=>state.loaded?.label||'Local model',
+    lease:()=>{if(!['ready','preparing'].includes(state.phase)||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?(state.live?.development?'preparing':'ready'):'idle');}};},
+    getNetwork:()=>({enabled:Boolean(state.settings.internet),jinaKey:state.settings.jinaKey||''}),
+    setNetwork:enabled=>{state.settings.internet=enabled;saveSettings();syncWebToggle();networkChanged();},
+  })).catch(error=>{workbenchPromise=null;throw error;});
+  workbench=await workbenchPromise;return workbench;
+}
 terminalButton.addEventListener('click',async()=>{
   terminalButton.disabled=true;
-  try {
-    workbenchPromise ||= import('./workbench.mjs').then(({mountWorkbench})=>mountWorkbench({
-      ready:()=>state.phase==='ready'&&Boolean(state.loaded),turn:agentTurn,modelName:()=>state.loaded?.label||'Local model',
-      lease:()=>{if(state.phase!=='ready'||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?'ready':'idle')}}},
-      getNetwork:()=>({enabled:Boolean(state.settings.internet),jinaKey:state.settings.jinaKey||''}),
-      setNetwork:enabled=>{state.settings.internet=enabled;saveSettings();syncWebToggle();networkChanged()},
-    })).catch(error=>{workbenchPromise=null;throw error});
-    workbench=await workbenchPromise;await workbench.open();
-  }catch(error){$('status-line').textContent=String(error.message||error)}
-  finally{terminalButton.disabled=false}
+  try{await(await ensureWorkbench()).open();}catch(error){$('status-line').textContent=String(error.message||error);}
+  finally{terminalButton.disabled=false;}
 });
+$('chat-mode').value=recall('evolve-llm-chat-mode')||'auto';
+if(!$('chat-mode').value)$('chat-mode').value='auto';
+$('chat-mode').addEventListener('change',()=>remember('evolve-llm-chat-mode',$('chat-mode').value));
 
 worker.postMessage({ type: 'hello', gpu: state.settings.gpu });
