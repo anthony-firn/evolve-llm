@@ -21,12 +21,12 @@ def package(runtime, out):
     subprocess.run(['git', 'diff', '--exit-code', engine_commit, 'HEAD', '--', 'src', 'Cargo.toml', 'Cargo.lock'], cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
     if subprocess.check_output(['git', 'status', '--porcelain', '--', 'src', 'Cargo.toml', 'Cargo.lock'], cwd=ROOT):
         raise ValueError('Engine sources have local changes')
-    names = ['icon.svg', 'markdown.js', 'index.html', 'app.js', 'app.css', 'sdk.mjs', 'sdk.d.mts', 'worker.js', 'model-readers.mjs', 'models.js', 'tools.js', 'network.js',
+    names = ['icon.svg', 'markdown.js', 'index.html', 'app.js', 'app.css', 'sdk.mjs', 'sdk.d.mts', 'worker.js', 'tool-transport.mjs', 'model-readers.mjs', 'models.js', 'tools.js', 'network.js',
         'preview-client.mjs', 'preview/index.html', 'examples/snake.html', 'workbench.mjs', 'shell-client.mjs', 'shell-worker.mjs', 'pi-agent.bundle.mjs', 'pi-agent.bundle.mjs.LEGAL.txt',
         'shell-pkg/shell.js', 'shell-pkg/shell_bg.wasm', 'shell-pkg/pi-build.json', 'shell-pkg/PI-LICENSE.txt',
         'examples/index.html', 'examples/example.mjs', 'examples/example.css', 'examples/fixture-worker.mjs']
     files = {name: (ROOT / 'web' / name).read_bytes() for name in names if (ROOT / 'web' / name).is_file()}
-    for required in ['shell-pkg/shell_bg.wasm', 'pi-agent.bundle.mjs', 'network.js', 'model-readers.mjs', 'preview/index.html', 'preview-client.mjs']:
+    for required in ['shell-pkg/shell_bg.wasm', 'pi-agent.bundle.mjs', 'network.js', 'model-readers.mjs', 'preview/index.html', 'preview-client.mjs', 'tool-transport.mjs']:
         if required not in files: raise ValueError('Build the workbench first: node tools/build_workbench.mjs')
     files.update({'pkg/' + name: (runtime / name).read_bytes() for name in ['evolve_llm.js', 'evolve_llm_bg.wasm', 'BUILD.json']})
     files['WORKBENCH.md'] = (ROOT / 'docs/workbench.md').read_bytes()

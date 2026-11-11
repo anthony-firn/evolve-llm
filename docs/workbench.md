@@ -37,9 +37,12 @@ This integrates the real MIT-licensed **Pi agent core 1.5.1** from pi-mono, with
 to the existing Rust/WASM/WebGPU model. It reuses the loaded weights. The Pi bundle and shell
 kernel load on demand when opening Terminal, with no second model or provider account.
 Pi gets sequential `bash`, `read`, `write`, `edit`, `web_search`, `open_url`, `preview`, and `browser_test` tools.
-The UI displays tool arguments, actual results, and completion counts. Each task allows 6 model
-turns, 12 tools, 3 tools per model response, and 3 minutes total; tool output sent to the model is
-bounded. Stop cancels inference and outstanding reads. If inference will not stop, its worker is
+The UI displays tool arguments, actual results, and completion counts. Each task allows 10 model
+turns, 12 tool calls, one tool per model response, and 3 minutes total; tool output sent to the model is
+bounded. Up to two format retries count toward the turn limit. Invalid or truncated calls never
+execute; failed tool calls are shown alongside the actual file-change count. Edits require a prior
+read and a nonempty exact substring from that read. Network tools are offered only with Web on.
+Stop cancels inference and outstanding reads. If inference will not stop, its worker is
 restarted and the model must be reloaded. Chat and model loading wait while Pi owns the engine.
 
 Tool reliability depends on the model. Small models can choose the wrong arguments, ignore
@@ -101,7 +104,10 @@ Try `pi Make snake-example.html use a blue background, then browser_test it and 
 The Pi tokens selector defaults to 2,048 output tokens, with options for 1,024 or 4,096; the
 loaded model context must also have room for the prompt and response. A compact game or
 small edits work better than generating a large app in one call. Truncated or invalid tool
-calls now report failure, rather than a successful completion. They never execute partially.
+calls report failure and never execute partially. For models with a broken double-braced JSON
+example in their GGUF tool template, Pi supplies valid tool instructions through the ordinary
+chat template. Qwen2.5 0.5B can still invent edits or ignore feedback; use a coding model and
+inspect the file-change count before trusting a completion claim.
 
 The preview runs inline HTML/CSS/JavaScript in an opaque-origin iframe, with no same-origin
 permission, host execution, workspace API, storage, external assets, network requests, forms,

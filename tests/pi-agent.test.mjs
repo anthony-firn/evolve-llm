@@ -21,7 +21,7 @@ test('real Pi agent loop invokes sandbox tools and feeds their results back to t
 test('Pi task turn budget terminates a model that repeatedly requests tools',async()=>{
  let executed=0;
  const task=createPiTask({workspace:{request:async()=>{executed++;return {stdout:'x',code:0}}},network:{options:()=>({enabled:false})},turn:async()=>({text:'<tool_call>{"name":"bash","arguments":{"command":"pwd"}}</tool_call>',reason:'end',n:10})});
- await assert.rejects(task.run('Loop'),/6-turn limit/);assert.equal(executed,6);
+ await assert.rejects(task.run('Loop'),/10-turn limit/);assert.equal(executed,10);
 });
 
 test('truncated tool calls are not executed and malformed arguments do not cross the tool boundary',async()=>{
@@ -42,4 +42,31 @@ test('Pi can smoke-test and preview HTML and passes the selected output budget',
  assert.equal(opts.maxTokens,4096);assert(schemas.some(x=>x.function.name==='browser_test'));n++;
  return {text:n===1?'<tool_call>{"name":"browser_test","arguments":{"path":"/workspace/game.html"}}</tool_call>':n===2?'<tool_call>{"name":"preview","arguments":{"path":"/workspace/game.html"}}</tool_call>':'Opened.',reason:'end'};
  }});const completed=await task.run('Test and play');assert.equal(completed.messages.find(m=>m.role==='toolResult').isError,false);assert.deepEqual(calls,[['/workspace/game.html',true],['/workspace/game.html',false]]);
+});
+
+test('malformed output gets bounded model feedback and can recover without executing invalid replies',async()=>{
+ let n=0,executed=0;const events=[];
+ const task=createPiTask({onEvent:e=>events.push(e),workspace:{request:async(name)=>{executed++;assert.equal(name,'read');return{text:'actual file'}}},network:{options:()=>({enabled:false})},turn:async(messages)=>{
+  n++;if(n===1)return {text:'<tool_call>{{"name":"edit","arguments":{}}</tool_call>',reason:'end'};
+  if(n===2){assert.match(messages.at(-1).content,/SINGLE opening brace/);return{text:'<tool_call>{"name":"read","arguments":{"path":"/workspace/game.html"}}</tool_call>',reason:'end'}}
+  return {text:'Read the file.',reason:'end'};
+ }});const result=await task.run('Read game.html');assert.equal(result.repairs,1);assert.equal(result.turns,3);assert.equal(executed,1);assert.equal(events.filter(e=>e.type==='retry').length,1);
+});
+test('edits require a prior read and an exact nonempty string; failures return to Pi for correction',async()=>{
+ let n=0;const operations=[];
+ const task=createPiTask({workspace:{request:async(name,args)=>{operations.push(name);return name==='read'?{text:'background:red;'}:{ok:true}}},network:{options:()=>({enabled:false})},turn:async(messages)=>{
+ n++;const call=n===1?{name:'edit',arguments:{path:'/workspace/game.html',oldText:'',newText:'blue'}}:n===2?{name:'read',arguments:{path:'/workspace/game.html'}}:n===3?{name:'edit',arguments:{path:'/workspace/game.html',oldText:'background:red;',newText:'background:blue;'}}:null;
+ if(n===2)assert(messages.some(m=>m.role==='tool'&&m.content.includes('Read this file first')));
+ return {text:call?'<tool_call>'+JSON.stringify(call)+'</tool_call>':'Changed.',reason:'end'};
+ }});const result=await task.run('Make the file blue');assert.deepEqual(operations,['read','edit']);assert.equal(result.changes,1);assert.equal(result.errors,1);assert.equal(result.lastToolFailed,false);
+});
+
+test('a failed tool followed by a confident answer still reports zero changes and a tool error',async()=>{
+ let n=0;
+ const task=createPiTask({workspace:{request:async()=>{throw Error('File not found')}},network:{options:()=>({enabled:false})},turn:async(_,schemas)=>{
+  assert(!schemas.some(t=>['open_url','web_search'].includes(t.function.name)));
+  return {text:++n===1?'<tool_call>{"name":"read","arguments":{"path":"/workspace/missing.html"}}</tool_call>':'Done; the game is blue.',reason:'end'};
+ }});
+ const result=await task.run('Change the game');
+ assert.equal(result.changes,0);assert.equal(result.errors,1);assert.equal(result.lastToolFailed,true);assert.equal(result.previewPath,null);
 });

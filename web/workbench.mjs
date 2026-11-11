@@ -77,11 +77,12 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
     })().catch(error=>{initialization=null;throw error});return initialization;
   }
   async function command(line){
+    console.classList.remove('preview-expanded');
     record(prompt.textContent+' '+line);
     if(line==='demo snake'){const response=await fetch(new URL('./examples/snake.html',import.meta.url));if(!response.ok)throw new Error('Bundled example is unavailable.');await workspace.request('write',{path:'/workspace/snake-example.html',text:await response.text()},{signal:task.signal});record('Bundled example','Loaded the included Snake example, ready for Pi to edit.');await openPreview('/workspace/snake-example.html',{signal:task.signal,smoke:true});return}
     if(/^(preview|test)\s+/.test(line)){const [operation,...parts]=line.split(/\s+/);await openPreview(parts.join(' '),{signal:task.signal,smoke:operation==='test'});return}
     if(/^pi(?:\s|$)/.test(line)){
-      const question=line.slice(2).trim();if(!question){record('Pi','Use pi followed by a task. Choose a tool-capable model such as Qwen. Example: pi Create a compact Snake game in snake.html, run browser_test, fix any errors, then preview it. Use a coding model; each task allows 6 model turns and 12 tool calls.');return}
+      const question=line.slice(2).trim();if(!question){record('Pi','Use pi followed by a task. For coding, choose Qwen2.5 Coder 1.5B or larger; tiny chat models often fail tool tasks. Example: pi Create a compact Snake game in snake.html, run browser_test, fix any errors, then preview it. Use a coding model; each task allows 10 model turns and 12 tool calls.');return}
       if(!ready())throw new Error('Load a model and wait until it is ready before running Pi. Shell commands work without a model.');
       const release=lease();let output=record('Pi · '+modelName(),'');
       try{
@@ -90,10 +91,11 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
           if(event.type==='token'){if(output.textContent.length<65536)output.textContent+=event.text;log.scrollTop=log.scrollHeight}
           else if(event.type==='tool'){record('Pi → '+event.name,JSON.stringify(event.args));output=record('Running…','')}
           else if(event.type==='tool-result'){output.textContent=JSON.stringify(event.result,null,2).slice(0,65536);output=record('Pi','')}
-          else if(event.type==='answer'&&event.error)output.textContent=event.error;
+          else if(event.type==='retry'){record('Pi · format retry '+event.attempt,event.message+'\nModel output: '+event.output,'error');output=record('Pi · retry','')}
+          else if(event.type==='answer'&&event.error)status.textContent=event.error;
         }});
         const signal=task.signal,abort=()=>agent?.abort();signal.addEventListener('abort',abort,{once:true});
-        try{const result=await agent.run(question);record(result.calls?'Pi finished':'Pi answered · no tools ran',`${result.turns} model turns · ${result.calls} tool calls`);if(result.previewPath)await openPreview(result.previewPath,{signal,smoke:true});status.textContent=`Pi finished · ${result.turns} model turns · ${result.calls} tool calls`;}
+        try{const result=await agent.run(question);record(result.lastToolFailed?'Pi stopped · last tool failed':result.calls?'Pi finished':'Pi answered · no tools ran',`${result.turns} model turns · ${result.calls} tool calls · ${result.changes} file changes · ${result.errors} tool errors`);if(result.previewPath)await openPreview(result.previewPath,{signal,smoke:true});status.textContent=`Pi finished · ${result.turns} model turns · ${result.calls} tool calls`;}
         finally{signal.removeEventListener('abort',abort)}
       }finally{release()}
     }else{
