@@ -5,6 +5,7 @@
 //! negotiated end to end inside the engine, so the relay forwards ciphertext only: it never sees
 //! page contents, cookies or passwords for HTTPS sites.
 
+pub mod announce;
 pub mod codec;
 pub mod limits;
 pub mod policy;

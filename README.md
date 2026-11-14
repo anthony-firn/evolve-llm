@@ -27,8 +27,10 @@ tools. Web access is explicit; there is no host shell or server inference. See
 **Browser** opens a web browser engine compiled to WebAssembly: Blitz with Stylo CSS and Taffy
 layout, Boa JavaScript, and rustls TLS, all in a worker. It loads real sites, keeps cookies and
 logins on this device, and you and Pi can use the same live page at once; Pi never types
-passwords. Sites are reached through `evolve-relay`, a small local relay that only forwards
-encrypted bytes. See [docs/browser.md](docs/browser.md).
+passwords. Nothing is installed or hosted for it: the engine contains a Tor client (Arti's
+`tor-proto`) and reaches sites through the Tor network over Snowflake, with TLS end to end inside
+the engine. For speed you can run `evolve-relay` on your computer, or use a community relay
+announced on Nostr. See [docs/browser.md](docs/browser.md).
 
 ## What it does
 
@@ -169,14 +171,15 @@ python3 -m http.server 8080 --directory dist
 ```
 
 Open http://localhost:8080. Any static host works. The app needs these content security policy
-sources and no inline scripts (the Jina, DuckDuckGo and Wikipedia sources only for web access, the
-`ws://` sources only for the browser's local relay):
+sources and no inline scripts (the Jina, DuckDuckGo and Wikipedia sources only for web access;
+`https://raw.githubusercontent.com` and `wss:` for the browser's Tor route, Nostr lookups and community
+relays; the `ws://` sources only for a relay on this computer):
 
 ```
 script-src 'self' 'wasm-unsafe-eval'; worker-src 'self';
 connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co
   https://*.wikipedia.org https://api.duckduckgo.com https://r.jina.ai https://s.jina.ai
-  ws://127.0.0.1:* ws://localhost:*
+  https://raw.githubusercontent.com wss: ws://127.0.0.1:* ws://localhost:*
 ```
 
 The native command line runs the same engine, reading weights from disk as it needs them:

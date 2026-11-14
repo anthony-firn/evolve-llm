@@ -58,14 +58,78 @@ gives visitors a `wss://` relay with nothing to install. A static Linux build:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
+# ring (TLS for --announce) needs a C compiler for the target: install musl-tools, or use gcc
+CC_x86_64_unknown_linux_musl=gcc cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 The page origin check stops other websites from using the relay from their visitors' browsers,
 but any program can send an allowed `Origin` header, so the per-client limits, the port
 allowlist and the private-address block are what protect a public relay from abuse. The workbench
-reads its relay from `web/browser-config.json` (`{"relayUrl": "wss://…/"}`); a relay set in the
-panel overrides it.
+does not depend on any public relay: its default route is the Tor network. A deployment can still
+preset a relay in `web/browser-config.json` (`{"relayUrl": "wss://…/"}`), and the route a
+person picks in the panel overrides it. To offer a public relay to everyone, announce it (below).
+
+## Join the community relay network
+
+Evolve Browser can use relays that other people run. A public relay announces itself on Nostr,
+the same way Fairground's content lives on independently operated Nostr relays: no central
+directory and no server run by the project. Browsers find announcements, check their
+signatures, drop expired ones and test that each relay answers before listing it. People choose
+a community relay explicitly; the browser does not switch to one on its own.
+
+1. Create a key for your relay (once). It prints the public key as `npub…` and hex; the secret
+   stays in the file, which is created with mode 0600 and never overwritten:
+
+   ```sh
+   evolve-relay keygen /etc/evolve-relay/relay.key
+   ```
+
+2. Run the relay in public mode behind HTTPS (a CDN or reverse proxy that passes WebSocket
+   upgrades and sets `X-Forwarded-For` or `CDN-ClientIP`), and announce it:
+
+   ```sh
+   evolve-relay --public --listen 0.0.0.0:8080 \
+     --announce /etc/evolve-relay/relay.key --public-url wss://relay.example.com/ \
+     --name "Example relay" --region us-west --contact ops@example.com
+   ```
+
+| Flag | Meaning |
+|---|---|
+| `--announce KEY_FILE` | Publish a signed announcement on startup and every 30 minutes. Requires `--public` and refuses `--allow-private`, so only a relay with per-client limits is offered to strangers. |
+| `--public-url URL` | The `wss://` address browsers use (required). |
+| `--nostr-relay URL` | Nostr relay to publish to (repeatable). Defaults: `wss://relay.damus.io`, `wss://nos.lol`, `wss://relay.primal.net`, `wss://offchain.pub`. |
+| `--name`, `--region`, `--contact` | Shown to people choosing a relay. Optional. |
+
+Before each announcement the relay connects to its own `--public-url` as a browser page would
+and waits for the Wisp `CONTINUE` packet; if that fails it does not announce and retries in five
+minutes, so an unreachable relay is not advertised.
+
+**What is published** is a public Nostr event of kind 38787 (parameterized replaceable), signed
+with your key:
+
+```
+tags: ["d", url] ["u", url] ["proto", "wisp/1"] ["limits", "8/128/2147483648"]
+      ["ports", "80,443"] ["name", …] ["region", …] ["contact", …]
+      ["expiration", now + 2 h] ["t", "evolve-relay"]
+```
+
+`limits` is connections / open streams / bytes per hour per client address, taken from the
+relay's settings. Nothing about visitors or traffic is published.
+
+**Stopping** is stopping the process: announcements expire two hours after the last one
+(NIP-40), and browsers ignore expired announcements. To stop sooner, use a new key next time.
+
+**Before you join**, know that an open relay makes your server's IP address the source of
+whatever sites visitors open through it. The port allowlist (80 and 443), the private-address
+block and the per-client limits reduce abuse but do not prevent it, and you may receive abuse
+reports. Check your hosting provider's terms and your local law, prefer a host meant for proxy
+traffic over a home connection, and keep `--verbose` off unless you need it, so you do not
+collect visitors' destinations.
+
+An announcement is a claim, not proof: browsers verify that it was signed by the key it names,
+not that the operator is honest. Because the engine negotiates TLS itself, a relay only handles
+encrypted bytes for `https://` sites, but it does see visitors' IP addresses and the host names
+they connect to.
 
 ## Security
 
@@ -108,6 +172,8 @@ Put it behind authentication and rate limits before exposing it.
 ## Tests
 
 ```sh
-cargo test                     # codec, address policy, origins, and end-to-end relay tests
-cargo test -- --ignored        # also fetch http://example.com through the relay
+cargo test                     # codec, address policy, origins, announcements (BIP-340 vectors,
+                               # NIP-01 ids, a fake Nostr relay) and end-to-end relay tests
+cargo test -- --ignored        # also fetch http://example.com through the relay and query the
+                               # default Nostr relays over TLS (read-only)
 ```

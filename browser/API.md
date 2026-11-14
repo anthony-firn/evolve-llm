@@ -4,12 +4,14 @@ This file is the contract between the parts of the browser that are built in par
 only together with every side that depends on it.
 
 ```
-main thread                         Web Worker (browser-worker.mjs)          relay (evolve-relay)
-┌───────────────────────────┐ msgs  ┌──────────────────────────────────┐ ws  ┌───────────────────┐
-│ BrowserClient             │◄────►│ wasm Browser (browser/src/web.rs)│◄──►│ Wisp v1 → TCP      │
-│  canvas, input, overlay   │       │  Blitz DOM/CSS/layout, Boa JS,   │     │ origin allowlist,  │
-│ Pi tools (pi-agent.mjs)   │       │  rustls, cookies, vello_cpu      │     │ private IPs blocked│
-└───────────────────────────┘       └──────────────────────────────────┘     └───────────────────┘
+main thread                         Web Worker (browser-worker.mjs)          route to websites
+┌───────────────────────────┐ msgs  ┌──────────────────────────────────┐ wss ┌───────────────────┐
+│ BrowserClient             │◄────►│ wasm Browser (browser/src/web.rs)│◄──►│ Tor: Snowflake     │
+│  canvas, input, overlay   │       │  Blitz DOM/CSS/layout, Boa JS,   │     │ bridge → 3 relays  │
+│ Pi tools (pi-agent.mjs)   │       │  rustls, cookies, vello_cpu,     │ ws  ├───────────────────┤
+└───────────────────────────┘       │  Tor client (vendor/webtor)      │◄──►│ or evolve-relay    │
+                                    └──────────────────────────────────┘     │ (Wisp v1 → TCP)    │
+                                                                             └───────────────────┘
 ```
 
 ## 1. WASM exports (`browser/src/web.rs`, wasm-bindgen, `--target web`)
@@ -21,10 +23,13 @@ worker. All coordinates are CSS pixels relative to the top-left of the page view
 class Browser {
   // fonts: [[fileName, Uint8Array], ...] (see web/browser-fonts/), wake: called (with no args)
   // whenever the engine wants tick() to run soon.
+  // relayUrl is the route: "tor:" (the Tor network over Snowflake) or a Wisp relay's ws(s):// URL.
   constructor(fonts: Array<[string, Uint8Array]>, relayUrl: string, cookiesJson: string | null,
               storageJson: string | null, wake: () => void);
   resize(cssWidth: number, cssHeight: number, devicePixelRatio: number): void;
-  setRelay(url: string): void;
+  setRelay(url: string): void;          // switch the route ("tor:" or ws(s)://); drops open connections
+  prepareNetwork(): void;              // start connecting now (Tor: bridge + first circuit, ~5–20 s)
+  setTorConsensus(baseUrls: string[]): void; // where consensus.txt.br / microdescriptors.txt.br live
   navigate(url: string): void;          // typed into the address bar; "example.com" → https://
   back(): void; forward(): void; reload(): void; stop(): void;
 
@@ -74,6 +79,7 @@ class Browser {
 { type: "ime", enabled, x, y, w, h }              // where to put the hidden textarea (CSS px)
 { type: "select", id, x, y, w, h, multiple,       // the person clicked a <select>: show a menu at
   options: [{ label, value, selected, disabled, group }] } // the box; reply with chooseOption(id, i)
+{ type: "network", route: "tor", state: "connecting" | "ready" | "failed", detail } // route progress
 ```
 
 ## 3. Agent API (shared page, person and agent at the same time)
@@ -128,12 +134,18 @@ The doc passed in is fully resolved (styles and layout up to date).
 
 ```ts
 export class BrowserClient extends EventTarget {
+  // relayUrl: the default route setting ("auto" when omitted; see docs/browser.md). The person's
+  // own choice is saved in localStorage and wins.
   constructor(options?: { relayUrl?: string });
   mount(container: HTMLElement): void;   // address bar, canvas, status, agent overlay
   ready: Promise<void>;
   navigate(url: string): Promise<void>;
   back(): void; forward(): void; reload(): void;
-  get state(): { url: string; title: string; loading: boolean; relayUrl: string; relayOk: boolean };
+  // choice: "auto" | "tor:" | ws(s):// URL; relayUrl: the route in use ("tor:" or a URL);
+  // relayOk: null while connecting; network: the latest "network" event.
+  get state(): { url: string; title: string; loading: boolean; relayUrl: string; relayOk: boolean | null;
+                 choice: string; network: { route: string; state: string; detail: string } | null };
+  setRelay(choice: string): Promise<boolean | null>;
   // Agent API: same names as 3.; each shows the agent cursor/highlight on the canvas and resolves
   // with the parsed JSON. While an agent action runs the panel shows "Pi is using the page".
   snapshot(maxChars?: number): Promise<Snapshot>;
@@ -147,11 +159,19 @@ export class BrowserClient extends EventTarget {
 }
 ```
 
-## 5. Relay (`browser/relay`, binary `evolve-relay`)
+## 5. Routes to websites
+
+`tor:` uses `browser/src/net/tor.rs` over the vendored `webtor` crate (`browser/vendor/`): a
+WebSocket to Snowflake's bridge (Turbo → KCP → SMUX → TLS → Tor channel), three-hop circuits from
+the cached consensus, one Tor stream per TCP connection, circuits isolated by first-party site.
+**Automatic** (`auto`, the default) is Tor, except on a page served from localhost, where it first
+tries the local relay (1.2 s probe). Public pages never probe the local network.
+
+## 6. Relay (`browser/relay`, binary `evolve-relay`)
 
 Wisp v1 server: `ws://127.0.0.1:8787/` by default. Only TCP streams. Refuses loopback, private,
 link-local, CGNAT, multicast and unspecified addresses after DNS resolution (unless
 `--allow-private`), ports other than 80/443 (unless `--allow-port N`), and WebSocket upgrades
 whose `Origin` is not allowed (default: `https://www.evolvetech.dev`, `http://localhost:*`,
-`http://127.0.0.1:*`; `--allow-origin URL` adds more). Default relay URL in the client:
+`http://127.0.0.1:*`; `--allow-origin URL` adds more). The local relay URL in the client:
 `ws://127.0.0.1:8787/`.

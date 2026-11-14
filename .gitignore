@@ -12,3 +12,4 @@ node_modules
 /browser/relay/target/
 /web/browser-pkg/
 /web/browser-fonts/
+/web/browser-tor/

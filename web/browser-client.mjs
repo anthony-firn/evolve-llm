@@ -8,8 +8,24 @@
  */
 
 export const DEFAULT_RELAY = 'ws://127.0.0.1:8787/';
-export const RELAY_DOCS = 'https://github.com/anthony-firn/evolve-llm/blob/main/docs/browser.md#the-relay';
+/** Route value for the Tor network (reached over Snowflake; nothing to install or host). */
+export const TOR_ROUTE = 'tor:';
+/** Route setting: Tor, or the relay on this computer when the page itself is served locally. */
+export const AUTO_ROUTE = 'auto';
+export const RELAY_DOCS = 'https://github.com/anthony-firn/evolve-llm/blob/main/docs/browser.md#how-pages-reach-websites';
 const RELAY_KEY = 'evolve-browser-relay';
+
+/** True when this page is served from this computer (no Local Network Access prompt for a local relay). */
+export function isLocalOrigin(loc = globalThis.location) {
+  return /^(localhost|127\.\d+\.\d+\.\d+|\[::1\])$/i.test(loc?.hostname || '');
+}
+
+/** A short name for a route, for the toolbar chip. */
+export function routeLabel(route) {
+  if (route === TOR_ROUTE) return 'Tor';
+  if (route === DEFAULT_RELAY) return 'Local relay';
+  return 'Relay';
+}
 const MAX_CONSOLE = 300;
 
 /** Address-bar text to a URL: schemes pass through, bare hosts get https://, other text searches. */
@@ -203,9 +219,11 @@ export class BrowserClient extends EventTarget {
     this._errors = 0;
     this._lastActivity = 0;
     this._persistTimer = null;
-    // The person's own relay setting wins, then the site's configured relay, then a local relay.
-    this._defaultRelay = relayUrl || DEFAULT_RELAY;
-    this._state = { url: '', title: '', loading: false, relayUrl: readSetting(RELAY_KEY) || this._defaultRelay, relayOk: null, canBack: false, canForward: false };
+    // The person's own route setting wins, then the site's configured route, then Auto (Tor, or
+    // the relay on this computer when the workbench itself is served locally).
+    this._defaultRelay = relayUrl || AUTO_ROUTE;
+    const choice = readSetting(RELAY_KEY) || this._defaultRelay;
+    this._state = { url: '', title: '', loading: false, choice, relayUrl: choice === AUTO_ROUTE ? TOR_ROUTE : choice, relayOk: null, network: null, canBack: false, canForward: false };
     this._ready = new Promise((resolve, reject) => { this._readyResolve = resolve; this._readyReject = reject; });
     this._ready.catch(() => {});
   }
@@ -217,8 +235,8 @@ export class BrowserClient extends EventTarget {
   }
 
   get state() {
-    const { url, title, loading, relayUrl, relayOk } = this._state;
-    return { url, title, loading, relayUrl, relayOk };
+    const { url, title, loading, relayUrl, relayOk, choice, network } = this._state;
+    return { url, title, loading, relayUrl, relayOk, choice, network };
   }
 
   get console() { return this._console.slice(); }
@@ -229,7 +247,8 @@ export class BrowserClient extends EventTarget {
     if (this._halted) return Promise.reject(new Error('The browser engine stopped repeatedly on this page. Press Reload to start it again.'));
     if (this._starting) return this._starting;
     this._starting = (async () => {
-      const saved = await this._persist.load().catch(() => ({}));
+      const [saved, route] = await Promise.all([this._persist.load().catch(() => ({})), this._resolveRoute(this._state.choice)]);
+      this._state.relayUrl = route;
       this._spawn(saved || {});
       this.checkRelay();
     })();
@@ -243,7 +262,7 @@ export class BrowserClient extends EventTarget {
       event?.preventDefault?.();
       if (this._worker === worker) this._recover({ error: event?.message || 'The browser worker failed.' });
     };
-    const message = { type: 'init', relayUrl: this._state.relayUrl, cookies: saved.cookies ?? null, storage: saved.storage ?? null, ...this._size };
+    const message = { type: 'init', relayUrl: this._state.relayUrl, cookies: saved.cookies ?? null, storage: saved.storage ?? null, torLog: readSetting('evolve-browser-tor-log') === '1', ...this._size };
     const transfer = [];
     const offscreen = this._ui?.takeOffscreen();
     if (offscreen) { message.canvas = offscreen; transfer.push(offscreen); }
@@ -305,8 +324,8 @@ export class BrowserClient extends EventTarget {
       case 'loading':
         s.loading = !!ev.loading;
         this._ui?.loading(s.loading, ev.url);
-        // A page that finished loading over http(s) proves the relay works.
-        if (!ev.loading && /^https?:/.test(ev.url || '') && !s.relayOk) { s.relayOk = true; this._ui?.relay(s); }
+        // A page that finished loading over http(s) proves the route works.
+        if (!ev.loading && /^https?:/.test(ev.url || '') && !s.relayOk && !(s.relayUrl === TOR_ROUTE && s.network?.state === 'failed')) { s.relayOk = true; this._ui?.relay(s); }
         break;
       case 'cursor': this._ui?.cursor(ev.cursor); break;
       case 'console':
@@ -321,11 +340,18 @@ export class BrowserClient extends EventTarget {
         break;
       case 'clipboard': this._copy(ev.text); break;
       case 'select': this._openSelect(ev); break;
+      case 'network':
+        s.network = { route: ev.route, state: ev.state, detail: ev.detail || '' };
+        if (s.relayUrl === TOR_ROUTE && ev.route === 'tor') {
+          s.relayOk = ev.state === 'ready' ? true : ev.state === 'failed' ? false : null;
+          this._ui?.relay(s);
+        }
+        break;
       case 'cookies': case 'storage': this._schedulePersist(); break;
       case 'error':
         s.loading = false;
         this._ui?.loading(false);
-        if (/relay/i.test(ev.text || '')) { s.relayOk = false; this._ui?.relay(s); }
+        if (/relay/i.test(ev.text || '') && s.relayUrl !== TOR_ROUTE) { s.relayOk = false; this._ui?.relay(s); }
         this._ui?.status(ev.text, 'error');
         break;
       case 'download': {
@@ -442,15 +468,37 @@ export class BrowserClient extends EventTarget {
   networkLog() { return this.request('networkLog'); }
   async clearData() { await this.request('clearData'); await this._persist.save({ cookies: null, storage: null }); }
 
+  /** The route for a setting: Auto is Tor, or the local relay when the page is served locally and the relay answers. */
+  async _resolveRoute(choice) {
+    if (choice !== AUTO_ROUTE) return choice;
+    if (isLocalOrigin()) {
+      let ok = false;
+      try { ok = await this._probe(DEFAULT_RELAY, 1200); } catch {}
+      if (ok) return DEFAULT_RELAY;
+    }
+    return TOR_ROUTE;
+  }
+
+  /** Use a route: "auto", "tor:" or a relay's ws(s):// URL (empty restores the default). */
   async setRelay(url) {
     const value = String(url || '').trim() || this._defaultRelay;
-    this._state.relayUrl = value;
+    this._state.choice = value;
     if (value === this._defaultRelay) { try { globalThis.localStorage?.removeItem(RELAY_KEY); } catch {} } else writeSetting(RELAY_KEY, value);
-    if (this._worker) await this.request('setRelay', { url: value }).catch(() => {});
+    const route = await this._resolveRoute(value);
+    if (route !== this._state.relayUrl) { this._state.network = null; this._state.relayOk = null; }
+    this._state.relayUrl = route;
+    if (this._worker) await this.request('setRelay', { url: route }).catch(() => {});
     return this.checkRelay();
   }
 
   async checkRelay() {
+    const s = this._state;
+    if (s.relayUrl === TOR_ROUTE) {
+      // Tor reports its own progress through "network" events.
+      if (s.network?.route === 'tor') s.relayOk = s.network.state === 'ready' ? true : s.network.state === 'failed' ? false : null;
+      this._ui?.relay(s);
+      return s.relayOk;
+    }
     this._state.relayOk = null;
     this._ui?.relay(this._state);
     let ok = false;
@@ -582,19 +630,31 @@ class BrowserView {
     this.reloadButton = button('reload', 'Reload', () => (client.state.loading ? client.stop() : client.reload()));
     this.addressInput = el('input', { type: 'text', class: 'browser-address-input', 'aria-label': 'Address', placeholder: 'Search or enter an address', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', enterkeyhint: 'go' });
     const form = el('form', { class: 'browser-address', role: 'search', onsubmit: (e) => { e.preventDefault(); const v = this.addressInput.value; if (v.trim()) { client.navigate(v).catch((err) => this.status(String(err.message || err), 'error')); this.focusPage(); } } }, this.addressInput);
-    this.relayChip = el('button', { type: 'button', class: 'browser-relay', 'data-state': 'checking', 'aria-expanded': 'false', title: 'Relay settings', onclick: () => this.toggleRelaySettings() }, el('i', { 'aria-hidden': 'true' }), el('span', { text: 'Relay' }));
+    this.relayChip = el('button', { type: 'button', class: 'browser-relay', 'data-state': 'checking', 'aria-expanded': 'false', title: 'How pages reach websites', onclick: () => this.toggleRelaySettings() }, el('i', { 'aria-hidden': 'true' }), el('span', { text: 'Tor' }));
+    this.relayChipLabel = this.relayChip.querySelector('span');
     const toolbar = el('header', { class: 'browser-toolbar' }, this.backButton, this.forwardButton, this.reloadButton, form, this.relayChip);
     if (onClose) toolbar.append(button('close', 'Close the browser', onClose));
 
-    this.relayInput = el('input', { type: 'url', class: 'browser-relay-input', 'aria-label': 'Relay WebSocket address', spellcheck: 'false', autocomplete: 'off' });
-    this.relaySettings = el('form', { class: 'browser-relay-settings', hidden: true, onsubmit: (e) => { e.preventDefault(); client.setRelay(this.relayInput.value); } },
-      el('label', { text: 'Relay' }), this.relayInput,
-      el('button', { type: 'submit', class: 'browser-button', text: 'Save and test' }),
-      el('p', { text: 'The relay forwards encrypted bytes between this page and websites. TLS runs inside the engine, so the relay cannot read pages, passwords or cookies.' }));
+    this.relayInput = el('input', { type: 'url', class: 'browser-relay-input', 'aria-label': 'Relay WebSocket address', placeholder: 'wss://relay.example/', spellcheck: 'false', autocomplete: 'off', oninput: () => { this.routeRadio('custom').checked = true; } });
+    const option = (value, title, detail, extra) => el('label', { class: 'browser-route' },
+      el('input', { type: 'radio', name: 'browser-route', value }),
+      el('span', {}, el('strong', { text: title }), el('small', { text: detail })), ...(extra ? [extra] : []));
+    this.communityList = el('div', { class: 'browser-route-community' });
+    this.communityButton = el('button', { type: 'button', class: 'browser-button browser-button-quiet', text: 'Find community relays', onclick: () => this.findCommunityRelays() });
+    this.relaySettings = el('form', { class: 'browser-relay-settings', hidden: true, onsubmit: (e) => { e.preventDefault(); this.applyRoute(); } },
+      el('fieldset', {}, el('legend', { text: 'How pages reach websites' }),
+        option(AUTO_ROUTE, 'Automatic', isLocalOrigin() ? 'The relay on this computer when it is running, otherwise the Tor network.' : 'The Tor network. Nothing to install.'),
+        option(TOR_ROUTE, 'Tor network', 'Through three volunteer relays, reached over Snowflake. Slower, and some sites block Tor.'),
+        option(DEFAULT_RELAY, 'Relay on this computer', 'Run evolve-relay; fastest, and sites see your own address.'),
+        el('div', { class: 'browser-route-group' }, el('div', { class: 'browser-route-head' }, el('strong', { text: 'Community relays' }), this.communityButton), this.communityList),
+        option('custom', 'Another relay', '', this.relayInput)),
+      el('div', { class: 'browser-route-actions' }, el('button', { type: 'submit', class: 'browser-button', text: 'Use' })),
+      el('p', { text: 'TLS runs inside the engine, so no relay or Tor exit can read pages, passwords or cookies on https:// sites. They see which sites you connect to: a relay also sees your address; Tor separates the two.' }));
     this.relayHelp = el('div', { class: 'browser-help', role: 'note', hidden: true },
-      el('strong', { text: 'Start the relay: ' }), el('code', { text: 'evolve-relay' }),
+      el('strong', { text: '' }),
       el('p', { text: '' }),
-      el('a', { href: RELAY_DOCS, target: '_blank', rel: 'noopener', text: 'How the relay works' }));
+      el('a', { href: RELAY_DOCS, target: '_blank', rel: 'noopener', text: 'How pages reach websites' }));
+    this.relayHelpTitle = this.relayHelp.querySelector('strong');
     this.relayHelpText = this.relayHelp.querySelector('p');
 
     this.stage = el('div', { class: 'browser-stage' });
@@ -833,18 +893,70 @@ class BrowserView {
 
   relay(s) {
     const state = s.relayOk === null ? 'checking' : s.relayOk ? 'ok' : 'down';
+    const tor = s.relayUrl === TOR_ROUTE;
     this.relayChip.dataset.state = state;
-    this.relayChip.title = state === 'ok' ? `Relay connected: ${s.relayUrl}` : state === 'down' ? `Relay not reachable: ${s.relayUrl}` : `Checking the relay at ${s.relayUrl}`;
-    if (globalThis.document.activeElement !== this.relayInput) this.relayInput.value = s.relayUrl;
+    this.relayChipLabel.textContent = routeLabel(s.relayUrl);
+    const detail = tor && s.network?.route === 'tor' ? s.network.detail : '';
+    this.relayChip.title = tor
+      ? (detail || (state === 'ok' ? 'Connected to the Tor network' : 'Connecting to the Tor network…'))
+      : state === 'ok' ? `Relay connected: ${s.relayUrl}` : state === 'down' ? `Relay not reachable: ${s.relayUrl}` : `Checking the relay at ${s.relayUrl}`;
     this.relayHelp.hidden = state !== 'down';
-    this.relayHelpText.textContent = `This page cannot reach the relay at ${s.relayUrl}. Run it on this computer (it listens on ws://127.0.0.1:8787/), or set another relay with the Relay button. Chrome may ask to let this site reach devices on your local network; allow it.`;
+    if (tor) {
+      this.relayHelpTitle.textContent = 'The Tor network is not reachable. ';
+      this.relayHelpText.textContent = `${detail || 'The Snowflake bridge did not answer.'} Reload to try again, or choose another route with the Tor button (for example evolve-relay on this computer).`;
+    } else {
+      this.relayHelpTitle.textContent = 'Start the relay: ';
+      this.relayHelpText.textContent = `evolve-relay — this page cannot reach the relay at ${s.relayUrl}. Run it on this computer (it listens on ws://127.0.0.1:8787/), or choose the Tor network with the Relay button. Chrome may ask to let this site reach devices on your local network; allow it.`;
+    }
+    if (!this.relaySettings.hidden) return;
+    this.syncRouteForm(s);
   }
 
-  toggleRelaySettings() {
-    const open = this.relaySettings.hidden;
+  routeRadio(value) {
+    return [...this.relaySettings.querySelectorAll('input[name=browser-route]')].find((r) => r.value === value) || null;
+  }
+
+  syncRouteForm(s = this.client.state) {
+    const choice = s.choice || s.relayUrl;
+    const radio = this.routeRadio(choice) || (this.relayInput.value = choice, this.routeRadio('custom'));
+    if (radio) radio.checked = true;
+  }
+
+  applyRoute() {
+    const picked = this.relaySettings.querySelector('input[name=browser-route]:checked')?.value || AUTO_ROUTE;
+    const value = picked === 'custom' ? this.relayInput.value.trim() : picked;
+    if (!value) { this.relayInput.focus(); return; }
+    this.client.setRelay(value);
+    this.toggleRelaySettings(false);
+  }
+
+  async findCommunityRelays() {
+    this.communityButton.disabled = true;
+    this.communityList.replaceChildren(el('small', { text: 'Asking Nostr relays for announced evolve-relay servers…' }));
+    try {
+      const { discoverRelays } = await import('./relay-directory.mjs');
+      const found = (await discoverRelays({})).filter((r) => r.ok);
+      if (!found.length) { this.communityList.replaceChildren(el('small', { text: 'No community relays answered right now. Anyone can run one: evolve-relay --public --announce.' })); return; }
+      this.communityList.replaceChildren(...found.slice(0, 8).map((r) => {
+        const where = [r.region, `${Math.round(r.rttMs)} ms`].filter(Boolean).join(' · ');
+        const label = el('label', { class: 'browser-route' },
+          el('input', { type: 'radio', name: 'browser-route', value: r.url }),
+          el('span', {}, el('strong', { text: r.name || new URL(r.url).host }), el('small', { text: `${new URL(r.url).host}${where ? ' · ' + where : ''} · operator ${String(r.pubkey || '').slice(0, 12)}… sees your address and the sites you open.` })));
+        return label;
+      }));
+      this.syncRouteForm();
+    } catch (e) {
+      this.communityList.replaceChildren(el('small', { text: `Could not look up community relays: ${e.message || e}` }));
+    } finally {
+      this.communityButton.disabled = false;
+    }
+  }
+
+  toggleRelaySettings(force) {
+    const open = typeof force === 'boolean' ? force : this.relaySettings.hidden;
     this.relaySettings.hidden = !open;
     this.relayChip.setAttribute('aria-expanded', String(open));
-    if (open) this.relayInput.focus();
+    if (open) { this.syncRouteForm(); this.relaySettings.querySelector('input[name=browser-route]:checked')?.focus(); }
   }
 
   agentBusy(on) {

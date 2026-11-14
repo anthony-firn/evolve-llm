@@ -24,8 +24,9 @@ function loadStyles() {
 }
 
 /**
- * The relay this deployment provides, from browser-config.json next to this module
- * (`{"relayUrl": "wss://…/"}`), or undefined for a relay on this computer.
+ * The default route this deployment sets, from browser-config.json next to this module
+ * (`{"relayUrl": "auto" | "tor:" | "wss://…/"}`), or undefined for Automatic (Tor, or the
+ * relay on this computer when the workbench is served locally).
  */
 async function siteRelay() {
   try {
@@ -33,7 +34,7 @@ async function siteRelay() {
     if (!response.ok) return undefined;
     const config = await response.json();
     const url = typeof config?.relayUrl === 'string' ? config.relayUrl.trim() : '';
-    return /^wss?:\/\//.test(url) ? url : undefined;
+    return /^wss?:\/\//.test(url) || url === 'tor:' || url === 'auto' ? url : undefined;
   } catch {
     return undefined;
   }

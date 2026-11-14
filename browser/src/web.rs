@@ -68,9 +68,43 @@ impl Browser {
         self.engine.resize(css_width, css_height, dpr);
     }
 
+    /// The route to websites: `"tor:"` for the Tor network, or a Wisp relay's ws(s):// URL.
     #[wasm_bindgen(js_name = setRelay)]
     pub fn set_relay(&self, url: &str) {
         self.client.set_relay(url);
+    }
+
+    /// Log the Tor client's progress (circuit builds, extends, streams) to the worker console.
+    #[wasm_bindgen(js_name = enableTorLog)]
+    pub fn enable_tor_log(&self) {
+        thread_local!(static ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+        if !ON.with(|o| o.replace(true)) {
+            let config = tracing_wasm::WASMLayerConfigBuilder::new()
+                .set_max_level(tracing::Level::INFO)
+                .set_report_logs_in_timings(false)
+                .set_console_config(tracing_wasm::ConsoleConfig::ReportWithoutConsoleColor)
+                .build();
+            tracing_wasm::set_as_global_default_with_config(config);
+        }
+    }
+
+    /// Transfer counters of the Tor route's Snowflake layers (JSON), for diagnostics.
+    #[wasm_bindgen(js_name = torStats)]
+    pub fn tor_stats(&self) -> String {
+        webtor::stats::json()
+    }
+
+    /// Start connecting the route now (Tor takes several seconds to reach its first circuit).
+    #[wasm_bindgen(js_name = prepareNetwork)]
+    pub fn prepare_network(&self) {
+        self.client.prepare();
+    }
+
+    /// Base URLs serving Tor's cached consensus (`consensus.txt.br`, `microdescriptors.txt.br`),
+    /// tried in order when the Tor route starts.
+    #[wasm_bindgen(js_name = setTorConsensus)]
+    pub fn set_tor_consensus(&self, urls: Vec<String>) {
+        crate::net::tor::TorNet::set_consensus_sources(urls);
     }
 
     pub fn navigate(&mut self, url: &str) {

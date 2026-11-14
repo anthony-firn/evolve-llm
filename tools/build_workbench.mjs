@@ -36,6 +36,14 @@ if(process.env.EVOLVE_SKIP_BROWSER!=='1'){
   const wasmOpt=spawnSync('wasm-opt',['--version'],{stdio:'ignore'}).status===0;
   if(wasmOpt)execFileSync('wasm-opt',['-O2','--enable-bulk-memory','--enable-nontrapping-float-to-int','--enable-simd','--enable-sign-ext','--enable-mutable-globals','--enable-reference-types','--enable-multivalue','-o',wasm,wasm],{cwd:root,stdio:'inherit'});
 
+  // Tor's cached consensus (relay list), bundled as the fallback for when webtor's daily snapshot
+  // is unreachable. The engine skips copies older than three days while a fresher one exists.
+  const torOut=new URL('../web/browser-tor/',import.meta.url);await mkdir(torOut,{recursive:true});
+  for(const n of ['consensus.txt.br','microdescriptors.txt.br']){
+    try{const r=await fetch(`https://raw.githubusercontent.com/ethereum/webtor-rs/main/webtor/src/cached/${n}`);if(!r.ok)throw new Error(`HTTP ${r.status}`);await writeFile(new URL(n,torOut),Buffer.from(await r.arrayBuffer()));}
+    catch(e){console.warn(`Tor consensus ${n} not refreshed (${e.message}); keeping the previous copy if there is one`);}
+  }
+
   // Fonts: WebAssembly has no system fonts, so the engine gets these files at start-up.
   const fontSrc=new URL('../browser/fonts/',import.meta.url),fontOut=new URL('../web/browser-fonts/',import.meta.url);
   await rm(fontOut,{recursive:true,force:true});await mkdir(fontOut,{recursive:true});

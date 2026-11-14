@@ -47,6 +47,8 @@ pub enum OutEvent {
     Ime { enabled: bool, x: f32, y: f32, w: f32, h: f32 },
     /// The person clicked a <select>: show a menu. `id` is passed back to chooseOption.
     Select { id: f64, x: f32, y: f32, w: f32, h: f32, multiple: bool, options: Vec<SelectOption> },
+    /// Progress of the network route: route "tor" | "relay", state "connecting" | "ready" | "failed".
+    Network { route: String, state: String, detail: String },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

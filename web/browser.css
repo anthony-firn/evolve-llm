@@ -18,8 +18,22 @@
 .browser-relay[data-state=down] i{background:var(--red)}
 .browser-relay[data-state=checking] i{background:var(--amber);animation:blink 1.2s infinite}
 
-.browser-relay-settings{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--bg-2);font-size:13px}
-.browser-relay-settings p{grid-column:1/-1;margin:0;color:var(--muted);font-size:12px;line-height:1.5}
+.browser-relay-settings{display:grid;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line);background:var(--bg-2);font-size:13px;max-height:60vh;overflow:auto}
+.browser-relay-settings fieldset{display:grid;gap:4px;margin:0;padding:0;border:0;min-width:0}
+.browser-relay-settings legend{padding:0 0 6px;font-weight:600}
+.browser-relay-settings>p{margin:0;color:var(--muted);font-size:12px;line-height:1.5}
+.browser-route{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:4px 10px;padding:7px 9px;border-radius:9px;cursor:pointer}
+.browser-route:hover{background:var(--tint)}
+.browser-route input[type=radio]{margin:3px 0 0}
+.browser-route span{display:grid;gap:1px;min-width:0}
+.browser-route small,.browser-route-community>small{color:var(--muted);font-size:12px;line-height:1.45;overflow-wrap:anywhere}
+.browser-route .browser-relay-input{grid-column:2}
+.browser-route-group{display:grid;gap:2px;padding:7px 9px}
+.browser-route-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.browser-route-community{display:grid;gap:2px}
+.browser-route-community .browser-route{padding-left:0}
+.browser-route-actions{display:flex;justify-content:flex-end}
+.browser-button-quiet{min-height:28px;padding:3px 10px;font-size:12px}
 .browser-relay-input{min-width:0;height:32px;padding:0 10px;border-radius:8px;border:1px solid var(--line-2);background:var(--surface);font:12px var(--mono)}
 .browser-button{min-height:32px;padding:5px 12px;border-radius:8px;border:1px solid var(--line-2);background:var(--tint);font-size:12.5px;font-weight:500;color:var(--text)}
 .browser-button:hover{background:var(--tint-2);border-color:var(--line-3)}
@@ -66,7 +80,6 @@
   .browser-address{order:5;flex-basis:100%}
   .browser-relay span{display:none}
   .browser-relay{padding:0 10px}
-  .browser-relay-settings{grid-template-columns:minmax(0,1fr)}
   .browser-start h2{font-size:1.1rem}
 }
 

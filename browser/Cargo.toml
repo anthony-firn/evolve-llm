@@ -44,6 +44,7 @@ percent-encoding = "2"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 rustls-pki-types = { version = "1", features = ["web"] }
 wasm-bindgen = "=0.2.130"
@@ -51,6 +52,45 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "ErrorEvent", "console"] }
 console_error_panic_hook = "0.1"
+# Tor over Snowflake (vendored webtor; see vendor/README.md)
+webtor = { path = "vendor/webtor" }
+tracing = "0.1"
+tracing-wasm = "0.2"
+tor-proto = { version = "0.37.0", default-features = false }
+
+# webtor needs Arti with its WebAssembly changes (time without std::time::Instant, ?Send
+# async traits). They live in the webtor-rs repository; pin the same commit as vendor/webtor.
+[patch.crates-io]
+tor-basic-utils = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-proto = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-rtcompat = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-async-utils = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-rtmock = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-memquota = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-units = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-log-ratelim = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+safelog = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+slotmap-careful = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+caret = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+oneshot-fused-workaround = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-bytes = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-cell = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-cert = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-config = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-error = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-linkspec = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-llcrypto = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-protover = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-relay-crypto = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-config-path = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-persist = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-general-addr = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-hscrypto = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-key-forge = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-keymgr = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-checkable = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+tor-netdoc = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
+fs-mistrust = { git = "https://github.com/ethereum/webtor-rs", rev = "a2432984ee657fec6905269cdfeb013254ef2c26" }
 
 [profile.release]
 opt-level = 3

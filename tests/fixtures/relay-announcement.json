@@ -1,0 +1,50 @@
+{
+  "id": "05a87be770930b7843041a0eb122d2edf4a98b4223618069d6f96e7b2194ead7",
+  "pubkey": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+  "created_at": 1700000000,
+  "kind": 38787,
+  "tags": [
+    [
+      "d",
+      "wss://relay.example.com/"
+    ],
+    [
+      "u",
+      "wss://relay.example.com/"
+    ],
+    [
+      "proto",
+      "wisp/1"
+    ],
+    [
+      "limits",
+      "8/128/2147483648"
+    ],
+    [
+      "ports",
+      "80,443"
+    ],
+    [
+      "name",
+      "Example relay"
+    ],
+    [
+      "region",
+      "us-west"
+    ],
+    [
+      "contact",
+      "ops@example.com"
+    ],
+    [
+      "expiration",
+      "1700007200"
+    ],
+    [
+      "t",
+      "evolve-relay"
+    ]
+  ],
+  "content": "Wisp v1 relay for Evolve Browser",
+  "sig": "ddd9f4f50104e223dc7184d038a17715b4327257c0c35c461928dfc78eaf83bc23506ebed3796aaeb509951fd3c39392af00e97bfe59a1b186f66afe828373b1"
+}

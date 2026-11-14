@@ -1,10 +1,12 @@
-//! Networking: HTTP/1.1 over TLS over Wisp streams, with browser cookie and CORS rules.
+//! Networking: HTTP/1.1 over TLS over Tor or Wisp streams, with browser cookie and CORS rules.
 
 pub mod http;
 pub mod policy;
 pub mod wisp;
 #[cfg(target_arch = "wasm32")]
 pub mod client;
+#[cfg(target_arch = "wasm32")]
+pub mod tor;
 
 use url::Url;
 

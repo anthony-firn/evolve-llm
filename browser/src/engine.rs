@@ -1681,9 +1681,10 @@ fn encode_form(form: &blitz_traits::net::FormData, enctype: &str) -> (Vec<u8>, S
 }
 
 fn error_page(url: &Url, error: &str) -> String {
-    let relay = error.contains("relay");
-    let help = if relay {
-        "<p>The browser reaches websites through a small relay that forwards encrypted bytes. Start it on this computer with <code>evolve-relay</code>, or set another relay in the browser settings.</p>"
+    let help = if error.contains("Tor") {
+        "<p>The browser reaches websites through the Tor network. Some sites refuse Tor exits or stop answering; try again for a new circuit, or pick another route with the network button.</p>"
+    } else if error.contains("relay") {
+        "<p>The browser reaches websites through a small relay that forwards encrypted bytes. Start it on this computer with <code>evolve-relay</code>, or pick another route with the network button.</p>"
     } else {
         "<p>Check the address, or try again in a moment.</p>"
     };

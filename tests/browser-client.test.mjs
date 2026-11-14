@@ -1,8 +1,8 @@
 // The WASM browser's main-thread client and worker host, with a fake worker and a fake engine.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BrowserClient, addressToUrl, modifierBits } from '../web/browser-client.mjs';
-import { createBrowserHost } from '../web/browser-host.mjs';
+import { BrowserClient, addressToUrl, modifierBits, isLocalOrigin, routeLabel, TOR_ROUTE, AUTO_ROUTE, DEFAULT_RELAY } from '../web/browser-client.mjs';
+import { createBrowserHost, torConsensusSources } from '../web/browser-host.mjs';
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
@@ -54,7 +54,8 @@ test('requests carry ids, start the worker with saved state and reject engine er
   const init = workers[0].messages[0];
   assert.equal(init.type, 'init');
   assert.equal(init.cookies, '[{"a":1}]');
-  assert.equal(init.relayUrl, 'ws://127.0.0.1:8787/');
+  // Automatic route on a public origin is Tor: no relay to install or host.
+  assert.equal(init.relayUrl, 'tor:');
   assert.equal(init.width, 1280);
   await assert.rejects(c.evaluate('bad'), /SyntaxError/);
   await c.ready;
@@ -83,7 +84,7 @@ test('input is fire-and-forget and resize is deduplicated', async () => {
 test('engine events update state, dispatch DOM events and trigger persistence', async () => {
   const { workers, factory } = fakeWorkers((m) => (m.type === 'cookiesJson' ? 'COOKIES' : m.type === 'storageJson' ? 'STORAGE' : null));
   const persistence = memoryPersistence();
-  const c = new BrowserClient({ workerFactory: factory, probe: async () => false, persistence });
+  const c = new BrowserClient({ relayUrl: 'ws://127.0.0.1:8787/', workerFactory: factory, probe: async () => false, persistence });
   await c.ready;
   const seen = [];
   for (const t of ['title', 'url', 'loading', 'console']) c.addEventListener(t, (e) => seen.push([t, e.detail]));
@@ -96,7 +97,7 @@ test('engine events update state, dispatch DOM events and trigger persistence', 
     { type: 'loading', loading: false, url: 'https://example.com/' },
     { type: 'cookies' },
   ]);
-  assert.deepEqual(c.state, { url: 'https://example.com/', title: 'Example Domain', loading: false, relayUrl: 'ws://127.0.0.1:8787/', relayOk: true });
+  assert.deepEqual(c.state, { url: 'https://example.com/', title: 'Example Domain', loading: false, relayUrl: 'ws://127.0.0.1:8787/', relayOk: true, choice: 'ws://127.0.0.1:8787/', network: null });
   assert.equal(seen.length, 5);
   assert.equal(c.console[0].text, 'boom');
   await c.persist();
@@ -104,6 +105,69 @@ test('engine events update state, dispatch DOM events and trigger persistence', 
   w.emit([{ type: 'error', text: 'Could not reach the relay at ws://127.0.0.1:8787/' }]);
   assert.equal(c.state.relayOk, false);
   c.dispose();
+});
+
+test('automatic route: Tor on public origins, the local relay on a local origin when it answers', async () => {
+  assert.equal(isLocalOrigin({ hostname: 'localhost' }), true);
+  assert.equal(isLocalOrigin({ hostname: '127.0.0.1' }), true);
+  assert.equal(isLocalOrigin({ hostname: 'www.evolvetech.dev' }), false);
+  assert.equal(routeLabel(TOR_ROUTE), 'Tor');
+  assert.equal(routeLabel(DEFAULT_RELAY), 'Local relay');
+  assert.equal(routeLabel('wss://relay.example/'), 'Relay');
+  const probes = [];
+  const probe = async (url) => { probes.push(url); return true; };
+  const c = new BrowserClient({ probe, persistence: memoryPersistence() });
+  assert.equal(await c._resolveRoute(AUTO_ROUTE), TOR_ROUTE);
+  assert.deepEqual(probes, [], 'a public origin never probes the local network');
+  const saved = globalThis.location;
+  try {
+    globalThis.location = { hostname: '127.0.0.1' };
+    assert.equal(await c._resolveRoute(AUTO_ROUTE), DEFAULT_RELAY);
+    const down = new BrowserClient({ probe: async () => false, persistence: memoryPersistence() });
+    assert.equal(await down._resolveRoute(AUTO_ROUTE), TOR_ROUTE);
+  } finally {
+    if (saved === undefined) delete globalThis.location; else globalThis.location = saved;
+  }
+  assert.equal(await c._resolveRoute('wss://relay.example/'), 'wss://relay.example/');
+});
+
+test('Tor progress events drive the route state, and switching routes reaches the worker', async () => {
+  const { workers, factory } = fakeWorkers(() => null);
+  const c = client({ workerFactory: factory });
+  await c.ready;
+  const w = workers[0];
+  assert.equal(c.state.relayUrl, TOR_ROUTE);
+  assert.equal(c.state.relayOk, null);
+  const seen = [];
+  c.addEventListener('network', (e) => seen.push(e.detail.state));
+  w.emit([{ type: 'network', route: 'tor', state: 'connecting', detail: 'Connecting to the Tor network…' }]);
+  assert.equal(c.state.relayOk, null);
+  w.emit([{ type: 'network', route: 'tor', state: 'ready', detail: 'Connected to Tor in 7.1 s' }]);
+  assert.equal(c.state.relayOk, true);
+  assert.equal(c.state.network.detail, 'Connected to Tor in 7.1 s');
+  // A Tor failure is not mistaken for a relay failure, and vice versa.
+  w.emit([{ type: 'error', text: 'Could not reach the relay at x' }]);
+  assert.equal(c.state.relayOk, true);
+  w.emit([{ type: 'network', route: 'tor', state: 'failed', detail: 'Could not connect to the Tor network: timeout' }]);
+  assert.equal(c.state.relayOk, false);
+  assert.deepEqual(seen, ['connecting', 'ready', 'failed']);
+  await c.setRelay('wss://relay.example/');
+  assert.equal(w.messages.at(-1).type, 'setRelay');
+  assert.equal(w.messages.at(-1).url, 'wss://relay.example/');
+  assert.equal(c.state.choice, 'wss://relay.example/');
+  assert.equal(c.state.relayOk, true, 'probed');
+  await c.setRelay(AUTO_ROUTE);
+  assert.equal(w.messages.at(-1).url, TOR_ROUTE);
+  assert.equal(c.state.network, null);
+  c.dispose();
+});
+
+test('Tor consensus sources: webtor snapshot first, then the bundled copy', () => {
+  const list = torConsensusSources(['https://mirror.example/tor']);
+  assert.equal(list[0], 'https://mirror.example/tor');
+  assert.equal(list[1], 'https://raw.githubusercontent.com/ethereum/webtor-rs/main/webtor/src/cached');
+  assert.match(list[2], /\/browser-tor\/$/);
+  assert.equal(new Set(list).size, list.length);
 });
 
 test('agent actions resolve with the engine result and report what happened', async () => {

@@ -9,6 +9,17 @@
 
 const AGENT = { snapshot: 'snapshot', agentClick: 'agentClick', agentType: 'agentType', agentSelect: 'agentSelect', agentScroll: 'agentScroll', agentKey: 'agentKey' };
 
+/**
+ * Where the Tor route gets its cached consensus: the snapshot webtor's CI commits daily first,
+ * then the copy bundled next to this module at build time (web/browser-tor/).
+ */
+export function torConsensusSources(extra) {
+  const list = Array.isArray(extra) ? extra.map(String) : [];
+  list.push('https://raw.githubusercontent.com/ethereum/webtor-rs/main/webtor/src/cached');
+  try { list.push(new URL('./browser-tor/', import.meta.url).href); } catch {}
+  return [...new Set(list)];
+}
+
 export function createBrowserHost({ load, post, now = () => performance.now(), setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = (id) => clearTimeout(id) }) {
   let browser = null;
   let canvas = null;
@@ -86,7 +97,10 @@ export function createBrowserHost({ load, post, now = () => performance.now(), s
     if (message.width) size = { width: message.width, height: message.height, dpr: message.dpr || 1 };
     const { Browser, fonts } = await load();
     browser = new Browser(fonts, message.relayUrl, message.cookies ?? null, message.storage ?? null, wake);
+    browser.setTorConsensus?.(torConsensusSources(message.torConsensus));
+    if (message.torLog) browser.enableTorLog?.();
     browser.resize(size.width, size.height, size.dpr);
+    browser.prepareNetwork?.();
     post({ type: 'ready' });
     wake();
     return { fonts: fonts.length };
@@ -104,7 +118,7 @@ export function createBrowserHost({ load, post, now = () => performance.now(), s
     reload: (b) => b.reload(),
     stop: (b) => b.stop(),
     resize: (b, m) => { size = { width: m.width, height: m.height, dpr: m.dpr || 1 }; b.resize(size.width, size.height, size.dpr); },
-    setRelay: (b, m) => b.setRelay(String(m.url)),
+    setRelay: (b, m) => { b.setRelay(String(m.url)); b.prepareNetwork?.(); },
     pointer: (b, m) => b.pointer(m.kind, m.x, m.y, m.button | 0, m.buttons | 0, m.mods | 0),
     wheel: (b, m) => b.wheel(m.x, m.y, m.dx, m.dy, m.deltaMode | 0, m.mods | 0),
     key: (b, m) => b.key(m.kind, String(m.key), String(m.code || ''), m.mods | 0, !!m.repeat),
@@ -113,6 +127,7 @@ export function createBrowserHost({ load, post, now = () => performance.now(), s
     chooseOption: (b, m) => b.chooseOption(Number(m.id), m.index | 0),
     evaluate: (b, m) => b.evaluate(String(m.code)),
     networkLog: (b) => JSON.parse(b.networkLog() || '[]'),
+    torStats: (b) => JSON.parse(b.torStats?.() || '{}'),
     cookiesJson: (b) => b.cookiesJson(),
     storageJson: (b) => b.storageJson(),
     clearData: (b) => b.clearData(),

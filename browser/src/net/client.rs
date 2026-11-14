@@ -1,9 +1,10 @@
-//! The HTTP client: TLS (rustls) over Wisp streams, connection pooling, redirects, cookies with
-//! SameSite rules, CORS for script requests, and content decoding.
+//! The HTTP client: TLS (rustls) over Tor or Wisp streams, connection pooling, redirects, cookies
+//! with SameSite rules, CORS for script requests, and content decoding.
 
 use super::http::{self, Framing, ResponseHead};
 use super::{Credentials, FetchRequest, FetchResponse, LogEntry, Mode, Redirect};
 use super::policy::{self, Context};
+use super::tor::{TorNet, TorStream};
 use super::wisp::{Mux, WispStream};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -20,15 +21,60 @@ use wasm_bindgen::JsCast;
 const PER_HOST: usize = 6;
 const TIMEOUT_MS: i32 = 45_000;
 
+/// The route to websites: `tor:` (the Tor network over Snowflake) or a Wisp relay's ws(s):// URL.
+pub const TOR_ROUTE: &str = "tor:";
+
+enum Route {
+    Tor(TorNet),
+    Wisp(Mux),
+}
+
+impl Route {
+    fn new(url: &str) -> Self {
+        if url.trim().eq_ignore_ascii_case(TOR_ROUTE) || url.trim().eq_ignore_ascii_case("tor") {
+            Route::Tor(TorNet::default())
+        } else {
+            Route::Wisp(Mux::new(url))
+        }
+    }
+    fn url(&self) -> String {
+        match self {
+            Route::Tor(_) => TOR_ROUTE.into(),
+            Route::Wisp(m) => m.url(),
+        }
+    }
+}
+
+/// One TCP connection to a website, over whichever route is in use.
+enum Stream {
+    Tor(TorStream),
+    Wisp(WispStream),
+}
+
+impl Stream {
+    async fn read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            Stream::Tor(s) => s.read().await,
+            Stream::Wisp(s) => s.read().await,
+        }
+    }
+    async fn write(&mut self, data: &[u8]) -> Result<(), String> {
+        match self {
+            Stream::Tor(s) => s.write(data).await,
+            Stream::Wisp(s) => s.write(data).await,
+        }
+    }
+}
+
 struct TlsConn {
     tls: rustls::ClientConnection,
-    io: WispStream,
+    io: Stream,
     pending: Vec<u8>,
     eof: bool,
 }
 
 impl TlsConn {
-    async fn connect(io: WispStream, host: &str, config: Arc<rustls::ClientConfig>) -> Result<Self, String> {
+    async fn connect(io: Stream, host: &str, config: Arc<rustls::ClientConfig>) -> Result<Self, String> {
         let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| format!("Invalid TLS server name {host}"))?;
         let tls = rustls::ClientConnection::new(config, name).map_err(|e| format!("TLS setup failed: {e}"))?;
         let mut conn = TlsConn { tls, io, pending: vec![], eof: false };
@@ -106,7 +152,7 @@ impl TlsConn {
 }
 
 enum Io {
-    Plain(WispStream),
+    Plain(Stream),
     Tls(Box<TlsConn>),
 }
 
@@ -140,7 +186,7 @@ enum ExchangeError {
 }
 
 pub struct Client {
-    mux: RefCell<Mux>,
+    route: RefCell<Route>,
     tls: Arc<rustls::ClientConfig>,
     pub jar: RefCell<cookie_store::CookieStore>,
     pool: RefCell<HashMap<String, Vec<Conn>>>,
@@ -173,7 +219,7 @@ impl Client {
             .map(|jar| jar.with_suffix_list(psl.clone().unwrap()))
             .unwrap_or_else(|| cookie_store::CookieStore::new_with_public_suffix(psl));
         Client {
-            mux: RefCell::new(Mux::new(relay_url)),
+            route: RefCell::new(Route::new(relay_url)),
             tls: tls_config(),
             jar: RefCell::new(jar),
             pool: RefCell::default(),
@@ -189,19 +235,34 @@ impl Client {
         }
     }
 
+    /// Switch the route: `tor:` or a relay's ws(s):// URL. Open connections are dropped.
     pub fn set_relay(&self, url: &str) {
-        if self.mux.borrow().url() != url {
-            *self.mux.borrow_mut() = Mux::new(url);
+        if self.route.borrow().url() != Route::new(url).url() {
+            *self.route.borrow_mut() = Route::new(url);
             self.pool.borrow_mut().clear();
         }
     }
 
+    /// Start connecting the route before the first request needs it (the Tor bridge and first
+    /// circuit take several seconds).
+    pub fn prepare(&self) {
+        if let Route::Tor(t) = &*self.route.borrow() {
+            let t = t.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = t.warm().await;
+            });
+        }
+    }
+
     pub fn relay_url(&self) -> String {
-        self.mux.borrow().url()
+        self.route.borrow().url()
     }
 
     pub fn relay_open(&self) -> bool {
-        self.mux.borrow().is_open()
+        match &*self.route.borrow() {
+            Route::Tor(t) => t.is_ready(),
+            Route::Wisp(m) => m.is_open(),
+        }
     }
 
     pub fn cookies_json(&self) -> String {
@@ -441,7 +502,14 @@ impl Client {
         let host = req.url.host_str().ok_or("URL has no host")?.to_string();
         let port = req.url.port_or_known_default().ok_or("URL has no port")?;
         let tls = req.url.scheme() == "https";
-        let key = format!("{}://{}:{}", req.url.scheme(), host, port);
+        // Over Tor, connections belong to the first-party site they were opened for, so that
+        // site's circuits are never shared with another site (first-party isolation).
+        let first_party = match req.mode {
+            Mode::Navigate => policy::site(&req.url),
+            _ => req.initiator.as_ref().filter(|u| matches!(u.scheme(), "http" | "https")).map(policy::site).unwrap_or_else(|| policy::site(&req.url)),
+        };
+        let tor = matches!(&*self.route.borrow(), Route::Tor(_));
+        let key = if tor { format!("{}://{}:{}#{}", req.url.scheme(), host, port, first_party) } else { format!("{}://{}:{}", req.url.scheme(), host, port) };
         let host_header = match req.url.port() {
             Some(p) => format!("{host}:{p}"),
             None => host.clone(),
@@ -460,7 +528,7 @@ impl Client {
             let reused = pooled.is_some();
             let mut conn = match pooled {
                 Some(c) => c,
-                None => self.open(&host, port, tls).await?,
+                None => self.open(&host, port, tls, &first_party).await?,
             };
             let exchange = self.exchange(&mut conn, &bytes, &req.method);
             match with_timeout(exchange, TIMEOUT_MS).await {
@@ -478,9 +546,19 @@ impl Client {
         Err(format!("Could not complete the request to {host}"))
     }
 
-    async fn open(&self, host: &str, port: u16, tls: bool) -> Result<Conn, String> {
-        let mux = self.mux.borrow().clone();
-        let stream = mux.connect(host, port).await?;
+    async fn open(&self, host: &str, port: u16, tls: bool, first_party: &str) -> Result<Conn, String> {
+        let route = match &*self.route.borrow() {
+            Route::Tor(t) => Route::Tor(t.clone()),
+            Route::Wisp(m) => Route::Wisp(m.clone()),
+        };
+        let stream = match route {
+            // The first Tor connection also waits for the bridge and the first circuit.
+            Route::Tor(t) => match with_timeout(t.connect(host, port, first_party), 90_000).await {
+                Some(stream) => Stream::Tor(stream?),
+                None => return Err(format!("Tor could not reach {host}:{port} within 90 seconds")),
+            },
+            Route::Wisp(m) => Stream::Wisp(m.connect(host, port).await?),
+        };
         let io = if tls {
             match with_timeout(TlsConn::connect(stream, host, self.tls.clone()), 20_000).await {
                 Some(r) => Io::Tls(Box::new(r?)),
