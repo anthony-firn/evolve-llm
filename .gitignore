@@ -8,3 +8,7 @@ node_modules
 /web/shell-pkg/
 /web/pi-agent.bundle.mjs
 /web/pi-agent.bundle.mjs.LEGAL.txt
+/browser/target/
+/browser/relay/target/
+/web/browser-pkg/
+/web/browser-fonts/

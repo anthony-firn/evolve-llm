@@ -1,7 +1,7 @@
 import { LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from './models.js';
 import { renderMarkdown, splitThinking } from './markdown.js';
 import { stripToolCalls } from './tools.js';
-import { wantsDevelopment, wantsSnakeStarter, developmentSummary, createDevelopmentView } from './chat-development.mjs';
+import { wantsDevelopment, wantsSnakeStarter, wantsBrowser, developmentSummary, createDevelopmentView } from './chat-development.mjs';
 
 const $ = (id) => document.getElementById(id);
 const app = $('app');
@@ -480,7 +480,8 @@ async function runDevelopment(question){
     }
     if(m.cancelRequested)throw new Error('Task cancelled.');
     m.content='Pi is working on your request…';scheduleLiveRender();
-    const result=await session.runTask(question.replace(/^\s*pi\s+/i,''),{context,starter,partial:true,onEvent:e=>{m.developmentView.event(e);if(e.type==='starter'){m.content='Your Snake starter is ready below. Pi is applying your request…';scheduleLiveRender();}},preview:(...args)=>m.developmentView.preview(...args)});
+    const browsing=wantsBrowser(question)||(state.lastTaskBrowsing&&!starter&&question.length<240&&!/\b(make|build|create|write|code|game|app)\b/i.test(question));state.lastTaskBrowsing=browsing;
+    const result=await session.runTask(question.replace(/^\s*pi\s+/i,''),{context,starter,partial:true,browser:browsing?()=>import('./browser-session.mjs').then(b=>b.ensureBrowser({show:true})):undefined,confirmBrowserAction:t=>Promise.resolve(confirm(t+'\n\nAllow Pi to do this?')),onEvent:e=>{m.developmentView.event(e);if(e.type==='starter'){m.content='Your Snake starter is ready below. Pi is applying your request…';scheduleLiveRender();}},preview:(...args)=>m.developmentView.preview(...args)});
     m.content=developmentSummary(result,m.developmentView.check);
     m.stats=`Pi · ${result.calls} tool call${result.calls===1?'':'s'} · ${result.changes} file${result.changes===1?'':'s'} changed · ${result.errors} tool errors`;
     m.developmentView.finish(result);
@@ -805,6 +806,15 @@ terminalButton.addEventListener('click',async()=>{
   terminalButton.disabled=true;
   try{await(await ensureWorkbench()).open();}catch(error){$('status-line').textContent=String(error.message||error);}
   finally{terminalButton.disabled=false;}
+});
+// ---- Browser: a web engine compiled to WebAssembly, shared by the person and Pi ----
+const browserButton=el('button',{class:'ghost',type:'button',id:'open-browser',text:'Browser',title:'Web browser engine in WebAssembly, shared with Pi'});
+$('open-settings').before(browserButton);
+browserButton.addEventListener('click',async()=>{
+  browserButton.disabled=true;
+  try{const {openBrowser,isBrowserOpen,closeBrowser}=await import('./browser-session.mjs');if(isBrowserOpen())closeBrowser();else await openBrowser();}
+  catch(error){$('status-line').textContent=String(error.message||error);}
+  finally{browserButton.disabled=false;}
 });
 $('chat-mode').value=recall('evolve-llm-chat-mode')||'auto';
 if(!$('chat-mode').value)$('chat-mode').value='auto';

@@ -144,6 +144,7 @@ API for articles), all from the browser. The page needs only this content securi
 script-src 'self' 'wasm-unsafe-eval'; worker-src 'self';
 connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co
   https://*.wikipedia.org https://api.duckduckgo.com https://r.jina.ai https://s.jina.ai
+  ws://127.0.0.1:* ws://localhost:*
 ```
 
 The browser build uses a whole-program-optimized release profile, 128-bit WebAssembly SIMD and

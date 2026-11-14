@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixture start</title>
+<style>
+  body { font: 16px Arial, sans-serif; margin: 24px; background: #fdfaf3; color: #222; }
+  h1 { color: #b4441a; }
+  .card { display: flex; gap: 12px; padding: 12px; border: 2px solid #b4441a; border-radius: 8px; width: 420px; }
+  input { width: 160px; }
+</style>
+</head>
+<body>
+<h1>Browser fixture</h1>
+<p id="said">Nobody has said hello yet.</p>
+<form class="card" id="hello">
+  <label for="name">Name</label>
+  <input id="name" name="name" placeholder="Your name">
+  <button type="submit" id="go">Say hello</button>
+</form>
+<p><label for="color">Color</label> <select id="color" onchange="document.getElementById('picked').textContent = 'Picked ' + this.value"><option>Red</option><optgroup label="Cool"><option>Green</option><option>Blue</option></optgroup></select></p>
+<p id="picked">Nothing picked.</p>
+<p><a href="second.html" id="next">Second page</a></p>
+<script>
+  document.getElementById('hello').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const name = document.getElementById('name').value || 'nobody';
+    document.getElementById('said').textContent = 'Hello ' + name;
+    document.title = 'Hello ' + name;
+    localStorage.setItem('last', name);
+    document.cookie = 'greeted=' + encodeURIComponent(name) + '; path=/';
+  });
+</script>
+</body>
+</html>

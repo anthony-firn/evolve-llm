@@ -1,13 +1,29 @@
 import { AppPreview } from './preview-client.mjs';
 
+// A web address: https://… or a bare domain such as news.ycombinator.com (not file names like app.js).
+const WEB_ADDRESS = /\bhttps?:\/\/[^\s<>"']+|\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:com|org|net|io|dev|ai|app|edu|gov|co|uk|us|ca|de|fr|eu|news|info|me|tv|xyz|site|tech|blog|so|gg|sh|ly)\b(?:\/[^\s<>"']*)?/i;
+const BROWSER_ACTION = /\b(?:go to|goto|open|visit|browse|navigate|log ?in|sign ?in|click|press|tap|fill (?:in|out)|type|search|look up|check|find|scroll|read|show|order|book|subscribe|download|upvote|vote|reply|post|comment)\b/i;
+const BROWSER_PLACE = /\b(?:website|web ?site|site|web ?page|webpage|browser|tab|link|button|form|account|inbox|dashboard|front page|homepage|home page)\b/i;
+
+/** Whether a request is about using a live web page (Pi with the shared browser). */
+export function wantsBrowser(text) {
+  const t = String(text);
+  if (/^\s*(?:explain|teach|can you explain|tell me (?:how|why|about)|how (?:do|does|can|should) (?:i|you|we|one)\b)/i.test(t) && !/\bhttps?:\/\//i.test(t)) return false;
+  if (/\b(?:in|with|using|on) (?:the|my|your) (?:web )?browser\b/i.test(t)) return true;
+  if (WEB_ADDRESS.test(t)) return !/^\s*(?:what is|what's|define)\s+(?:https?:\/\/)?[\w.-]+\s*\??\s*$/i.test(t);
+  return BROWSER_ACTION.test(t) && BROWSER_PLACE.test(t) && !/\b[\w-]+\.(?:html?|css|[cm]?js|json|txt|md|csv)\b|\/workspace\//i.test(t);
+}
+
 export function wantsDevelopment(text, mode = 'auto', active = false) {
   if (mode === 'chat') return false;
   if (mode === 'build') return true;
   if (/^\s*pi\s+/i.test(text)) return true;
+  if (wantsBrowser(text)) return true;
   if (/^\s*(?:explain|teach|what\b|why\b|how\b|can you explain|tell me (?:how|why|about))/i.test(text)) return false;
   const action = /^\s*(?:(?:can|could|would) you\s+)?code\b/i.test(text) || /\b(make|build|create|develop|implement|write|fix|edit|modify|update|change|add|remove|run|test|preview|open|read|summarize|save|rename|delete)\b/i.test(text);
   const object = /\b[\w-]+\.(?:html?|css|[cm]?js|json|txt|md|csv)\b|\/workspace\//i.test(text) || /\b(app|application|game|snake|website|page|calculator|script|file|code|html|css|javascript|bug|project|workspace)\b/i.test(text);
-  return action && (object || active) || active && /^\s*(?:try again|retry|do it|continue)\b/i.test(text);
+  // While Pi works on a task, short replies (approvals, "I logged in") continue it.
+  return action && (object || active) || active && /^\s*(?:try again|retry|do it|continue|go ahead|yes\b|yep\b|ok(?:ay)?\b|sure\b|confirm(?:ed)?\b|approved?\b|done\b|i(?:'m| am| have|'ve)? (?:logged|signed) in\b|logged in\b|signed in\b)/i.test(text);
 }
 
 export function wantsSnakeStarter(text) {

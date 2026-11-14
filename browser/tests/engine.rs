@@ -1,0 +1,311 @@
+//! End-to-end engine tests against an in-memory site: parsing, CSS, layout, painting,
+//! JavaScript, events, forms, timers, fetch, cookies and modules.
+
+use evolve_browser::testing::Harness;
+
+fn h() -> Harness {
+    Harness::new()
+}
+
+#[test]
+fn renders_a_styled_page() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", "<!doctype html><title>Hello</title><style>body{background:#204080;margin:0} h1{color:white}</style><h1>Hi there</h1>");
+    t.open("https://a.test/");
+    let (w, hgt) = t.engine.frame_size();
+    assert_eq!((w, hgt), (800, 600));
+    let frame = t.engine.take_frame().expect("a frame").to_vec();
+    // Background color fills the viewport
+    let px = &frame[(500 * 800 + 400) * 4..][..4];
+    assert_eq!(&px[..3], &[0x20, 0x40, 0x80], "background pixel {px:?}");
+    // Some white text pixels near the top
+    let white = frame.chunks(4).take(800 * 60).filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200).count();
+    assert!(white > 50, "expected heading text, found {white} white pixels");
+    assert!(t.events.iter().any(|e| matches!(e, evolve_browser::host::OutEvent::Title { title } if title == "Hello")));
+}
+
+#[test]
+fn runs_scripts_in_order_and_mutates_the_dom() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", r#"<p id=out>start</p>
+      <script>window.log = ['inline1'];</script>
+      <script src="/a.js"></script>
+      <script defer src="/d.js"></script>
+      <script>log.push('inline2'); document.getElementById('out').textContent = 'changed';
+        document.addEventListener('DOMContentLoaded', () => log.push('dcl'));
+        window.addEventListener('load', () => log.push('load'));</script>"#);
+    t.site.add("https://a.test/a.js", "text/javascript", "log.push('external')");
+    t.site.add("https://a.test/d.js", "text/javascript", "log.push('deferred')");
+    t.open("https://a.test/");
+    assert_eq!(t.eval("log.join(',')"), "\"inline1,external,inline2,deferred,dcl,load\"");
+    assert_eq!(t.eval("document.querySelector('#out').textContent"), "\"changed\"");
+    assert_eq!(t.eval("document.readyState"), "\"complete\"");
+}
+
+#[test]
+fn dom_apis_behave_like_a_browser() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", "<div id=root class='a b'><span>one</span><span>two</span></div>");
+    t.open("https://a.test/");
+    let checks = [
+        ("document.querySelectorAll('span').length", "2"),
+        ("document.getElementById('root').classList.contains('b')", "true"),
+        ("(() => { const d = document.createElement('div'); d.id = 'new'; d.innerHTML = '<b>bold</b>'; document.body.appendChild(d); return document.querySelector('#new b').textContent })()", "\"bold\""),
+        ("document.getElementById('root').children[1].previousElementSibling.textContent", "\"one\""),
+        ("(() => { const r = document.getElementById('root'); r.dataset.fooBar = 'x'; return r.getAttribute('data-foo-bar') })()", "\"x\""),
+        ("(() => { const r = document.getElementById('root'); r.style.color = 'red'; return r.style.color })()", "\"red\""),
+        ("getComputedStyle(document.getElementById('root')).display", "\"block\""),
+        ("document.getElementById('root').getBoundingClientRect().width > 100", "true"),
+        ("document.body.contains(document.querySelector('span'))", "true"),
+        ("(() => { const f = document.createDocumentFragment(); f.append('a', document.createElement('i')); document.body.append(f); return document.body.lastChild.nodeName })()", "\"I\""),
+        ("new URL('../x?y=1#z', 'https://a.test/p/q').href", "\"https://a.test/x?y=1#z\""),
+        ("new URLSearchParams('a=1&b=two%20words').get('b')", "\"two words\""),
+        ("btoa('hello') + atob('aGk=')", "\"aGVsbG8=hi\""),
+        ("typeof crypto.randomUUID()", "\"string\""),
+        ("(() => { localStorage.setItem('k', 'v'); return localStorage.getItem('k') })()", "\"v\""),
+        ("location.hostname", "\"a.test\""),
+        ("navigator.userAgent.includes('Chrome')", "true"),
+        ("matchMedia('(min-width: 600px)').matches", "true"),
+        ("document.querySelector('span') instanceof HTMLSpanElement && document.body instanceof HTMLElement", "true"),
+        ("new Intl.NumberFormat('en-US').format(1234567.891)", "\"1,234,567.891\""),
+        ("new TextDecoder().decode(new TextEncoder().encode('héllo'))", "\"héllo\""),
+    ];
+    for (code, want) in checks {
+        assert_eq!(t.eval(code), want, "{code}");
+    }
+}
+
+#[test]
+fn clicks_reach_listeners_and_inline_handlers() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", r#"<style>button{width:200px;height:60px;display:block}</style>
+      <button id=b onclick="this.dataset.inline = 'yes'">Press</button><p id=o></p>
+      <script>let n = 0; document.getElementById('b').addEventListener('click', e => { n++; document.getElementById('o').textContent = 'clicked ' + n + ' ' + e.isTrusted; });</script>"#);
+    t.open("https://a.test/");
+    let r: Vec<f64> = serde_json::from_str(&t.eval("JSON.stringify((() => { const r = document.getElementById('b').getBoundingClientRect(); return [r.x, r.y, r.width, r.height] })())").trim_matches('"').replace("\\\"", "\"")).unwrap_or_default();
+    let (x, y) = if r.len() == 4 { ((r[0] + r[2] / 2.0) as f32, (r[1] + r[3] / 2.0) as f32) } else { (100.0, 30.0) };
+    t.engine.pointer("move", x, y, 0, 0, 0);
+    t.engine.pointer("down", x, y, 0, 1, 0);
+    t.engine.pointer("up", x, y, 0, 0, 0);
+    t.settle();
+    assert_eq!(t.eval("document.getElementById('o').textContent"), "\"clicked 1 true\"");
+    assert_eq!(t.eval("document.getElementById('b').dataset.inline"), "\"yes\"");
+}
+
+#[test]
+fn timers_promises_and_animation_frames_run() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", r#"<script>
+      window.seen = [];
+      setTimeout(() => seen.push('timeout'), 20);
+      Promise.resolve().then(() => seen.push('micro'));
+      requestAnimationFrame(() => seen.push('raf'));
+      const id = setInterval(() => { seen.push('tick'); if (seen.filter(s => s === 'tick').length === 2) clearInterval(id); }, 5);
+      (async () => { await new Promise(r => setTimeout(r, 30)); seen.push('async'); })();
+    </script>"#);
+    t.open("https://a.test/");
+    let seen = t.eval("seen.slice().sort().join(',')");
+    assert_eq!(seen, "\"async,micro,raf,tick,tick,timeout\"");
+}
+
+#[test]
+fn fetch_and_xhr_with_cors_rules() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", "<p id=o></p>");
+    t.site.add("https://a.test/data.json", "application/json", r#"{"name":"evolve"}"#);
+    t.site.add("https://other.test/secret", "application/json", r#"{"secret":1}"#);
+    t.site.add_with("https://open.test/public", 200, "application/json", r#"{"open":true}"#, &[("Access-Control-Allow-Origin", "*")]);
+    t.open("https://a.test/");
+    t.eval("fetch('/data.json').then(r => r.json()).then(j => { document.getElementById('o').textContent = j.name })");
+    assert_eq!(t.eval("document.getElementById('o').textContent"), "\"evolve\"");
+    t.eval("window.x = ''; const q = new XMLHttpRequest(); q.open('GET', '/data.json'); q.onload = () => { x = q.status + ':' + JSON.parse(q.responseText).name }; q.send()");
+    assert_eq!(t.eval("x"), "\"200:evolve\"");
+    // Cross-origin without CORS headers is blocked; with ACAO it's readable.
+    t.eval("window.c1 = ''; fetch('https://other.test/secret').then(() => c1 = 'read', e => c1 = 'blocked')");
+    // (The in-memory loader doesn't enforce CORS; the rustls client does. Here we only check the
+    // request was made in CORS mode without credentials.)
+    let req = t.site.requests.borrow().iter().find(|r| r.url.as_str() == "https://other.test/secret").cloned().unwrap();
+    assert_eq!(req.mode, evolve_browser::net::Mode::Cors);
+    assert_eq!(req.credentials, evolve_browser::net::Credentials::SameOrigin);
+}
+
+#[test]
+fn cookies_from_responses_and_script() {
+    let mut t = h();
+    t.site.add_with("https://a.test/", 200, "text/html", "<p>hi</p>", &[("Set-Cookie", "session=abc; HttpOnly; Path=/"), ("Set-Cookie", "theme=dark; Path=/")]);
+    t.open("https://a.test/");
+    assert_eq!(t.eval("document.cookie"), "\"theme=dark\"");
+    t.eval("document.cookie = 'lang=en; path=/'");
+    let c = t.eval("document.cookie");
+    assert!(c.contains("theme=dark") && c.contains("lang=en") && !c.contains("session"), "{c}");
+}
+
+#[test]
+fn forms_submit_with_script_interception() {
+    let mut t = h();
+    t.site.add("https://a.test/login", "text/html", r#"<style>input,button{display:block;width:200px;height:30px}</style>
+      <form id=f method=post action="/session"><input name=user id=u><input type=password name=pass id=p><button id=go>Log in</button></form>
+      <script>window.submits = 0; document.getElementById('f').addEventListener('submit', e => { submits++; if (!window.allow) e.preventDefault(); });</script>"#);
+    t.site.add("https://a.test/session", "text/html", "<title>Welcome</title><p>Logged in</p>");
+    t.open("https://a.test/login");
+    t.eval("document.getElementById('u').value = 'anthony'; document.getElementById('p').value = 'hunter2'");
+    t.eval("document.getElementById('go').click()");
+    assert_eq!(t.eval("submits"), "1");
+    assert!(!t.site.requests.borrow().iter().any(|r| r.url.path() == "/session"), "prevented submit must not navigate");
+    t.eval("window.allow = true; document.getElementById('go').click()");
+    t.settle();
+    let post = t.site.requests.borrow().iter().find(|r| r.url.path() == "/session").cloned().expect("POST sent");
+    assert_eq!(post.method, "POST");
+    assert_eq!(String::from_utf8_lossy(&post.body), "user=anthony&pass=hunter2");
+    assert_eq!(t.eval("document.title"), "\"Welcome\"");
+}
+
+#[test]
+fn dynamic_scripts_and_modules_load() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", r#"<script type=importmap>{"imports":{"lib":"/lib.js"}}</script>
+      <script type=module>import { greet } from 'lib'; import two from './two.js'; window.mod = greet() + two;</script>
+      <script>const s = document.createElement('script'); s.src = '/dyn.js'; s.onload = () => window.dynLoaded = true; document.head.appendChild(s);</script>"#);
+    t.site.add("https://a.test/lib.js", "text/javascript", "export function greet() { return 'hi' }");
+    t.site.add("https://a.test/two.js", "text/javascript", "export default 2");
+    t.site.add("https://a.test/dyn.js", "text/javascript", "window.dyn = 'ran'");
+    t.open("https://a.test/");
+    assert_eq!(t.eval("window.mod"), "\"hi2\"", "console: {:?}", t.console());
+    assert_eq!(t.eval("window.dyn + ',' + window.dynLoaded"), "\"ran,true\"");
+}
+
+#[test]
+fn history_and_fragments() {
+    let mut t = h();
+    t.site.add("https://a.test/one", "text/html", "<a id=l href='/two'>two</a>");
+    t.site.add("https://a.test/two", "text/html", "<title>Two</title><div style='height:3000px'></div><p id=end>end</p>");
+    t.open("https://a.test/one");
+    t.eval("document.getElementById('l').click()");
+    t.settle();
+    assert_eq!(t.eval("location.pathname"), "\"/two\"");
+    t.eval("history.pushState({n:1}, '', '/two?x=1')");
+    assert_eq!(t.eval("location.search"), "\"?x=1\"");
+    t.eval("window.pops = 0; addEventListener('popstate', () => pops++); history.back()");
+    t.settle();
+    assert_eq!(t.eval("location.search + ':' + pops"), "\":1\"");
+    t.engine.back();
+    t.settle();
+    assert_eq!(t.eval("location.pathname"), "\"/one\"");
+}
+
+#[test]
+fn console_errors_are_reported_not_fatal() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", "<script>throw new Error('boom')</script><script>window.after = 1; console.log('still', {a: 1})</script>");
+    t.open("https://a.test/");
+    assert_eq!(t.eval("after"), "1");
+    let console = t.console();
+    assert!(console.iter().any(|l| l.contains("boom")), "{console:?}");
+    assert!(console.iter().any(|l| l.contains("still {a: 1}")), "{console:?}");
+}
+
+#[test]
+fn agent_snapshot_and_actions_share_the_page() {
+    let mut t = h();
+    t.site.add("https://a.test/login", "text/html", r#"<title>Sign in</title><style>input,button{display:block;width:240px;height:30px;margin:6px}</style>
+      <h1>Sign in</h1><form method=post action="/session"><label>Email <input name=email></label><label>Password <input type=password name=pw></label>
+      <select name=plan><option value=free>Free</option><option value=pro>Pro</option></select><button>Continue</button></form>"#);
+    t.site.add("https://a.test/session", "text/html", "<title>Done</title><p>ok</p>");
+    t.open("https://a.test/login");
+    let snap = t.engine.snapshot(4000);
+    let text = snap["text"].as_str().unwrap().to_string();
+    assert!(text.contains("Sign in"), "{text}");
+    let find = |needle: &str| -> usize {
+        let line = text.split('[').find(|seg| seg.to_lowercase().contains(needle)).unwrap_or_else(|| panic!("{needle} in {text}"));
+        line.split(']').next().unwrap().parse().unwrap()
+    };
+    let email = find("email");
+    let pw = find("password");
+    let plan = find("combobox");
+    assert!(!text.contains("hunter"), "{text}");
+    let r = t.engine.agent_type(email, "me@example.com", false);
+    assert_eq!(r["ok"], true, "{r}");
+    t.settle();
+    assert_eq!(t.eval("document.querySelector('[name=email]').value"), "\"me@example.com\"");
+    let r = t.engine.agent_type(pw, "secret", false);
+    assert_eq!(r["error"], "password", "{r}");
+    // The person types the password themselves; the agent's old refs are now stale.
+    t.eval("document.querySelector('[name=pw]').focus()");
+    t.engine.ime_commit("hunter2");
+    t.settle();
+    let r = t.engine.agent_select(plan, "pro");
+    assert_eq!(r["error"], "stale", "{r}");
+    let snap = t.engine.snapshot(4000);
+    let text = snap["text"].as_str().unwrap().to_string();
+    assert!(!text.contains("hunter2"), "password value leaked: {text}");
+    let find = |needle: &str| -> usize {
+        let line = text.split('[').find(|seg| seg.to_lowercase().contains(needle)).unwrap();
+        line.split(']').next().unwrap().parse().unwrap()
+    };
+    let r = t.engine.agent_select(find("combobox"), "pro");
+    assert_eq!(r["ok"], true, "{r}");
+    let r = t.engine.agent_click(find("continue"));
+    assert_eq!(r["ok"], true, "{r}");
+    t.settle();
+    let post = t.site.requests.borrow().iter().find(|r| r.url.path() == "/session").cloned().expect("submitted");
+    assert_eq!(String::from_utf8_lossy(&post.body), "email=me%40example.com&pw=hunter2&plan=pro");
+    assert_eq!(t.eval("document.title"), "\"Done\"");
+}
+
+#[test]
+fn replaced_children_stay_usable_by_scripts() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", "<div id=a><b>1</b><i>2</i></div><div id=b></div>");
+    t.open("https://a.test/");
+    // jQuery's buildFragment pattern: keep childNodes, clear the container, move them elsewhere.
+    let r = t.eval("(() => { const a = document.getElementById('a'); const kids = [...a.childNodes]; a.textContent = ''; const b = document.getElementById('b'); kids.forEach(k => b.appendChild(k)); const tmp = document.createElement('div'); tmp.innerHTML = '<u>3</u>'; const u = tmp.firstChild; tmp.innerHTML = ''; b.appendChild(u); return b.textContent + '|' + a.childNodes.length })()");
+    assert_eq!(r, "\"123|0\"");
+}
+
+#[test]
+fn person_select_menu_and_choice() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", "<style>select{width:200px;height:30px}</style><select id=s onchange=\"document.title='picked '+this.value\"><option value=a>Alpha</option><optgroup label=G><option value=b>Beta</option></optgroup></select>");
+    t.open("https://a.test/");
+    t.events.clear();
+    t.engine.pointer("move", 20.0, 20.0, 0, 0, 0);
+    t.engine.pointer("down", 20.0, 20.0, 0, 1, 0);
+    t.engine.pointer("up", 20.0, 20.0, 0, 0, 0);
+    t.settle();
+    let menu = t.events.iter().find_map(|e| match e { evolve_browser::host::OutEvent::Select { id, options, .. } => Some((*id, options.clone())), _ => None }).expect("select menu");
+    assert_eq!(menu.1.len(), 2);
+    assert_eq!(menu.1[1].group.as_deref(), Some("G"));
+    assert!(menu.1[0].selected);
+    t.engine.choose_option(menu.0, 1);
+    t.settle();
+    assert_eq!(t.eval("document.getElementById('s').value + ',' + document.title"), "\"b,picked b\"");
+}
+
+#[test]
+fn typing_inserts_each_character_once() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", "<style>input{width:200px;height:30px}</style><input id=i><script>window.keys='';document.getElementById('i').addEventListener('keydown',e=>keys+=e.key)</script>");
+    t.open("https://a.test/");
+    t.engine.pointer("down", 20.0, 15.0, 0, 1, 0);
+    t.engine.pointer("up", 20.0, 15.0, 0, 0, 0);
+    for c in ["h", "i"] {
+        t.engine.key("down", c, &format!("Key{}", c.to_uppercase()), 0, false);
+        t.engine.ime_commit(c);
+        t.engine.key("up", c, &format!("Key{}", c.to_uppercase()), 0, false);
+    }
+    t.engine.key("down", "Backspace", "Backspace", 0, false);
+    t.engine.key("up", "Backspace", "Backspace", 0, false);
+    t.settle();
+    assert_eq!(t.eval("document.getElementById('i').value + ':' + keys"), "\"h:hiBackspace\"");
+}
+
+#[test]
+fn import_meta_and_blob_scripts() {
+    let mut t = h();
+    t.site.add("https://a.test/app/", "text/html", r#"<script type=module src="/assets/main.js"></script>
+      <script>const b = new Blob(["window.fromBlob = 'yes'"], {type: 'text/javascript'}); const s = document.createElement('script'); s.src = URL.createObjectURL(b); document.head.appendChild(s);</script>"#);
+    t.site.add("https://a.test/assets/main.js", "text/javascript", "window.meta = import.meta.url + '|' + import.meta.resolve('./chunk.js');");
+    t.open("https://a.test/app/");
+    assert_eq!(t.eval("window.meta"), "\"https://a.test/assets/main.js|https://a.test/assets/chunk.js\"", "{:?}", t.console());
+    assert_eq!(t.eval("window.fromBlob"), "\"yes\"");
+}

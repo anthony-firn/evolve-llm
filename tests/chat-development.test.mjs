@@ -30,3 +30,14 @@ test('development summaries describe actual artifacts and preserve partial failu
  const deleted=developmentSummary({artifacts:[],removed:['/workspace/old.txt'],errors:0},null);
  assert.match(deleted,/Deleted old.txt/);assert.doesNotMatch(deleted,/No workspace files changed|did not produce/);
 });
+
+import { wantsBrowser } from '../web/chat-development.mjs';
+test('Auto sends live-web requests to Pi with the browser and keeps file and chat requests as before',()=>{
+ for(const text of ['Go to news.ycombinator.com and log in','Open https://example.com','What is on the front page of news.ycombinator.com?','Log in to my GitHub account in the browser','Click the login button on the website','Search wikipedia.org for Rust','Summarize https://example.com/post']){
+  assert.equal(wantsBrowser(text),true,text);assert.equal(wantsDevelopment(text),true,text);
+ }
+ for(const text of ['Read README.txt and save a summary','Fix the bug in app.js','Open game.html','Make me a Snake game','How do I log in to github.com?','What is example.com?','Explain how websites work','Hello'])assert.equal(wantsBrowser(text),false,text);
+ assert.equal(wantsDevelopment('Open https://example.com','chat'),false);
+ for(const text of ['Yes, post it','I logged in','Go ahead','ok'])assert.equal(wantsDevelopment(text,'auto',true),true,text);
+ assert.equal(wantsDevelopment('Yes','auto',false),false);
+});

@@ -1,0 +1,64 @@
+[package]
+name = "evolve-browser"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A web browser engine compiled to WebAssembly: Stylo CSS, Taffy layout, Parley text, Boa JavaScript, rustls networking"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["svg", "woff", "accessibility", "floats"] }
+blitz-html = "=0.3.0-beta.4"
+blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
+blitz-traits = "=0.3.0-beta.4"
+anyrender = "0.14"
+anyrender_vello_cpu = { version = "0.18", default-features = false }
+boa_engine = { version = "0.22", features = ["js", "annex-b"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
+httparse = "1"
+cookie_store = { version = "0.22", features = ["serde_json", "public_suffix", "wasm-bindgen"] }
+cookie = "0.18"
+publicsuffix = "2.3"
+futures = "0.3"
+keyboard-types = "0.8"
+smallvec = "1"
+kurbo = "0.13"
+parley = { version = "0.12", default-features = false, features = ["std"] }
+peniko = "0.6"
+encoding_rs = "0.8"
+cursor-icon = "1"
+getrandom = "0.4"
+flate2 = "1"
+brotli-decompressor = "5"
+url = "2"
+http = "1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+html-escape = "0.2"
+percent-encoding = "2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+rustls-pki-types = { version = "1", features = ["web"] }
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "ErrorEvent", "console"] }
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[dev-dependencies]
+png = "0.18"

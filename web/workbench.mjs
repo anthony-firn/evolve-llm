@@ -115,7 +115,7 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
         await showPreview(starterPath,{signal:task.signal,smoke:true});
       }
       const {createPiTask}=await import('./pi-agent.bundle.mjs');
-      agent=createPiTask({turn,workspace,network,preview:showPreview,maxTokens:Number(tokenLimit.value),modelName:modelName(),onEvent:emit});
+      agent=createPiTask({turn,workspace,network,preview:showPreview,maxTokens:Number(tokenLimit.value),modelName:modelName(),onEvent:emit,browser:options.browser,confirmBrowserAction:options.confirmBrowserAction});
       const signal=task.signal,abort=()=>agent?.abort();signal.addEventListener('abort',abort,{once:true});
       try{
         signal.throwIfAborted();

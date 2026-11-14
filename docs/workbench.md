@@ -51,6 +51,9 @@ Use **Import text**, **Export**, and **Restore** to move files between devices. 
 be cleared or evicted, so export important work. Models and files remain on the visitor's device;
 static hosting can be mirrored or served locally without an inference server.
 
+The **Browser** button opens a real web browser engine that Pi can share with you; see
+[browser.md](browser.md).
+
 ## Pi with the loaded model
 
 Load a tool-capable GGUF such as Qwen, wait for Ready, then enter:

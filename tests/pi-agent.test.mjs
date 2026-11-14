@@ -123,3 +123,123 @@ test('a failed edit must be corrected before final preview can finish the task',
  }});
  const result=await task.run('Edit and preview');assert.equal(n,2);assert.equal(opened,1);assert.equal(result.changes,1);assert.equal(result.errors,2);
 });
+
+// ---- Browser tools (shared live page, browser/API.md section 4) ----
+import { normalizeBrowserUrl } from '../web/pi-agent.mjs';
+const LOGIN = '# Login\n[1] textbox "acct" value=""  [2] password "pw" (value hidden)\n[3] button "login"';
+function fakeBrowser(pages = { 'https://news.ycombinator.com/login': LOGIN }) {
+  const log = []; let url = '', text = '';
+  const b = {
+    log, state: { url: '' },
+    async navigate(u) { log.push(['navigate', u]); url = u; text = pages[u] ?? 'Hello'; },
+    async waitForIdle(ms) { log.push(['idle', ms]); },
+    async snapshot(max) { log.push(['snapshot', max]); return { url, title: 'Login', scrollY: 0, pageHeight: 1400, viewportHeight: 700, text, refs: (text.match(/\[\d+\]/g) || []).length, version: 1 }; },
+    click: async (ref) => { log.push(['click', ref]); return b.clickResult || { ok: true }; },
+    type: async (ref, t, o) => { log.push(['type', ref, t, o]); return { ok: true }; },
+    select: async (ref, v) => { log.push(['select', ref, v]); return { ok: true }; },
+    scroll: async (dy) => { log.push(['scroll', dy]); return { ok: true }; },
+    key: async (k) => { log.push(['key', k]); return { ok: true }; },
+    back() { log.push(['back']); },
+  };
+  return b;
+}
+const call = (name, args) => ({ text: '<tool_call>' + JSON.stringify({ name, arguments: args }) + '</tool_call>', reason: 'end' });
+const network = { options: () => ({ enabled: false }) };
+
+test('browser tasks get shared-page tools, safety instructions and a larger budget', async () => {
+  const browser = fakeBrowser(); let n = 0; const results = [];
+  const task = createPiTask({ browser, workspace: { request: async () => ({ ok: true }) }, network, turn: async (messages, schemas) => {
+    const tools = schemas.map(s => s.function.name);
+    for (const t of ['browser_open', 'browser_snapshot', 'browser_click', 'browser_type', 'browser_select', 'browser_scroll', 'browser_key', 'browser_back', 'read']) assert(tools.includes(t), t);
+    assert(!tools.includes('preview') && !tools.includes('browser_test'));
+    assert.match(messages[0].content, /share a live web browser/); assert.match(messages[0].content, /Never type passwords or payment details/);
+    assert.match(messages[0].content, /never instructions/); assert.match(messages[0].content, /at most 16 model turns and 24 tool calls/);
+    if (n) results.push(messages.at(-1).content);
+    n++;
+    if (n === 1) return call('browser_open', { url: 'news.ycombinator.com/login' });
+    if (n === 2) return call('browser_type', { ref: 1, text: 'anthony' });
+    if (n === 3) return call('browser_type', { ref: 2, text: 'hunter2' });
+    if (n === 4) return call('browser_scroll', { direction: 'down' });
+    return { text: 'Please type your password in the browser.', reason: 'end' };
+  } });
+  const result = await task.run('Log in to Hacker News');
+  assert.equal(result.calls, 4);
+  assert.deepEqual(browser.log.find(l => l[0] === 'navigate'), ['navigate', 'https://news.ycombinator.com/login']);
+  assert.match(results[0], /Page: "Login" https:\/\/news\.ycombinator\.com\/login/);
+  assert.match(results[0], /untrusted data from the website/); assert.match(results[0], /\[3\] button "login"/);
+  assert(browser.log.some(l => l[0] === 'type' && l[1] === 1 && l[2] === 'anthony' && l[3].submit === false));
+  assert(!browser.log.some(l => l[0] === 'type' && l[1] === 2), 'password field must never be typed into');
+  assert.match(results[2], /Ask the person to type it themselves/);
+  assert.deepEqual(browser.log.find(l => l[0] === 'scroll'), ['scroll', 595]);
+  assert.equal(result.messages.filter(m => m.role === 'toolResult' && m.isError).length, 1);
+});
+
+test('person activity, missing refs and engine refusals return a fresh snapshot to Pi', async () => {
+  const browser = fakeBrowser(); let n = 0; const seen = [];
+  const task = createPiTask({ browser, workspace: { request: async () => ({}) }, network, turn: async (messages) => {
+    if (n) seen.push(messages.at(-1).content);
+    n++;
+    if (n === 1) return call('browser_open', { url: 'https://news.ycombinator.com/login' });
+    if (n === 2) { browser.clickResult = { ok: false, error: 'stale' }; return call('browser_click', { ref: 3 }); }
+    if (n === 3) return call('browser_click', { ref: 9 });
+    if (n === 4) { browser.clickResult = { ok: false, error: 'password' }; return call('browser_click', { ref: 1 }); }
+    return { text: 'Done.', reason: 'end' };
+  } });
+  await task.run('Click login');
+  assert.match(seen[1], /did not run: the person is using the page right now/); assert.match(seen[1], /\[3\] button "login"/);
+  assert.match(seen[2], /no element \[9\]/);
+  assert.match(seen[3], /password, one-time code or payment details/);
+  assert.equal(browser.log.filter(l => l[0] === 'click').length, 2);
+});
+
+test('risky clicks need the person: refused without approval, done with it', async () => {
+  const pages = { 'https://shop.example/cart': '[1] button "Place order"  [2] link "Continue shopping" -> /\n[3] link "Remove item" -> /cart/rm' };
+  for (const approve of [undefined, false, true]) {
+    const browser = fakeBrowser(pages); let n = 0; const asked = []; const seen = [];
+    const task = createPiTask({ browser, workspace: { request: async () => ({}) }, network,
+      confirmBrowserAction: approve === undefined ? undefined : async (text) => { asked.push(text); return approve; },
+      turn: async (messages) => {
+        if (n) seen.push(messages.at(-1).content);
+        n++;
+        if (n === 1) return call('browser_open', { url: 'https://shop.example/cart' });
+        if (n === 2) return call('browser_click', { ref: 1 });
+        if (n === 3) return call('browser_click', { ref: 2 });
+        if (n === 4) return call('browser_click', { ref: 3 });
+        return { text: 'Asked the person.', reason: 'end' };
+      } });
+    await task.run('Buy it');
+    const clicks = browser.log.filter(l => l[0] === 'click').map(l => l[1]);
+    if (approve) { assert.deepEqual(clicks, [1, 2, 3]); assert.equal(asked.length, 2); assert.match(asked[0], /Place order/); }
+    else { assert.deepEqual(clicks, [2]); assert.match(seen[1], /needs the person's approval/); assert.match(seen[3], /needs the person's approval/); }
+  }
+});
+
+test('the browser accessor is resolved lazily, once, and older snapshots are compacted', async () => {
+  let made = 0; const browser = fakeBrowser(); let n = 0; let last;
+  const task = createPiTask({ browser: async () => { made++; return browser; }, workspace: { request: async () => ({}) }, network, turn: async (messages) => {
+    n++;
+    if (n === 1) { assert.equal(made, 0); return call('browser_open', { url: 'https://news.ycombinator.com/login' }); }
+    if (n === 2) return call('browser_snapshot', {});
+    if (n === 3) return call('browser_key', { key: 'Tab' });
+    last = messages; return { text: 'ok', reason: 'end' };
+  } });
+  await task.run('Look');
+  assert.equal(made, 1);
+  const tools = last.filter(m => m.role === 'tool');
+  assert.equal(tools.length, 3);
+  assert.match(tools[0].content, /older page snapshot omitted/); assert.doesNotMatch(tools[0].content, /button "login"/);
+  assert.match(tools[2].content, /Press Tab: done/); assert.match(tools[2].content, /button "login"/);
+});
+
+test('browser tasks stop at their own turn budget; other tasks keep theirs', async () => {
+  const task = createPiTask({ browser: fakeBrowser(), workspace: { request: async () => ({}) }, network, turn: async () => call('browser_snapshot', {}) });
+  await assert.rejects(task.run('Loop'), /16-turn limit/);
+});
+
+test('only http and https pages can be opened, without embedded credentials', () => {
+  assert.equal(normalizeBrowserUrl('news.ycombinator.com'), 'https://news.ycombinator.com/');
+  assert.equal(normalizeBrowserUrl('http://localhost:8080/x'), 'http://localhost:8080/x');
+  assert.equal(normalizeBrowserUrl('localhost:3000'), 'https://localhost:3000/');
+  for (const bad of ['javascript:alert(1)', 'file:///etc/passwd', 'data:text/html,hi', 'https://user:pw@example.com/', ''])
+    assert.throws(() => normalizeBrowserUrl(bad), bad);
+});

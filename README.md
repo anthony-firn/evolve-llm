@@ -22,6 +22,14 @@ tool-capable model, then enter `pi <task>` to run Pi agent core with sandbox fil
 tools. Web access is explicit; there is no host shell or server inference. See
 [commands, limits, permissions and self-hosting](docs/workbench.md).
 
+## Web browser
+
+**Browser** opens a web browser engine compiled to WebAssembly: Blitz with Stylo CSS and Taffy
+layout, Boa JavaScript, and rustls TLS, all in a worker. It loads real sites, keeps cookies and
+logins on this device, and you and Pi can use the same live page at once; Pi never types
+passwords. Sites are reached through `evolve-relay`, a small local relay that only forwards
+encrypted bytes. See [docs/browser.md](docs/browser.md).
+
 ## What it does
 
 - **Downloads a model once.** Choose from the catalog, browse any Hugging Face repository, or
@@ -161,12 +169,14 @@ python3 -m http.server 8080 --directory dist
 ```
 
 Open http://localhost:8080. Any static host works. The app needs these content security policy
-sources and no inline scripts (the last four only for web access):
+sources and no inline scripts (the Jina, DuckDuckGo and Wikipedia sources only for web access, the
+`ws://` sources only for the browser's local relay):
 
 ```
 script-src 'self' 'wasm-unsafe-eval'; worker-src 'self';
 connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co
   https://*.wikipedia.org https://api.duckduckgo.com https://r.jina.ai https://s.jina.ai
+  ws://127.0.0.1:* ws://localhost:*
 ```
 
 The native command line runs the same engine, reading weights from disk as it needs them:
