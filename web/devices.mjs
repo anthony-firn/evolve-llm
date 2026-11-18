@@ -239,7 +239,14 @@ export class Helpers {
     const h = { id, link, name: 'Device', capacity: 0, gpu: '', stage: null, state: 'connecting', progress: null, pending: new Map() };
     this.list.push(h);
     link.onMessage = (m, bytes) => this.message(h, m, bytes);
-    link.send({ t: 'hello', v: PAIR_PROTOCOL, role: 'main' }).catch(() => {});
+    // The helper answers with its own hello; ask again until it has.
+    const hello = () => link.send({ t: 'hello', v: PAIR_PROTOCOL, role: 'main' }).catch(() => {});
+    hello();
+    let tries = 0;
+    const retry = setInterval(() => {
+      if (h.state !== 'connecting' || !this.list.includes(h) || ++tries > 10) clearInterval(retry);
+      else hello();
+    }, 3000);
     this.onChange();
   }
 
@@ -341,14 +348,21 @@ export class Helping {
     this.calls = new Map();
     this.seq = 0;
     this.served = 0;
+    this.about = about;
     link.onMessage = (m, bytes) => this.message(m, bytes);
     this.onWorker = (e) => this.fromWorker(e.data || {});
     worker.addEventListener('message', this.onWorker);
-    link.send({ t: 'hello', v: PAIR_PROTOCOL, role: 'helper', ...about }).catch(() => {});
+    this.hello();
+  }
+
+  hello() {
+    this.link.send({ ...this.about, t: 'hello', v: PAIR_PROTOCOL, role: 'helper' }).catch(() => {});
   }
 
   message(m, bytes) {
-    if (m.t === 'load') {
+    if (m.t === 'hello' && m.role === 'main') {
+      this.hello();
+    } else if (m.t === 'load') {
       this.loadId = m.id;
       this.stage = m.stage;
       this.served = 0;

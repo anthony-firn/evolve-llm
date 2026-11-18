@@ -50,6 +50,8 @@ export class Signal {
     ws.onopen = () => {
       const since = this.now() - 30;
       ws.send(JSON.stringify(['REQ', 'swarm', { kinds: [SIGNAL_KIND], '#t': this.topics, since }, { kinds: [SIGNAL_KIND], '#p': [this.pubkey], since }]));
+      // Presence is not kept by relays: say it again on each relay as it connects.
+      if (this.presence !== undefined) this.publish(this.topics.map((t) => ['t', t]), this.presence, ws).catch(() => {});
     };
     ws.onmessage = (m) => this.receive(m.data);
     ws.onclose = () => {
@@ -105,16 +107,18 @@ export class Signal {
     return JSON.parse(new TextDecoder().decode(pt));
   }
 
-  async publish(tags, content) {
+  /** Sign and send an event to every connected relay, or only to `only`. */
+  async publish(tags, content, only = null) {
     const ev = { pubkey: this.pubkey, created_at: this.now(), kind: SIGNAL_KIND, tags, content };
     ev.id = await eventId(ev);
     ev.sig = bytesToHex(await schnorr.signAsync(hexToBytes(ev.id), this.secret));
     const text = JSON.stringify(['EVENT', ev]);
-    for (const ws of this.sockets.values()) if (ws.readyState === 1) ws.send(text);
+    for (const ws of only ? [only] : this.sockets.values()) if (ws.readyState === 1) ws.send(text);
   }
 
   /** Say which files (topics) this page shares, optionally with a short text. */
   announce(content = '') {
+    this.presence = content;
     return this.publish(this.topics.map((t) => ['t', t]), content);
   }
 
