@@ -1,10 +1,11 @@
 // Runs the WebAssembly engine off the main thread: downloads, GPU upload and generation.
-import init, { create_loader, inspect, inspect_parts } from './pkg/evolve_llm.js';
+import init, { create_loader, inspect, inspect_parts, layer_bytes } from './pkg/evolve_llm.js';
 import { formatBytes } from './models.js';
 import { assistantWithCalls, nativeToolFormat, toolResult, toolTransport } from './tool-transport.mjs';
 import { openModelReaders, storageError } from './model-readers.mjs';
 import { RangeCache, RemoteModel } from './remote-reader.mjs';
 import { CHUNK as SWARM_CHUNK } from './swarm-protocol.mjs';
+import { capacityOf, planSplit } from './split.mjs';
 import { TOOL_SCHEMAS, displayText, parseToolCalls, rawPiece, runTool, schemaTypes, webSearch } from './tools.js';
 
 const CHUNK = 16 << 20; // bytes read from the file per upload call
@@ -12,6 +13,9 @@ const post = (type, data = {}) => self.postMessage({ type, ...data });
 
 let wasm = null;
 let chat = null;
+// Layers this device runs for the chat on another of the person's devices.
+let layers = null;
+let stageQueue = Promise.resolve();
 // Synchronous readers of the loaded model's files, kept open while it runs: weights that do not
 // fit on the GPU are read again from them.
 let readers = [];
@@ -216,6 +220,19 @@ async function download(entry) {
 
 // ---- Reading models that stay on Hugging Face ----
 
+// With the person's other devices running later layers, each pass hands its hidden state to the
+// page, which sends it through them and returns the state after the last layer.
+let remoteSeq = 0;
+const remoteCalls = new Map();
+function remoteForward(hidden, n, pos0) {
+  return new Promise((resolve, reject) => {
+    const id = ++remoteSeq;
+    remoteCalls.set(id, { resolve, reject });
+    self.postMessage({ type: 'remote-forward', id, hidden: hidden.buffer, n, pos0 }, [hidden.buffer]);
+  });
+}
+const remoteControl = (op) => post('remote-control', { op });
+
 // The weight swarm runs on the page (WebRTC is not available in workers). With sharing on, the
 // network reader asks the page for chunks before going to Hugging Face, and tells it what it
 // cached, so the page can serve those chunks to other visitors.
@@ -312,7 +329,7 @@ function readHeader(reader) {
   }
 }
 
-async function loadModel(source, wantCtx, lowPower, budgetPref) {
+async function loadModel(source, wantCtx, lowPower, budgetPref, { stage = null, split = null } = {}) {
   readers = source.remote ? source.remote.readers() : await openModelReaders(source, modelsDir);
   remote = source.remote || null;
   // Headers come over the network together; later reads of a longer header fall back to
@@ -342,9 +359,18 @@ async function loadModel(source, wantCtx, lowPower, budgetPref) {
   const budget = budgetPref === 'all' ? null
     : budgetPref && budgetPref !== 'auto' ? Number(budgetPref) * 2 ** 30
     : (model.fast_bytes > AUTO ? AUTO : null);
+  // Shared with the person's other devices (`split`: what each can hold): this one keeps the
+  // embedding, the head and the first layers, and the page has the others load the rest.
+  if (split?.length) {
+    const lb = JSON.parse(layer_bytes(headers));
+    const stages = planSplit(lb, [capacityOf(budgetPref), ...split]);
+    const helpers = stages.slice(1).map((s, helper) => ({ helper, stage: { first: s.first, end: s.end, embed: false, head: false } })).filter((h) => h.stage.end > h.stage.first);
+    if (helpers.length) stage = { first: 0, end: stages[0].end, embed: true, head: true };
+    post('split-plan', { helpers, ctx, n_layer: lb.n_layer, mine: stage });
+  }
   let loader;
   try {
-    loader = await create_loader(headers, JSON.stringify({ low_power: lowPower, budget }));
+    loader = await create_loader(headers, JSON.stringify({ low_power: lowPower, budget, stage }));
   } catch (e) {
     throw new Error(`Could not start the model on the GPU: ${e?.message || e}`);
   }
@@ -382,6 +408,11 @@ async function loadModel(source, wantCtx, lowPower, budgetPref) {
     const net = remote;
     loader.set_source((file, offset, target) => files[file].read(offset, target), net ? (quads) => net.prefetch(quads) : undefined);
     post('progress', { phase: 'prepare', loaded: total, total });
+    if (stage && !stage.embed) {
+      layers = loader.finish_stage(ctx);
+      return { stageLoaded: true, stage, placement: JSON.parse(layers.placement()) };
+    }
+    if (stage) loader.set_remote(remoteForward, remoteControl);
     chat = loader.finish(ctx);
     try {
       toolTemplate = nativeToolFormat(chat.render(JSON.stringify([{ role: 'user', content: 'Hi' }]), JSON.stringify({ tools: TOOL_SCHEMAS })));
@@ -410,6 +441,12 @@ function unload() {
     chat.free();
     chat = null;
   }
+  if (layers) {
+    layers.free();
+    layers = null;
+  }
+  for (const c of remoteCalls.values()) c.reject(new Error('The model was unloaded.'));
+  remoteCalls.clear();
   closeReaders();
 }
 
@@ -549,7 +586,7 @@ const handlers = {
   async adapter({ gpu }) {
     post('adapter', { adapter: await describeAdapter(gpu) });
   },
-  async load({ source, ctx, gpu, gpuMemory, cacheGb, share }) {
+  async load({ source, ctx, gpu, gpuMemory, cacheGb, share, stage, split }) {
     cancelLoad = false;
     swarmOn = Boolean(share);
     unload();
@@ -563,7 +600,11 @@ const handlers = {
       files = { names: await download(source) };
       post('cache', await listCached().catch(() => ({ models: [], supported: false })));
     }
-    const result = await loadModel(files, ctx, gpu === 'low-power', gpuMemory);
+    const result = await loadModel(files, ctx, gpu === 'low-power', gpuMemory, { stage, split });
+    if (result.stageLoaded) {
+      post('stage-loaded', { stage: result.stage, placement: result.placement });
+      return;
+    }
     const name = source.kind === 'file' ? (source.files || [source.file])[0].name : null;
     post('loaded', { ...result, source: source.kind === 'file' ? { kind: 'file', name } : { kind: 'hf', key: source.key, id: source.id } });
   },
@@ -572,6 +613,31 @@ const handlers = {
   },
   network_policy({ enabled }) { webAbort.abort(); },
   swarm({ on }) { swarmOn = Boolean(on); },
+  'remote-result'({ id, hidden, error }) {
+    const c = remoteCalls.get(id);
+    if (!c) return;
+    remoteCalls.delete(id);
+    if (error) c.reject(new Error(error));
+    else c.resolve(new Float32Array(hidden));
+  },
+  // A helper's layers, one call at a time.
+  'stage-forward'({ id, hidden, n, pos0 }) {
+    stageQueue = stageQueue.then(async () => {
+      try {
+        if (!layers) throw new Error('No layers are loaded on this device.');
+        const out = await layers.forward(new Float32Array(hidden), n, pos0);
+        self.postMessage({ type: 'stage-result', id, hidden: out.buffer }, [out.buffer]);
+      } catch (e) {
+        post('error', { during: 'stage-forward', id, message: e?.message || String(e) });
+      }
+    });
+  },
+  'stage-control'({ op }) {
+    stageQueue = stageQueue.then(() => {
+      if (op === 'snapshot') layers?.snapshot();
+      if (op === 'restore') layers?.restore();
+    });
+  },
   'swarm-data'({ id, bytes }) {
     const resolve = swarmCalls.get(id);
     if (!resolve) return;

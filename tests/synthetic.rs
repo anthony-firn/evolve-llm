@@ -246,6 +246,7 @@ fn every_format_matches_the_cpu_reference_on_the_gpu() {
             binding_limit: limit,
             layout: if compact { quant::Layout::Blocks } else { quant::Layout::Fast },
             budget,
+            stage: None,
         };
         let mut engine = Engine::with_options(device.take().unwrap(), &g, opts).unwrap();
         engine.set_source(Box::new(evolve_llm::source::MemorySource(vec![bytes.clone()])));

@@ -129,6 +129,78 @@ impl Matrix {
     }
 }
 
+/// The part of a model one device runs when several devices share it: layers `first..end`,
+/// and whether it reads tokens (the embedding) and makes logits (the output head). The device
+/// the chat runs on holds the embedding, the head and the first layers; others hold the rest
+/// and pass the hidden state on (see [`Remote`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Stage {
+    pub first: usize,
+    pub end: usize,
+    pub embed: bool,
+    pub head: bool,
+}
+
+impl Stage {
+    pub fn whole(n_layer: usize) -> Stage {
+        Stage { first: 0, end: n_layer, embed: true, head: true }
+    }
+
+    pub fn has_layer(&self, l: usize) -> bool {
+        l >= self.first && l < self.end
+    }
+
+    /// Whether this stage needs the tensor.
+    pub fn holds(&self, name: &str, tied_embeddings: bool) -> bool {
+        let layer = name.strip_prefix("blk.").and_then(|r| r.split('.').next()).and_then(|l| l.parse::<usize>().ok());
+        match layer {
+            Some(l) => self.has_layer(l),
+            None => match name {
+                "token_embd.weight" => self.embed || (self.head && tied_embeddings),
+                "rope_freqs.weight" => true,
+                _ => self.head,
+            },
+        }
+    }
+}
+
+/// The layers after this device's, run elsewhere (other devices of the same person). `forward`
+/// takes the hidden state after this device's last layer for `n` tokens from `pos0` and returns
+/// the hidden state after the model's last layer (see [`Engine::hidden_width`] for the layout).
+/// `snapshot` and `restore` mirror this engine's, for models with a recurrent state.
+pub trait Remote {
+    fn forward<'a>(&'a self, hidden: Vec<f32>, n: usize, pos0: usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>, String>> + 'a>>;
+    fn snapshot(&self);
+    fn restore(&self);
+}
+
+/// What a pass reads: tokens, or the hidden state another device's layers produced (`n` tokens,
+/// token-major).
+#[derive(Clone, Copy)]
+enum Feed<'a> {
+    Tokens(&'a [u32]),
+    Hidden(&'a [f32], usize),
+}
+
+impl<'a> Feed<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Feed::Tokens(t) => t.len(),
+            Feed::Hidden(_, n) => *n,
+        }
+    }
+
+    fn slice(&self, s: usize, n: usize) -> Feed<'a> {
+        match *self {
+            Feed::Tokens(t) => Feed::Tokens(&t[s..s + n]),
+            Feed::Hidden(h, total) => {
+                let w = h.len() / total;
+                Feed::Hidden(&h[s * w..(s + n) * w], n)
+            }
+        }
+    }
+}
+
 /// How weights are laid out on the GPU.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Options {
@@ -139,6 +211,8 @@ pub struct Options {
     /// GPU memory for weights. Models larger than this keep only part of their weights on the
     /// GPU and read the rest from storage while they run (None = no limit).
     pub budget: Option<u64>,
+    /// Run only part of the model (None = all of it).
+    pub stage: Option<Stage>,
 }
 
 /// Where a tensor lives in the file and how to upload it in row chunks.
@@ -286,6 +360,11 @@ struct State {
     xl: wgpu::Buffer,
     ml: wgpu::Buffer,
     sup: Option<Super>,
+    // Block checkpoints (models with residuals across blocks) and the token stride of their
+    // buffer; a staging buffer for handing the hidden state to another device.
+    ck: wgpu::Buffer,
+    ck_tokens: usize,
+    hidden_staging: Option<wgpu::Buffer>,
 }
 
 pub struct Engine {
@@ -320,6 +399,9 @@ pub struct Engine {
     /// A second copy of the recurrent state, taken before verifying a draft (made on first use).
     spec_state: RefCell<Vec<(wgpu::Buffer, wgpu::Buffer)>>,
     spec_pos: Cell<usize>,
+    /// The part of the model this engine runs, and who runs the layers after it.
+    pub stage: Stage,
+    remote: RefCell<Option<std::rc::Rc<dyn Remote>>>,
 }
 
 fn storage(ro: bool, binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -428,6 +510,7 @@ impl Engine {
                 binding_limit: limit,
                 layout: quant::Layout::Fast,
                 budget: None,
+                stage: None,
             },
         )
     }
@@ -445,8 +528,14 @@ impl Engine {
             .max_storage_binding
             .min(gpu.info.max_buffer_size)
             .min(opts.binding_limit.unwrap_or(u64::MAX));
-        let mats_list = model::matrices(&cfg);
-        let vec_bytes: u64 = model::vectors(&cfg).iter().map(|v| v.1 as u64 * 4).sum();
+        let stage = opts.stage.unwrap_or(Stage::whole(cfg.n_layer));
+        if stage.first > stage.end || stage.end > cfg.n_layer || (stage.embed && stage.first != 0) || (!stage.embed && stage.head) {
+            return Err(format!("{stage:?} is not a part of this {}-layer model a device can run", cfg.n_layer));
+        }
+        let tied = cfg.tied_embeddings;
+        let mats_list: Vec<_> = model::matrices(&cfg).into_iter().filter(|m| stage.holds(&m.0, tied)).collect();
+        let vec_list: Vec<_> = model::vectors(&cfg).into_iter().filter(|v| stage.holds(&v.0, tied)).collect();
+        let vec_bytes: u64 = vec_list.iter().map(|v| v.1 as u64 * 4).sum();
         let ty = |name: &str| g.tensor(name).unwrap().ggml_type;
         let size_in = |layout: Layout, name: &str, rows: usize, k: usize| {
             GpuFormat::choose(ty(name), layout).unwrap().bytes(k, rows)
@@ -481,14 +570,14 @@ impl Engine {
         };
         if streaming {
             let mut used = vec_bytes;
-            if !cfg.tied_embeddings {
+            if !cfg.tied_embeddings && stage.embed {
                 place.insert("token_embd.weight".into(), Place::Cpu);
                 placement.cpu_embeddings = true;
             }
             let compact = |name: &str, rows: usize, k: usize| size_in(Layout::Blocks, name, rows, k);
             let mut pool_layers: Vec<usize> = Vec::new();
             if let Some(e) = &cfg.moe {
-                for l in (0..cfg.n_layer).filter(|&l| cfg.is_moe(l)) {
+                for l in (0..cfg.n_layer).filter(|&l| cfg.is_moe(l) && stage.has_layer(l)) {
                     let names = ["gate", "up", "down"].map(|k| format!("blk.{l}.ffn_{k}_exps.weight"));
                     let types = [ty(&names[0]), ty(&names[1]), ty(&names[2])];
                     let w = cfg.expert_in();
@@ -523,15 +612,15 @@ impl Engine {
                 .filter(|m| place[&m.0] == Place::Resident && m.0.starts_with("blk."))
                 .map(|m| (m.0.clone(), m.1 * m.3, m.2, compact(&m.0, m.1 * m.3, m.2)))
                 .collect();
-            let head = mats_list.iter().find(|m| m.0 == head_name).unwrap();
-            let head_bytes = compact(head_name, head.1 * head.3, head.2);
+            let head = mats_list.iter().find(|m| m.0 == head_name && stage.head);
+            let head_bytes = head.map_or(0, |h| compact(head_name, h.1 * h.3, h.2));
             let dense_total: u64 = dense.iter().map(|d| d.3).sum();
             if used + head_bytes + dense_total + pool_min <= budget {
                 used += head_bytes + dense_total;
                 placement.resident_layers = cfg.n_layer;
             } else {
                 // Keep the head if it is small next to the budget; stream it otherwise.
-                if head_bytes * 4 <= budget.saturating_sub(used) {
+                if head_bytes * 4 <= budget.saturating_sub(used) || head.is_none() {
                     used += head_bytes;
                 } else {
                     place.insert(head_name.into(), Place::Ring);
@@ -719,7 +808,7 @@ impl Engine {
             );
         }
         let mut vecs = HashMap::new();
-        for (name, len) in model::vectors(&cfg) {
+        for (name, len) in vec_list {
             let t = g.tensor(&name).unwrap();
             let rb = quant::row_bytes(t.ggml_type, len)? as u64;
             plan.push(TensorPlan {
@@ -814,6 +903,8 @@ impl Engine {
             all_logits: Cell::new(false),
             spec_state: RefCell::new(Vec::new()),
             spec_pos: Cell::new(0),
+            stage,
+            remote: RefCell::new(None),
         };
         e.compile()?;
         Ok(e)
@@ -889,8 +980,9 @@ impl Engine {
             self.pipeline("route-sort".into(), shaders::route_sort(), &rs);
             self.pipeline("moe-sum".into(), shaders::moe_sum(), &ms);
         }
-        let ef = self.mats["token_embd.weight"].fmt;
-        self.pipeline(format!("embed-{}", ef.key()), shaders::embed(ef), &mm);
+        if let Some(ef) = self.mats.get("token_embd.weight").map(|m| m.fmt) {
+            self.pipeline(format!("embed-{}", ef.key()), shaders::embed(ef), &mm);
+        }
         let l = &self.layouts;
         let (n, ni, r, a, tk, ml) = (
             l.norm.clone(),
@@ -1093,7 +1185,7 @@ impl Engine {
             None => (buf("unused", 4), buf("unused", 4), buf("unused", 4), buf("unused", 4), buf("unused", 4)),
         };
         let icache: Vec<Option<wgpu::Buffer>> = (0..c.n_layer)
-            .map(|l| ix.as_ref().filter(|i| i.full[l] && !c.is_kda(l)).map(|i| buf("idx-cache", ctx * i.head_dim / 2)))
+            .map(|l| ix.as_ref().filter(|i| i.full[l] && !c.is_kda(l) && self.stage.has_layer(l)).map(|i| buf("idx-cache", ctx * i.head_dim / 2)))
             .collect();
         let gate = buf("gate", t * ff_width);
         let xf = buf("xf", c.n_embd);
@@ -1101,7 +1193,7 @@ impl Engine {
         let tokens = buf("tokens", t);
         let (kc, vc): (Vec<_>, Vec<_>) = (0..c.n_layer)
             .map(|l| match &mla {
-                _ if c.is_kda(l) => (buf("unused", 4), buf("unused", 4)),
+                _ if c.is_kda(l) || !self.stage.has_layer(l) => (buf("unused", 4), buf("unused", 4)),
                 Some(m) => (buf("latent-cache", ctx * (m.kv_lora + m.rope) / 2), buf("unused", 4)),
                 None => (
                     buf("k-cache", ctx * c.kv_dim() / 2),
@@ -1206,8 +1298,13 @@ impl Engine {
         let mut kda_state = Vec::new();
         let mut kda_snap = Vec::new();
         if let Some(kk) = &kda {
-            for _ in kk.layers.iter().filter(|&&x| x) {
-                let pair = || (buf("kda-state", kk.n_head * kk.head_dim * kk.head_dim), buf("kda-conv", 3 * kd * 3));
+            for (l, _) in kk.layers.iter().enumerate().filter(|(_, &x)| x) {
+                // Layers another device runs keep their state there.
+                let here = self.stage.has_layer(l);
+                let pair = || match here {
+                    true => (buf("kda-state", kk.n_head * kk.head_dim * kk.head_dim), buf("kda-conv", 3 * kd * 3)),
+                    false => (buf("unused", 4), buf("unused", 4)),
+                };
                 kda_state.push(pair());
                 kda_snap.push(pair());
             }
@@ -1374,9 +1471,9 @@ impl Engine {
             });
         };
 
-        let emb = &self.mats["token_embd.weight"];
-        let gpu_embed = emb.place == Place::Resident;
-        for s in emb.shards.iter().filter(|_| gpu_embed) {
+        // The embedding on the GPU (when this stage reads tokens and the table is resident).
+        let emb = self.mats.get("token_embd.weight").filter(|m| self.stage.embed && m.place == Place::Resident);
+        for (emb, s) in emb.iter().flat_map(|m| m.shards.iter().map(move |s| (*m, s))) {
             let p = params(&words(&[
                 c.n_embd as u32,
                 s.rows as u32,
@@ -1500,6 +1597,15 @@ impl Engine {
         let mut layers = Vec::with_capacity(c.n_layer);
         let mut kda_index = 0;
         for l in 0..c.n_layer {
+            if !self.stage.has_layer(l) {
+                // Another device runs this layer.
+                if c.is_kda(l) {
+                    kda_index += 1;
+                }
+                let at = ops.len();
+                layers.push(LayerOps { start: at, route_end: at, experts_end: at, end: at });
+                continue;
+            }
             let n = |s: &str| format!("blk.{l}.{s}");
             let start = ops.len();
             let (mut route_end, mut experts_end) = (0, 0);
@@ -1765,18 +1871,21 @@ impl Engine {
             });
         }
         let head_start = ops.len();
-        if bs > 0 {
-            res_mix(&mut ops, &self.vecs["output_res_score.weight"], n_ckpt, false, &xm);
-            norm(&mut ops, &xm, &self.vecs["output_norm.weight"], &xf, c.n_embd, true);
-        } else {
-            norm(&mut ops, &x, &self.vecs["output_norm.weight"], &xf, c.n_embd, true);
-        }
         let head = if c.tied_embeddings {
             "token_embd.weight"
         } else {
             "output.weight"
         };
-        matmul(&mut ops, head, &xf, &logits, 0, None, true, Input::rows(c.n_embd));
+        // Only the stage that makes logits has the head.
+        if self.stage.head {
+            if bs > 0 {
+                res_mix(&mut ops, &self.vecs["output_res_score.weight"], n_ckpt, false, &xm);
+                norm(&mut ops, &xm, &self.vecs["output_norm.weight"], &xf, c.n_embd, true);
+            } else {
+                norm(&mut ops, &x, &self.vecs["output_norm.weight"], &xf, c.n_embd, true);
+            }
+            matmul(&mut ops, head, &xf, &logits, 0, None, true, Input::rows(c.n_embd));
+        }
         // The same head for every token of a short batch: verifying a speculative draft needs
         // the logits after each of its tokens.
         let head_end = ops.len();
@@ -1788,13 +1897,15 @@ impl Engine {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        if bs > 0 {
-            res_mix(&mut ops, &self.vecs["output_res_score.weight"], n_ckpt, false, &xm);
-            norm(&mut ops, &xm, &self.vecs["output_norm.weight"], &xfa, c.n_embd, false);
-        } else {
-            norm(&mut ops, &x, &self.vecs["output_norm.weight"], &xfa, c.n_embd, false);
+        if self.stage.head {
+            if bs > 0 {
+                res_mix(&mut ops, &self.vecs["output_res_score.weight"], n_ckpt, false, &xm);
+                norm(&mut ops, &xm, &self.vecs["output_norm.weight"], &xfa, c.n_embd, false);
+            } else {
+                norm(&mut ops, &x, &self.vecs["output_norm.weight"], &xfa, c.n_embd, false);
+            }
+            matmul(&mut ops, head, &xfa, &logits_all, 0, None, false, Input::rows(c.n_embd));
         }
-        matmul(&mut ops, head, &xfa, &logits_all, 0, None, false, Input::rows(c.n_embd));
 
         let route_bytes = route.size();
         let sup = (super_tokens > 0).then(|| {
@@ -1824,6 +1935,15 @@ impl Engine {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // A stage hands its hidden state on a chunk at a time: x and every checkpoint.
+        let hidden_staging = (self.stage != Stage::whole(c.n_layer)).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hidden staging"),
+                size: (t * c.n_embd * (1 + n_ckpt) * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
         self.state = Some(State {
             ctx,
             step,
@@ -1848,6 +1968,9 @@ impl Engine {
             xl,
             ml,
             sup,
+            ck,
+            ck_tokens,
+            hidden_staging,
         });
         match self.gpu.take_error() {
             Some(e) => Err(format!("could not prepare the model on the GPU: {e}")),
@@ -2100,6 +2223,9 @@ impl Engine {
     pub fn snapshot(&self) {
         self.copy_state(true);
         self.snapshot_pos.set(Some(self.recurrent_pos.get()));
+        if let Some(r) = self.remote.borrow().clone() {
+            r.snapshot();
+        }
     }
 
     /// Return to the snapshot; the position it was taken at, if there is one.
@@ -2107,6 +2233,9 @@ impl Engine {
         let pos = self.snapshot_pos.get()?;
         self.copy_state(false);
         self.recurrent_pos.set(pos);
+        if let Some(r) = self.remote.borrow().clone() {
+            r.restore();
+        }
         Some(pos)
     }
 
@@ -2122,17 +2251,38 @@ impl Engine {
     }
 
     /// Logits after reading `tokens` at positions from `pos0`. A model with a recurrent state
-    /// must continue where it stopped, or start over at 0.
+    /// must continue where it stopped, or start over at 0. A stage without the head returns
+    /// the hidden state after its last layer instead (see [`Engine::hidden_width`]).
     pub async fn forward(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, String> {
+        if !self.stage.embed {
+            return Err("this device runs layers in the middle of the model; it reads hidden states, not tokens".into());
+        }
+        self.forward_input(Feed::Tokens(tokens), pos0).await
+    }
+
+    /// For a stage that runs layers after another device's: read the hidden state that device
+    /// handed on (`n` tokens from `pos0`) and return the one after this stage's last layer.
+    pub async fn forward_hidden(&self, hidden: &[f32], n: usize, pos0: usize) -> Result<Vec<f32>, String> {
+        if self.stage.embed {
+            return Err("this device reads tokens, not hidden states".into());
+        }
+        if n == 0 || hidden.len() != n * self.hidden_width(self.stage.first) {
+            return Err(format!("expected the hidden state of {n} tokens before layer {}", self.stage.first));
+        }
+        self.forward_input(Feed::Hidden(hidden, n), pos0).await
+    }
+
+    async fn forward_input(&self, input: Feed<'_>, pos0: usize) -> Result<Vec<f32>, String> {
         if self.is_recurrent() && pos0 != 0 && pos0 != self.recurrent_pos.get() {
             return Err(format!(
                 "this model's recurrent state is at position {}, not {pos0}",
                 self.recurrent_pos.get()
             ));
         }
-        let out = self.forward_at(tokens, pos0).await;
+        let n = input.len();
+        let out = self.forward_at(input, pos0).await;
         match &out {
-            Ok(_) => self.recurrent_pos.set(pos0 + tokens.len()),
+            Ok(_) => self.recurrent_pos.set(pos0 + n),
             Err(_) => {
                 // A pass that stopped part way (a cancelled or failed read) leaves some layers'
                 // recurrent state ahead of the others, and expert slots that may not hold what
@@ -2154,30 +2304,157 @@ impl Engine {
         self.recurrent_pos.get()
     }
 
-    async fn forward_at(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, String> {
+    /// Block checkpoints that exist before layer `l` (models with residuals across blocks).
+    fn ckpts_before(&self, l: usize) -> usize {
+        match self.cfg.attn_res_block {
+            0 => 0,
+            bs => l.div_ceil(bs),
+        }
+    }
+
+    /// Floats per token of the hidden state handed from one device to the next before layer
+    /// `l`: the residual stream, then each block checkpoint made so far. Tokens follow each
+    /// other, so a batch can be cut or joined anywhere.
+    pub fn hidden_width(&self, l: usize) -> usize {
+        self.cfg.n_embd * (1 + self.ckpts_before(l))
+    }
+
+    /// Who runs the layers after this engine's, when it holds the head but not every layer.
+    pub fn set_remote(&self, remote: Option<std::rc::Rc<dyn Remote>>) {
+        *self.remote.borrow_mut() = remote;
+    }
+
+    pub fn has_remote(&self) -> bool {
+        self.remote.borrow().is_some()
+    }
+
+    /// Write `n` tokens of a hidden state with `k` checkpoints: the residual stream into `xbuf`
+    /// from token `x_tok`, the checkpoints at chunk offset `c0`.
+    fn write_hidden(&self, h: &[f32], n: usize, k: usize, xbuf: &wgpu::Buffer, x_tok: usize, c0: usize) {
+        let st = self.state.as_ref().unwrap();
+        let ne = self.cfg.n_embd;
+        let w = ne * (1 + k);
+        for j in 0..=k {
+            let mut part = Vec::with_capacity(n * ne);
+            for t in 0..n {
+                part.extend_from_slice(&h[t * w + j * ne..t * w + (j + 1) * ne]);
+            }
+            let (buf, at) = match j {
+                0 => (xbuf, x_tok),
+                _ => (&st.ck, (j - 1) * st.ck_tokens + c0),
+            };
+            self.gpu.queue.write_buffer(buf, (at * ne * 4) as u64, &floats(&part));
+        }
+    }
+
+    /// Read `n` tokens of the hidden state back with `k` checkpoints (the reverse of
+    /// `write_hidden`), a staging buffer's worth at a time.
+    async fn read_hidden(&self, n: usize, k: usize, xbuf: &wgpu::Buffer, x_tok: usize, c0: usize) -> Result<Vec<f32>, String> {
+        let st = self.state.as_ref().unwrap();
+        let staging = st.hidden_staging.as_ref().ok_or("this engine runs the whole model")?;
+        let ne = self.cfg.n_embd;
+        let w = ne * (1 + k);
+        let cap = (staging.size() as usize / 4 / ne / (1 + self.ckpts_before(self.cfg.n_layer))).max(1);
+        let mut out = vec![0f32; n * w];
+        let mut s = 0;
+        while s < n {
+            let m = cap.min(n - s);
+            let mut e = self.gpu.device.create_command_encoder(&Default::default());
+            let len = (m * ne * 4) as u64;
+            e.copy_buffer_to_buffer(xbuf, ((x_tok + s) * ne * 4) as u64, staging, 0, len);
+            for j in 0..k {
+                e.copy_buffer_to_buffer(&st.ck, ((j * st.ck_tokens + c0 + s) * ne * 4) as u64, staging, (j + 1) as u64 * len, len);
+            }
+            self.gpu.queue.submit([e.finish()]);
+            let bytes = read_back(&self.gpu, staging, (1 + k) as u64 * len).await?;
+            for j in 0..=k {
+                for t in 0..m {
+                    let src = ((j * m + t) * ne) * 4;
+                    let dst = (s + t) * w + j * ne;
+                    for (o, b) in out[dst..dst + ne].iter_mut().zip(bytes[src..src + ne * 4].chunks_exact(4)) {
+                        *o = f32::from_le_bytes(b.try_into().unwrap());
+                    }
+                }
+            }
+            s += m;
+        }
+        Ok(out)
+    }
+
+    /// The remote for a stage that holds the head but not every layer, or an error when none
+    /// is connected.
+    fn remote_for_pass(&self) -> Result<Option<std::rc::Rc<dyn Remote>>, String> {
+        let remote = self.remote.borrow().clone();
+        if self.stage.head && self.stage.end < self.cfg.n_layer && remote.is_none() {
+            return Err(format!(
+                "layers {} to {} run on another device, and none is connected",
+                self.stage.end + 1,
+                self.cfg.n_layer
+            ));
+        }
+        Ok(remote)
+    }
+
+    /// The other devices' layers for the whole batch, then the hidden state of its last chunk
+    /// (`n` tokens at batch offset `s`, checkpoints at chunk offset `c0`) back in place for the
+    /// head.
+    async fn through_remote(&self, remote: &dyn Remote, hidden: Vec<f32>, total: usize, pos0: usize, s: usize, n: usize, c0: usize) -> Result<(), String> {
+        let st = self.state.as_ref().unwrap();
+        let back = remote.forward(hidden, total, pos0).await?;
+        let w = self.hidden_width(self.cfg.n_layer);
+        if back.len() != total * w {
+            return Err("another device returned a hidden state of the wrong size".into());
+        }
+        self.write_hidden(&back[s * w..(s + n) * w], n, self.ckpts_before(self.cfg.n_layer), &st.x, 0, c0);
+        Ok(())
+    }
+
+    async fn forward_at(&self, input: Feed<'_>, pos0: usize) -> Result<Vec<f32>, String> {
         if self.placement.streaming {
-            return self.forward_streamed(tokens, pos0).await;
+            return self.forward_streamed(input, pos0).await;
         }
         let st = self.state.as_ref().ok_or("model is not loaded")?;
-        if tokens.is_empty() {
+        let total = input.len();
+        if total == 0 {
             return Err("nothing to process".into());
         }
-        if pos0 + tokens.len() > st.ctx {
+        if pos0 + total > st.ctx {
             return Err(format!(
                 "the conversation is longer than the {}-token context",
                 st.ctx
             ));
         }
-        let chunks: Vec<&[u32]> = tokens.chunks(MAX_BATCH).collect();
-        let mut pos = pos0;
-        for (i, chunk) in chunks.iter().enumerate() {
-            let n = chunk.len() as u32;
+        let remote = self.remote_for_pass()?;
+        let hand_on = remote.is_some() || !self.stage.head;
+        if hand_on && self.all_logits.get() {
+            return Err("drafts are not verified while other devices run part of the model".into());
+        }
+        let (k_in, k_out) = (self.ckpts_before(self.stage.first), self.ckpts_before(self.stage.end));
+        let chunks: Vec<(usize, usize)> = (0..total).step_by(MAX_BATCH).map(|s| (s, MAX_BATCH.min(total - s))).collect();
+        let mut hidden = Vec::new();
+        for (i, &(s, n)) in chunks.iter().enumerate() {
             let last = i + 1 == chunks.len();
-            self.write_step(n as usize, pos, 0);
-            self.gpu.queue.write_buffer(&st.tokens, 0, &words(chunk));
-            let cmd = self.encode_chunk(chunk.len(), last);
+            self.write_step(n, pos0 + s, 0);
+            match input.slice(s, n) {
+                Feed::Tokens(t) => self.gpu.queue.write_buffer(&st.tokens, 0, &words(t)),
+                Feed::Hidden(h, _) => self.write_hidden(h, n, k_in, &st.x, 0, 0),
+            }
+            let cmd = self.encode_chunk(n, last && !hand_on);
             self.gpu.queue.submit([cmd]);
-            pos += chunk.len();
+            if hand_on {
+                hidden.extend(self.read_hidden(n, k_out, &st.x, 0, 0).await?);
+            }
+        }
+        if !self.stage.head {
+            return Ok(hidden);
+        }
+        if let Some(r) = &remote {
+            let &(s, n) = chunks.last().unwrap();
+            self.through_remote(r.as_ref(), hidden, total, pos0, s, n, 0).await?;
+            self.write_step(n, pos0 + s, 0);
+            let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+            self.record_head(&mut enc, n);
+            self.gpu.queue.submit([enc.finish()]);
         }
         if self.all_logits.get() {
             return Ok(Vec::new()); // forward_all reads every token's logits
@@ -2420,7 +2697,9 @@ impl Engine {
     /// experts once and runs every chunk that chose them; then the rest of the layer. Chunk
     /// activations wait in `Super` buffers between phases, and block checkpoints are indexed by
     /// the chunk's offset (`step.chunk0`). With `head`, the last token's logits go to staging.
-    async fn forward_layers(&self, tokens: &[u32], pos0: usize, head: bool) -> Result<(), String> {
+    /// A stage without the head returns the hidden state after its last layer; one with a
+    /// remote hands it to the other devices first.
+    async fn forward_layers(&self, input: Feed<'_>, pos0: usize, head: bool, remote: Option<&dyn Remote>) -> Result<Vec<f32>, String> {
         let st = self.state.as_ref().unwrap();
         let sup = st.sup.as_ref().unwrap();
         let q = &self.gpu.queue;
@@ -2428,7 +2707,8 @@ impl Engine {
         let n_expert = c.moe.as_ref().map_or(0, |e| e.n_expert);
         let n_used = c.moe.as_ref().map_or(0, |e| e.n_used);
         let latent = c.expert_latent;
-        let chunks: Vec<(usize, usize)> = (0..tokens.len()).step_by(MAX_BATCH).map(|s| (s, MAX_BATCH.min(tokens.len() - s))).collect();
+        let total = input.len();
+        let chunks: Vec<(usize, usize)> = (0..total).step_by(MAX_BATCH).map(|s| (s, MAX_BATCH.min(total - s))).collect();
         let route_bytes = st.route.size();
         let enc = || self.gpu.device.create_command_encoder(&Default::default());
         // Byte ranges of `n` tokens from token `s`, `w` values wide.
@@ -2445,21 +2725,28 @@ impl Engine {
             }
         };
         let ne = c.n_embd;
+        let (k_in, k_out) = (self.ckpts_before(self.stage.first), self.ckpts_before(self.stage.end));
         for &(s, n) in &chunks {
             self.write_step(n, pos0 + s, s);
-            let mut e = enc();
-            if self.placement.cpu_embeddings || st.embed_end == 0 {
-                self.prefetch(&self.embed_spans(&tokens[s..s + n])).await?;
-                q.write_buffer(&st.x, 0, &floats(&self.embed_cpu(&tokens[s..s + n])?));
-            } else {
-                q.write_buffer(&st.tokens, 0, &words(&tokens[s..s + n]));
-                self.record(&mut e, 0..st.embed_end, n);
+            match input.slice(s, n) {
+                Feed::Tokens(tokens) => {
+                    let mut e = enc();
+                    if self.placement.cpu_embeddings || st.embed_end == 0 {
+                        self.prefetch(&self.embed_spans(tokens)).await?;
+                        q.write_buffer(&st.x, 0, &floats(&self.embed_cpu(tokens)?));
+                    } else {
+                        q.write_buffer(&st.tokens, 0, &words(tokens));
+                        self.record(&mut e, 0..st.embed_end, n);
+                    }
+                    park(&mut e, s, n, true, &[(&st.x, &sup.x, ne)]);
+                    q.submit([e.finish()]);
+                }
+                // The previous device's residual stream goes straight to its parked place.
+                Feed::Hidden(h, _) => self.write_hidden(h, n, k_in, &sup.x, s, s),
             }
-            park(&mut e, s, n, true, &[(&st.x, &sup.x, ne)]);
-            q.submit([e.finish()]);
         }
         let mut queued = 0u64;
-        for (l, lo) in st.layers.iter().enumerate() {
+        for (l, lo) in st.layers.iter().enumerate().filter(|(l, _)| self.stage.has_layer(*l)) {
             self.prefetch(&self.ring_spans(&self.ring_layers[l])).await?;
             queued += self.upload_rings(&self.ring_layers[l])?;
             let Some(pool) = self.layer_pool[l] else {
@@ -2555,35 +2842,64 @@ impl Engine {
             }
             queued = 0;
         }
+        let mut hidden = Vec::new();
+        if remote.is_some() || !self.stage.head {
+            for &(s, n) in &chunks {
+                hidden.extend(self.read_hidden(n, k_out, &sup.x, s, s).await?);
+            }
+        }
+        if !self.stage.head {
+            return Ok(hidden);
+        }
         if head {
             let &(s, n) = chunks.last().unwrap();
             self.prefetch(&self.ring_spans(&self.ring_head)).await?;
             self.upload_rings(&self.ring_head)?;
+            match remote {
+                Some(r) => self.through_remote(r, hidden, total, pos0, s, n, s).await?,
+                None => {
+                    let mut e = enc();
+                    park(&mut e, s, n, false, &[(&st.x, &sup.x, ne)]);
+                    q.submit([e.finish()]);
+                }
+            }
             self.write_step(n, pos0 + s, s);
             let mut e = enc();
-            park(&mut e, s, n, false, &[(&st.x, &sup.x, ne)]);
             self.record_head(&mut e, n);
             q.submit([e.finish()]);
+        } else if let Some(r) = remote {
+            // Not the last part of the prompt: the other devices' layers still read it.
+            r.forward(hidden, total, pos0).await?;
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     /// Forward pass for models that do not fit: layer by layer, reading streamed weights and
     /// the experts each token chose.
-    async fn forward_streamed(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, String> {
+    async fn forward_streamed(&self, input: Feed<'_>, pos0: usize) -> Result<Vec<f32>, String> {
         let st = self.state.as_ref().ok_or("model is not loaded")?;
-        if tokens.is_empty() {
+        let total = input.len();
+        if total == 0 {
             return Err("nothing to process".into());
         }
-        if pos0 + tokens.len() > st.ctx {
+        if pos0 + total > st.ctx {
             return Err(format!("the conversation is longer than the {}-token context", st.ctx));
         }
-        if let Some(sup) = st.sup.as_ref().filter(|_| tokens.len() > MAX_BATCH) {
-            let parts: Vec<&[u32]> = tokens.chunks(sup.tokens).collect();
-            let mut pos = pos0;
-            for (i, part) in parts.iter().enumerate() {
-                self.forward_layers(part, pos, i + 1 == parts.len()).await?;
-                pos += part.len();
+        let remote = self.remote_for_pass()?;
+        let hand_on = remote.is_some() || !self.stage.head;
+        if hand_on && self.all_logits.get() {
+            return Err("drafts are not verified while other devices run part of the model".into());
+        }
+        if let Some(sup) = st.sup.as_ref().filter(|_| total > MAX_BATCH) {
+            let mut hidden = Vec::new();
+            let mut s = 0;
+            while s < total {
+                let n = sup.tokens.min(total - s);
+                hidden.extend(self.forward_layers(input.slice(s, n), pos0 + s, s + n == total, remote.as_deref()).await?);
+                s += n;
+            }
+            if !self.stage.head {
+                return Ok(hidden);
             }
             if self.all_logits.get() {
                 return Ok(Vec::new()); // forward_all reads every token's logits
@@ -2594,21 +2910,26 @@ impl Engine {
         let q = &self.gpu.queue;
         let n_expert = self.cfg.moe.as_ref().map_or(0, |e| e.n_expert);
         let n_used = self.cfg.moe.as_ref().map_or(0, |e| e.n_used);
-        let chunks: Vec<&[u32]> = tokens.chunks(MAX_BATCH).collect();
-        let mut pos = pos0;
-        for (ci, chunk) in chunks.iter().enumerate() {
-            let n = chunk.len();
+        let (k_in, k_out) = (self.ckpts_before(self.stage.first), self.ckpts_before(self.stage.end));
+        let chunks: Vec<(usize, usize)> = (0..total).step_by(MAX_BATCH).map(|s| (s, MAX_BATCH.min(total - s))).collect();
+        let mut hidden = Vec::new();
+        for (ci, &(s, n)) in chunks.iter().enumerate() {
             let last = ci + 1 == chunks.len();
-            self.write_step(n, pos, 0);
-            q.write_buffer(&st.tokens, 0, &words(chunk));
-            if self.placement.cpu_embeddings || st.embed_end == 0 {
-                self.prefetch(&self.embed_spans(chunk)).await?;
-                q.write_buffer(&st.x, 0, &floats(&self.embed_cpu(chunk)?));
-            } else {
-                q.submit([self.encode_range(0..st.embed_end, n, false)]);
+            self.write_step(n, pos0 + s, 0);
+            match input.slice(s, n) {
+                Feed::Tokens(chunk) => {
+                    q.write_buffer(&st.tokens, 0, &words(chunk));
+                    if self.placement.cpu_embeddings || st.embed_end == 0 {
+                        self.prefetch(&self.embed_spans(chunk)).await?;
+                        q.write_buffer(&st.x, 0, &floats(&self.embed_cpu(chunk)?));
+                    } else {
+                        q.submit([self.encode_range(0..st.embed_end, n, false)]);
+                    }
+                }
+                Feed::Hidden(h, _) => self.write_hidden(h, n, k_in, &st.x, 0, 0),
             }
             let mut queued = 0u64;
-            for (l, lo) in st.layers.iter().enumerate() {
+            for (l, lo) in st.layers.iter().enumerate().filter(|(l, _)| self.stage.has_layer(*l)) {
                 self.prefetch(&self.ring_spans(&self.ring_layers[l])).await?;
                 queued += self.upload_rings(&self.ring_layers[l])?;
                 match self.layer_pool[l] {
@@ -2660,14 +2981,28 @@ impl Engine {
                     }
                 }
             }
-            if last {
+            if hand_on {
+                hidden.extend(self.read_hidden(n, k_out, &st.x, 0, 0).await?);
+            } else if last {
                 self.prefetch(&self.ring_spans(&self.ring_head)).await?;
                 self.upload_rings(&self.ring_head)?;
                 let mut enc = self.gpu.device.create_command_encoder(&Default::default());
                 self.record_head(&mut enc, n);
                 q.submit([enc.finish()]);
             }
-            pos += n;
+        }
+        if !self.stage.head {
+            return Ok(hidden);
+        }
+        if let Some(r) = &remote {
+            let &(s, n) = chunks.last().unwrap();
+            self.through_remote(r.as_ref(), hidden, total, pos0, s, n, 0).await?;
+            self.prefetch(&self.ring_spans(&self.ring_head)).await?;
+            self.upload_rings(&self.ring_head)?;
+            self.write_step(n, pos0 + s, 0);
+            let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+            self.record_head(&mut enc, n);
+            q.submit([enc.finish()]);
         }
         if self.all_logits.get() {
             return Ok(Vec::new()); // forward_all reads every token's logits

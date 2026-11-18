@@ -192,6 +192,18 @@
         </select>
         <small>For models read from Hugging Face: pieces come from other visitors who have them, and pieces stored here go to visitors who need them, browser to browser. Every piece is checked against published hashes before use. Peers see your IP address and which model files you read; your conversations never leave this device. Off unless you turn it on.</small>
       </label>
+      <fieldset class="block devices">
+        <legend>Your other devices</legend>
+        <small>Run a model too large for this device across your other computers. Open the pairing link on each of them: this device keeps the conversation, the first layers and the output, and the others run the remaining layers, passing the model's working state back over a direct, encrypted connection. Each reads only its share of the model from Hugging Face. Applies to models from Hugging Face, from the next load.</small>
+        <button type="button" class="ghost" id="pair-start">Pair another device</button>
+        <div id="pair-info" hidden>
+          <label class="block">Open this link on the other device
+            <span class="pair-row"><input type="text" id="pair-link" readonly><button type="button" class="ghost" id="pair-copy">Copy</button></span>
+          </label>
+          <ul class="pair-list" id="pair-list"></ul>
+          <button type="button" class="ghost" id="pair-stop">Stop pairing</button>
+        </div>
+      </fieldset>
       <label class="check"><input type="checkbox" name="thinking"> Let reasoning models think before answering</label>
       <fieldset class="block web">
         <legend>Internet access</legend>
@@ -203,6 +215,15 @@
         </label>
       </fieldset>
       <footer><button class="ghost" type="button" id="reset-settings">Restore defaults</button><button class="primary" value="close">Done</button></footer>
+    </form>
+  </dialog>
+
+  <dialog class="settings helping" id="helping" aria-labelledby="helping-title">
+    <form method="dialog">
+      <header><h2 id="helping-title">Helping your other device</h2></header>
+      <p id="helping-status" aria-live="polite">Looking for your other device…</p>
+      <p><small>Pairing code <strong id="helping-code"></strong>. Keep this tab open: this device runs part of the model your other device is using. It reads its share of the model from Hugging Face and keeps it in this browser's storage for next time (Settings on this device set how much). It receives the model's internal state for each step, not the conversation's text.</small></p>
+      <footer><button class="primary" type="button" id="helping-stop">Stop helping</button></footer>
     </form>
   </dialog>
 </body>

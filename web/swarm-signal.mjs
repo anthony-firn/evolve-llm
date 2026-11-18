@@ -9,6 +9,7 @@ import { NOSTR_RELAYS, eventId, verifyEvent } from './relay-directory.mjs';
 
 export const SIGNAL_KIND = 25075;
 export const topic = (sha) => `evolve-swarm:${sha}`;
+const PREFIX = 'evolve-swarm:';
 
 const hexToBytes = (hex) => Uint8Array.from(hex.match(/../g) ?? [], (b) => parseInt(b, 16));
 const bytesToHex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
@@ -17,10 +18,12 @@ const unb64 = (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
 
 export class Signal {
   /**
-   * `onEvent(kind, from, data)`: kind 'presence' (data: list of file SHA-256s) or 'message'
-   * (data: the decrypted object a peer sent to this page).
+   * `onEvent(kind, from, data, content)`: kind 'presence' (data: the topics' names, such as
+   * file SHA-256s; content: what the announcement carried) or 'message' (data: the decrypted
+   * object a peer sent to this page). `prefix` names the kind of topic (pairing uses its own).
    */
-  constructor({ relays = NOSTR_RELAYS, WebSocketImpl = globalThis.WebSocket, onEvent = () => {}, now = () => Math.floor(Date.now() / 1000) } = {}) {
+  constructor({ relays = NOSTR_RELAYS, WebSocketImpl = globalThis.WebSocket, onEvent = () => {}, now = () => Math.floor(Date.now() / 1000), prefix = PREFIX } = {}) {
+    this.prefix = prefix;
     this.relays = relays;
     this.WebSocketImpl = WebSocketImpl;
     this.onEvent = onEvent;
@@ -35,7 +38,7 @@ export class Signal {
   }
 
   start(shas) {
-    this.topics = shas.map(topic);
+    this.topics = shas.map((s) => this.prefix + s);
     for (const url of this.relays) this.connect(url, 0);
   }
 
@@ -70,8 +73,8 @@ export class Signal {
       const data = await this.decrypt(ev.pubkey, ev.content).catch(() => null);
       if (data) this.onEvent('message', ev.pubkey, data);
     } else if (!to) {
-      const shas = ev.tags.filter((t) => t[0] === 't' && t[1]?.startsWith('evolve-swarm:')).map((t) => t[1].slice(13));
-      if (shas.length) this.onEvent('presence', ev.pubkey, shas);
+      const shas = ev.tags.filter((t) => t[0] === 't' && t[1]?.startsWith(this.prefix)).map((t) => t[1].slice(this.prefix.length));
+      if (shas.length) this.onEvent('presence', ev.pubkey, shas, typeof ev.content === 'string' ? ev.content : '');
     }
   }
 
@@ -110,9 +113,9 @@ export class Signal {
     for (const ws of this.sockets.values()) if (ws.readyState === 1) ws.send(text);
   }
 
-  /** Say which files this page shares. */
-  announce() {
-    return this.publish(this.topics.map((t) => ['t', t]), '');
+  /** Say which files (topics) this page shares, optionally with a short text. */
+  announce(content = '') {
+    return this.publish(this.topics.map((t) => ['t', t]), content);
   }
 
   /** Send an object to one peer, encrypted to it. */

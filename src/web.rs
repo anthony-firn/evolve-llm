@@ -212,6 +212,68 @@ impl WeightSource for JsSource {
     }
 }
 
+/// The layers after this device's, run by the person's other devices: `forward(hidden, n,
+/// pos0)` (a Float32Array) resolves to the hidden state after the model's last layer;
+/// `control(op)` passes on "snapshot" and "restore".
+struct JsRemote {
+    forward: js_sys::Function,
+    control: js_sys::Function,
+}
+
+impl crate::gpu::engine::Remote for JsRemote {
+    fn forward<'a>(&'a self, hidden: Vec<f32>, n: usize, pos0: usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>, String>> + 'a>> {
+        Box::pin(async move {
+            let arr = js_sys::Float32Array::from(&hidden[..]);
+            let p = self
+                .forward
+                .call3(&JsValue::NULL, &arr, &JsValue::from(n as f64), &JsValue::from(pos0 as f64))
+                .map_err(js_error)?;
+            let v = wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(p)).await.map_err(js_error)?;
+            Ok(js_sys::Float32Array::new(&v).to_vec())
+        })
+    }
+
+    fn snapshot(&self) {
+        let _ = self.control.call1(&JsValue::NULL, &JsValue::from_str("snapshot"));
+    }
+
+    fn restore(&self) {
+        let _ = self.control.call1(&JsValue::NULL, &JsValue::from_str("restore"));
+    }
+}
+
+/// What each part of a model weighs, for sharing it among devices, as JSON: `n_layer`,
+/// `embed` and `head` bytes, `layers` (bytes of each), and `hidden` (floats per token handed
+/// from one device to the next before each layer, 0 to n_layer).
+#[wasm_bindgen]
+pub fn layer_bytes(headers: js_sys::Array) -> Result<String, JsValue> {
+    let g = merged(&headers).map_err(err)?;
+    let cfg = model::config(&g).map_err(err)?;
+    let mut layers = vec![0u64; cfg.n_layer];
+    let (mut embed, mut head) = (0u64, 0u64);
+    for t in &g.tensors {
+        let rows: u64 = t.dims[1..].iter().product();
+        let bytes = crate::quant::row_bytes(t.ggml_type, t.dims[0] as usize).map_or(0, |b| b as u64 * rows);
+        let layer = t.name.strip_prefix("blk.").and_then(|r| r.split('.').next()).and_then(|l| l.parse::<usize>().ok());
+        match layer {
+            Some(l) if l < cfg.n_layer => layers[l] += bytes,
+            Some(_) => {}
+            None if t.name == "token_embd.weight" => embed += bytes,
+            None => head += bytes,
+        }
+    }
+    let bs = cfg.attn_res_block;
+    let hidden: Vec<usize> = (0..=cfg.n_layer).map(|l| cfg.n_embd * (1 + if bs > 0 { l.div_ceil(bs) } else { 0 })).collect();
+    Ok(json(&serde_json::json!({
+        "n_layer": cfg.n_layer,
+        "embed": embed,
+        "head": head,
+        "layers": layers,
+        "hidden": hidden,
+        "tied": cfg.tied_embeddings,
+    })))
+}
+
 #[derive(serde::Deserialize, Default)]
 struct LoadOptions {
     #[serde(default)]
@@ -219,6 +281,9 @@ struct LoadOptions {
     /// GPU bytes for weights; larger models stream the rest from storage.
     #[serde(default)]
     budget: Option<f64>,
+    /// The layers this device runs when the model is shared with the person's other devices.
+    #[serde(default)]
+    stage: Option<crate::gpu::engine::Stage>,
 }
 
 #[wasm_bindgen]
@@ -246,6 +311,7 @@ pub async fn create_loader(headers: js_sys::Array, options: String) -> Result<Lo
             binding_limit: None,
             layout: crate::quant::Layout::Fast,
             budget,
+            stage: o.stage,
         };
         let engine = Engine::with_options(gpu, &g, opts).map_err(err)?;
         match scope.pop().await {
@@ -299,6 +365,20 @@ impl Loader {
             .map_err(err)
     }
 
+    /// For the device the chat runs on, when the person's other devices run the layers after
+    /// its own (see `JsRemote`). Call before `finish`.
+    pub fn set_remote(&self, forward: js_sys::Function, control: js_sys::Function) {
+        self.engine.as_ref().unwrap().set_remote(Some(Rc::new(JsRemote { forward, control })));
+    }
+
+    /// For a device that runs layers in the middle or at the end of a model for another device:
+    /// allocate the context and return the stage.
+    pub fn finish_stage(&mut self, ctx: u32) -> Result<Layers, JsValue> {
+        let mut engine = self.engine.take().ok_or("finished")?;
+        engine.finish(ctx as usize).map_err(err)?;
+        Ok(Layers { engine: Rc::new(engine) })
+    }
+
     /// Allocate the context and return a chat session.
     pub fn finish(&mut self, ctx: u32) -> Result<Chat, JsValue> {
         let mut engine = self.engine.take().ok_or("finished")?;
@@ -308,6 +388,51 @@ impl Loader {
             inner: Rc::new(RefCell::new(session)),
             decoder: RefCell::new(StreamDecoder::default()),
         })
+    }
+}
+
+/// Layers this device runs for another device's chat.
+#[wasm_bindgen]
+pub struct Layers {
+    engine: Rc<Engine>,
+}
+
+#[wasm_bindgen]
+impl Layers {
+    /// Resolves to the hidden state after this stage's last layer (a Float32Array), given the
+    /// one before its first layer for `n` tokens from `pos0`. Calls must not overlap.
+    pub fn forward(&self, hidden: js_sys::Float32Array, n: u32, pos0: u32) -> js_sys::Promise {
+        let engine = self.engine.clone();
+        let h = hidden.to_vec();
+        wasm_bindgen_futures::future_to_promise(async move {
+            let out = engine.forward_hidden(&h, n as usize, pos0 as usize).await.map_err(err)?;
+            Ok(js_sys::Float32Array::from(&out[..]).into())
+        })
+    }
+
+    pub fn snapshot(&self) {
+        self.engine.snapshot();
+    }
+
+    pub fn restore(&self) {
+        self.engine.restore();
+    }
+
+    /// Weights read while running since the last call, as JSON.
+    pub fn stats(&self) -> String {
+        json(&self.engine.take_stream_stats())
+    }
+
+    pub fn placement(&self) -> String {
+        json(&self.engine.placement)
+    }
+
+    pub fn weight_bytes(&self) -> f64 {
+        self.engine.weight_bytes as f64
+    }
+
+    pub fn context_length(&self) -> u32 {
+        self.engine.context_length() as u32
     }
 }
 

@@ -4,7 +4,7 @@
 //! in both weight layouts. Needs the GGUF files in $EVOLVE_LLM_MODELS and a GPU; skips otherwise.
 
 use evolve_llm::gguf;
-use evolve_llm::gpu::{self, engine::{Engine, Options}};
+use evolve_llm::gpu::{self, engine::{Engine, Options, Stage}};
 use evolve_llm::quant::Layout;
 use evolve_llm::source::MemorySource;
 use serde_json::Value;
@@ -72,7 +72,7 @@ fn run(name: &str, suffix: &str, tol: f32) {
             eprintln!("skipping {name}: no GPU adapter");
             return;
         };
-        let opts = Options { binding_limit: None, layout, budget };
+        let opts = Options { binding_limit: None, layout, budget, stage: None };
         let mut e = Engine::with_options(gpu, &g, opts).unwrap_or_else(|err| panic!("{name}: {err}"));
         for p in e.plan().to_vec().iter().filter(|p| p.resident) {
             e.upload(&p.name, 0, &bytes[p.offset as usize..(p.offset + p.bytes) as usize]).unwrap();
@@ -171,7 +171,7 @@ fn long_prompt_matches_resident(file: &str, budget: u64, want: u64) {
             eprintln!("skipping {file}: no GPU adapter");
             return;
         };
-        let mut e = Engine::with_options(gpu, &g, Options { binding_limit: None, layout: Layout::Fast, budget }).unwrap();
+        let mut e = Engine::with_options(gpu, &g, Options { binding_limit: None, layout: Layout::Fast, budget, stage: None }).unwrap();
         for p in e.plan().to_vec().iter().filter(|p| p.resident) {
             e.upload(&p.name, 0, &bytes[p.offset as usize..(p.offset + p.bytes) as usize]).unwrap();
         }
@@ -216,7 +216,7 @@ fn speculation_matches(file: &str, budget: u64) {
         eprintln!("skipping {file}: no GPU adapter");
         return;
     };
-    let mut e = Engine::with_options(gpu, &g, Options { binding_limit: None, layout: Layout::Fast, budget: Some(budget) }).unwrap();
+    let mut e = Engine::with_options(gpu, &g, Options { binding_limit: None, layout: Layout::Fast, budget: Some(budget), stage: None }).unwrap();
     for p in e.plan().to_vec().iter().filter(|p| p.resident) {
         e.upload(&p.name, 0, &bytes[p.offset as usize..(p.offset + p.bytes) as usize]).unwrap();
     }
@@ -255,4 +255,125 @@ fn speculative_decoding_matches_greedy() {
     speculation_matches("tiny-k31-bf16.gguf", 1);
     speculation_matches("tiny-deepseek3.gguf", 1);
     speculation_matches("Llama-3.2-1B-Instruct-Q4_K_M.gguf", 300 << 20);
+}
+
+/// The layers after the first device's, run by other "devices" (engines) in turn.
+struct Chain(Vec<Engine>);
+
+impl evolve_llm::gpu::engine::Remote for Chain {
+    fn forward<'a>(&'a self, hidden: Vec<f32>, n: usize, pos0: usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>, String>> + 'a>> {
+        Box::pin(async move {
+            let mut h = hidden;
+            for e in &self.0 {
+                h = e.forward_hidden(&h, n, pos0).await?;
+            }
+            Ok(h)
+        })
+    }
+    fn snapshot(&self) {
+        self.0.iter().for_each(|e| e.snapshot());
+    }
+    fn restore(&self) {
+        self.0.iter().for_each(|e| {
+            e.restore();
+        });
+    }
+}
+
+/// An engine for one stage of the model (all of it with None), loaded from `bytes`.
+fn stage_engine(g: &gguf::Gguf, bytes: &[u8], budget: Option<u64>, stage: Option<Stage>, ctx: usize) -> Option<Engine> {
+    let gpu = pollster::block_on(gpu::init()).ok()?;
+    let mut e = Engine::with_options(gpu, g, Options { binding_limit: None, layout: Layout::Fast, budget, stage }).unwrap();
+    for p in e.plan().to_vec().iter().filter(|p| p.resident) {
+        e.upload(&p.name, 0, &bytes[p.offset as usize..(p.offset + p.bytes) as usize]).unwrap();
+    }
+    e.set_source(Box::new(MemorySource(vec![bytes.to_vec()])));
+    e.finish(ctx).unwrap();
+    Some(e)
+}
+
+/// A model split across three devices (this one: embedding, the first layers and the head;
+/// two others: the rest) must give the logits one device gives, for a prompt and the tokens
+/// after it, resident and streamed. Then, through a session, the same greedy text over two
+/// turns (the second reuses the first's cache, and the recurrent state's snapshot).
+fn pipeline_matches(file: &str, budget: Option<u64>, n_prompt: usize) {
+    use evolve_llm::sampler::SamplerConfig;
+    use evolve_llm::session::Session;
+    let Ok(bytes) = std::fs::read(models_dir().join(file)) else {
+        eprintln!("skipping {file}: not found");
+        return;
+    };
+    let g = gguf::parse(&bytes).unwrap();
+    let cfg = evolve_llm::model::config(&g).unwrap();
+    let n = cfg.n_layer;
+    let (a, b) = (n / 3, (2 * n / 3).max(n / 3 + 1).min(n));
+    let n_prompt = n_prompt.min(cfg.ctx_train - 8);
+    let ctx = (n_prompt + 64).min(cfg.ctx_train);
+    let vocab = cfg.n_vocab as u64;
+    let tokens: Vec<u32> = (0..n_prompt as u64).map(|i| ((i * 2654435761 + 12345) % vocab.min(32000)) as u32).collect();
+    let split = || -> Option<Engine> {
+        let main = stage_engine(&g, &bytes, budget, Some(Stage { first: 0, end: a, embed: true, head: true }), ctx)?;
+        let rest = vec![
+            stage_engine(&g, &bytes, budget, Some(Stage { first: a, end: b, embed: false, head: false }), ctx)?,
+            stage_engine(&g, &bytes, budget, Some(Stage { first: b, end: n, embed: false, head: false }), ctx)?,
+        ];
+        main.set_remote(Some(std::rc::Rc::new(Chain(rest))));
+        Some(main)
+    };
+    let Some(whole) = stage_engine(&g, &bytes, budget, None, ctx) else {
+        eprintln!("skipping {file}: no GPU adapter");
+        return;
+    };
+    let parts = split().unwrap();
+    // A prompt, then three tokens one at a time.
+    let mut worst_err = 0f32;
+    let mut next = tokens.clone();
+    let mut pos = 0;
+    for step in 0..4 {
+        let want = pollster::block_on(whole.forward(&next, pos)).unwrap();
+        let got = pollster::block_on(parts.forward(&next, pos)).unwrap();
+        let range = want.iter().cloned().fold(f32::MIN, f32::max) - want.iter().cloned().fold(f32::MAX, f32::min);
+        worst_err = worst_err.max(worst(&got, &want) / range);
+        pos += next.len();
+        let best = want.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0 as u32;
+        next = vec![best];
+        let _ = step;
+    }
+    eprintln!("{file}: layers 1-{a} here, {}-{b} and {}-{n} on two other devices, streamed {}: {worst_err:.1e} of the logit range", a + 1, b + 1, budget.is_some());
+    // Identical kernels give identical logits; a stage whose share fits its budget keeps it
+    // resident in the faster layout, which rounds slightly differently from streamed blocks.
+    assert!(worst_err < 1e-3, "{file}: the split model's logits differ");
+
+    // Two turns through a session: the second shares the first's prefix.
+    let mut texts = Vec::new();
+    for engine in [whole, parts] {
+        let mut s = Session::new(engine, &g).unwrap();
+        s.set_sampler(SamplerConfig { temperature: 0.0, repeat_penalty: 1.0, ..Default::default() });
+        let mut out = Vec::new();
+        let mut prompt = tokens[..n_prompt.min(40)].to_vec();
+        for _turn in 0..2 {
+            pollster::block_on(s.prefill(&prompt)).unwrap();
+            // Six tokens a turn (a session that speculates can return several per step).
+            let mut turn = Vec::new();
+            while turn.len() < 6 {
+                turn.extend(pollster::block_on(s.next_many()).unwrap());
+            }
+            turn.truncate(6);
+            out.extend(turn.iter().copied());
+            prompt.extend(turn);
+            prompt.extend([11u32, 220, 1000]);
+        }
+        texts.push(out);
+    }
+    assert_eq!(texts[0], texts[1], "{file}: the split model's greedy text differs");
+}
+
+#[test]
+fn split_across_devices_matches_one_device() {
+    pipeline_matches("tiny-k31-bf16.gguf", None, 40);
+    pipeline_matches("tiny-k31-bf16.gguf", Some(1), 300);
+    pipeline_matches("tiny-deepseek3.gguf", Some(1), 300);
+    pipeline_matches("tiny-qwen3moe.gguf", None, 40);
+    pipeline_matches("Llama-3.2-1B-Instruct-Q4_K_M.gguf", None, 40);
+    pipeline_matches("Llama-3.2-1B-Instruct-Q4_K_M.gguf", Some(300 << 20), 300);
 }

@@ -246,6 +246,10 @@ async function startLoad(source) {
   loadStarted = performance.now();
   setPhase('loading');
   if (source.kind === 'hf') remember('evolve-llm-last', source.id);
+  // With paired devices, each reads only its share of a model from Hugging Face.
+  state.helpers?.unloadAll();
+  const helpers = source.kind === 'hf' ? state.helpers?.ready() ?? [] : [];
+  if (helpers.length && !source.stream) source = { ...source, stream: true, resolve: true, parts: null };
   if (source.kind === 'hf' && (source.resolve || !source.bytes) && !source.parts) {
     // Split models and pasted files: ask Hugging Face for every part and its size first.
     try {
@@ -259,7 +263,141 @@ async function startLoad(source) {
   stopSharing();
   const share = Boolean(source.stream && state.settings.share && source.parts?.length);
   if (share) await startSharing(source);
-  worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx), gpu: state.settings.gpu, gpuMemory: state.settings.gpuMemory, cacheGb: Number(state.settings.cacheGb), share });
+  state.split = helpers.length ? { source, helpers, pending: null, plan: null } : null;
+  worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx), gpu: state.settings.gpu, gpuMemory: state.settings.gpuMemory, cacheGb: Number(state.settings.cacheGb), share, split: helpers.length ? helpers.map((h) => h.capacity) : null });
+}
+
+// ---- Your other devices: pairing, and running part of a model on them ----
+
+let pairing = null;
+// Advanced: other Nostr relays or ICE servers (self-hosting, tests), as JSON in
+// localStorage['evolve-llm-swarm'] = {"relays": [...], "iceServers": [...]}.
+function networkOverrides() {
+  try { return JSON.parse(localStorage.getItem('evolve-llm-swarm') || '{}') || {}; } catch { return {}; }
+}
+
+async function startPairing() {
+  if (pairing) return;
+  const { Helpers, Pairing, newCode } = await import('./devices.mjs');
+  const code = recall('evolve-llm-pair-code') || newCode();
+  remember('evolve-llm-pair-code', code);
+  state.helpers ??= new Helpers({ onChange: renderDevices });
+  const o = networkOverrides();
+  pairing = new Pairing({
+    code,
+    role: 'main',
+    ...(Array.isArray(o.relays) && { relays: o.relays }),
+    ...(Array.isArray(o.iceServers) && { iceServers: o.iceServers }),
+    onLink: (link, id) => state.helpers.add(link, id),
+    onClose: (id) => state.helpers.remove(id),
+  });
+  await pairing.start();
+  remember('evolve-llm-pairing', '1');
+  $('pair-link').value = `${location.origin}${location.pathname}#pair=${code}`;
+  renderDevices();
+}
+
+function stopPairing() {
+  pairing?.stop();
+  pairing = null;
+  try { localStorage.removeItem('evolve-llm-pairing'); } catch { /* storage unavailable */ }
+  renderDevices();
+}
+
+function renderDevices() {
+  $('pair-info').hidden = !pairing;
+  $('pair-start').hidden = Boolean(pairing);
+  const list = $('pair-list');
+  list.replaceChildren();
+  const hs = state.helpers?.list ?? [];
+  if (pairing && !hs.length) list.append(el('li', {}, el('span', { text: 'No other device yet' }), el('span', { text: 'Waiting for the link to be opened' })));
+  for (const h of hs) {
+    const p = h.progress?.total ? ` ${Math.round((100 * h.progress.loaded) / h.progress.total)}%` : '';
+    const layers = h.stage ? `layers ${h.stage.first + 1}–${h.stage.end}` : '';
+    const what = h.state === 'connecting' ? 'Connecting'
+      : h.state === 'ready' ? `Ready · ${formatBytes(h.capacity)} for the model`
+      : h.state === 'loading' ? `Loading ${layers}${p}`
+      : h.state === 'loaded' ? `Running ${layers}` : h.state;
+    list.append(el('li', {}, el('span', { text: h.name }), el('span', { text: what })));
+  }
+  if (state.phase === 'loading' && state.split?.pending) {
+    const busy = state.split.helpers.filter((h) => h.state === 'loading');
+    if (busy.length) $('loading-step').textContent = `Loading on your other devices: ${busy.map((h) => `${h.name}${h.progress?.total ? ` ${Math.round((100 * h.progress.loaded) / h.progress.total)}%` : ''}`).join(', ')}`;
+  }
+}
+
+function onSplitPlan({ helpers: plan, ctx, mine }) {
+  const sp = state.split;
+  if (!sp) return;
+  sp.plan = { mine, helpers: plan.map(({ helper, stage }) => ({ h: sp.helpers[helper], stage })) };
+  sp.pending = Promise.all(sp.plan.helpers.map(({ h, stage }) => state.helpers.load(h, sp.source, stage, ctx)));
+  // A device that cannot load its layers ends the load now rather than after this one's.
+  sp.pending.catch((e) => {
+    if (state.split !== sp || state.phase !== 'loading') return;
+    worker.postMessage({ type: 'cancel' });
+    state.helpers.unloadAll();
+    onError({ during: 'load', message: e.message });
+  });
+}
+
+function onRemoteForward({ id, hidden, n, pos0 }) {
+  state.helpers.forward(hidden, n, pos0).then(
+    (out) => worker.postMessage({ type: 'remote-result', id, hidden: out }, [out]),
+    (e) => worker.postMessage({ type: 'remote-result', id, error: e.message || String(e) }),
+  );
+}
+
+/** Where the loaded model's layers run, for the status line. */
+function splitSummary() {
+  const plan = state.split?.plan;
+  if (!plan?.helpers.length) return '';
+  const here = plan.mine?.end ? `layers 1–${plan.mine.end} here` : 'the input and output here';
+  return ` · ${here}, ${plan.helpers.map(({ h, stage }) => `${stage.first + 1}–${stage.end} on ${h.name}`).join(', ')}`;
+}
+
+// A page opened from a pairing link lends this device to the chat device.
+let helping = null;
+async function startHelping(code) {
+  state.helping = true;
+  const dlg = $('helping');
+  $('helping-code').textContent = code;
+  dlg.addEventListener('cancel', (e) => e.preventDefault());
+  $('helping-stop').onclick = () => { location.replace(location.pathname); };
+  dlg.showModal();
+  while (!state.adapter) await new Promise((r) => setTimeout(r, 200));
+  if (!state.adapter.ok) { $('helping-status').textContent = 'This browser cannot run models (WebGPU is unavailable), so it cannot help.'; return; }
+  const { Helping, Pairing } = await import('./devices.mjs');
+  const { capacityOf } = await import('./split.mjs');
+  const o = networkOverrides();
+  const about = { name: deviceName(), capacity: capacityOf(state.settings.gpuMemory), gpu: state.adapter.description || '' };
+  const show = (s) => { $('helping-status').textContent = s; };
+  pairing = new Pairing({
+    code,
+    role: 'helper',
+    ...(Array.isArray(o.relays) && { relays: o.relays }),
+    ...(Array.isArray(o.iceServers) && { iceServers: o.iceServers }),
+    onLink: (link) => {
+      helping?.stop();
+      show('Connected. Waiting for your other device to load a model.');
+      helping = new Helping({
+        link, worker, about, settings: () => state.settings,
+        onState: (st) => {
+          if (st.state === 'loading') show(`Loading layers ${st.stage.first + 1}–${st.stage.end} from Hugging Face${st.progress?.total ? `: ${Math.round((100 * st.progress.loaded) / st.progress.total)}%` : '…'}`);
+          else if (st.state === 'loaded') show(`Running layers ${st.stage.first + 1}–${st.stage.end}${st.served ? ` · ${st.served} ${st.served === 1 ? 'pass' : 'passes'}` : ''}. Keep this tab open.`);
+          else if (st.state === 'error') show(`Could not load: ${st.message}`);
+          else if (st.state === 'idle') show('Connected. Waiting for your other device to load a model.');
+        },
+      });
+    },
+    onClose: () => show('Your other device disconnected. Waiting for it to come back…'),
+  });
+  await pairing.start();
+}
+
+function deviceName() {
+  const ua = navigator.userAgent;
+  const os = /Android/.test(ua) ? 'Android device' : /iPhone|iPad/.test(ua) ? 'iPhone or iPad' : /Mac OS X/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows PC' : /CrOS/.test(ua) ? 'Chromebook' : /Linux/.test(ua) ? 'Linux computer' : 'Device';
+  return os;
 }
 
 // ---- Sharing model pieces with other visitors (opt-in) ----
@@ -371,13 +509,13 @@ function onLoaded({ model, chat, source }) {
   const secs = (performance.now() - loadStarted) / 1000;
   const cfg = model.config;
   const types = Object.keys(model.weight_types).join(', ');
-  $('ready-title').textContent = `${label} is running on your GPU`;
+  $('ready-title').textContent = state.split?.plan?.helpers.length ? `${label} is running on your devices` : `${label} is running on your GPU`;
   const active = model.active_parameters < model.parameters * 0.9 ? `, ${formatParams(model.active_parameters)} active per token` : '';
   const pl = chat.placement || {};
   const where = pl.streaming
     ? ` · ${formatBytes(chat.weight_bytes + chat.state_bytes)} on the GPU, ${formatBytes(pl.streamed_bytes)} read from storage as needed${pl.expert_slots ? ` (an expert cache of ${pl.expert_slots.toLocaleString()} of ${pl.experts_total.toLocaleString()} experts)` : ` (${pl.resident_layers} of ${cfg.n_layer} layers on the GPU)`}`
     : ` · ${formatBytes(chat.weight_bytes + chat.state_bytes)} of GPU memory`;
-  $('ready-meta').textContent = `${formatParams(model.parameters)} parameters${active} · ${types} · ${cfg.n_layer} layers · ${chat.context.toLocaleString()}-token context${where} · ready in ${secs.toFixed(1)} s`;
+  $('ready-meta').textContent = `${formatParams(model.parameters)} parameters${active} · ${types} · ${cfg.n_layer} layers · ${chat.context.toLocaleString()}-token context${where}${splitSummary()} · ready in ${secs.toFixed(1)} s`;
   $('suggestions').replaceChildren(...SUGGESTIONS.map((s) => el('button', { type: 'button', text: s, onclick: () => send(s) })));
   $('status-line').textContent = 'Replies are generated on this device. Responses can be wrong; check anything important.';
   setPhase('ready');
@@ -645,6 +783,8 @@ function onError({ during, message }) {
 
 function onWorkerMessage(event) {
   const msg = event.data;
+  // While lending this device to another, its worker answers that device (see devices.mjs).
+  if (state.helping && msg.type !== 'adapter') return;
   if (msg.requestId) {
     if (!agentRequest || msg.requestId !== agentRequest.id) return;
     if (msg.type === 'agent_event' && msg.event.type === 'token') agentRequest.onToken?.(msg.event.text);
@@ -658,7 +798,16 @@ function onWorkerMessage(event) {
     case 'progress': onProgress(msg); break;
     case 'stream-progress': onStreamProgress(msg); break;
     case 'inspected': break;
-    case 'loaded': onLoaded(msg); break;
+    case 'loaded':
+      // With other devices running part of the model, it is ready when they are.
+      if (state.split?.pending) {
+        const sp = state.split;
+        sp.pending.then(() => { if (state.split === sp && state.phase === 'loading') onLoaded(msg); }, () => {});
+      } else onLoaded(msg);
+      break;
+    case 'split-plan': onSplitPlan(msg); break;
+    case 'remote-forward': onRemoteForward(msg); break;
+    case 'remote-control': state.helpers?.control(msg.op); break;
     case 'prefill': onPrefill(msg); break;
     case 'token':
       if (state.live) {
@@ -852,6 +1001,7 @@ function finishAgent(error,value) {
 }
 function restartEngine(reason) {
   stopSharing();
+  state.helpers?.unloadAll();
   worker.terminate();finishAgent(new Error(reason));state.loaded=null;state.loading=null;
   worker=new Worker(new URL('./worker.js',import.meta.url),{type:'module'});worker.onmessage=onWorkerMessage;worker.onerror=onWorkerError;
   setPhase('starting');worker.postMessage({type:'hello',gpu:state.settings.gpu});$('status-line').textContent=reason+' Choose a saved model to reload it.';
@@ -907,3 +1057,11 @@ if(!$('chat-mode').value)$('chat-mode').value='auto';
 $('chat-mode').addEventListener('change',()=>remember('evolve-llm-chat-mode',$('chat-mode').value));
 
 worker.postMessage({ type: 'hello', gpu: state.settings.gpu });
+{
+  const code = new URLSearchParams(location.hash.slice(1)).get('pair');
+  if (code) startHelping(code.toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 24));
+  else if (recall('evolve-llm-pairing') === '1') startPairing().catch(() => {});
+  $('pair-start').addEventListener('click', () => startPairing().catch((e) => { $('status-line').textContent = `Pairing could not start: ${e.message || e}`; }));
+  $('pair-stop').addEventListener('click', stopPairing);
+  $('pair-copy').addEventListener('click', () => navigator.clipboard?.writeText($('pair-link').value).catch(() => {}));
+}

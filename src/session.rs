@@ -90,6 +90,9 @@ impl Session {
         if let Ok(v) = std::env::var("EVOLVE_LLM_SPECULATE") {
             s.spec.on = v == "1";
         }
+        // Verifying a draft needs every token's logits from one pass; with other devices running
+        // part of the model, tokens go one at a time.
+        s.spec.on &= !s.engine.has_remote();
         Ok(s)
     }
 
@@ -129,7 +132,7 @@ impl Session {
 
     /// Turn speculative decoding on or off (on by default when the model streams).
     pub fn set_speculation(&mut self, on: bool) {
-        self.spec.on = on;
+        self.spec.on = on && !self.engine.has_remote();
     }
 
     /// Bring the cache to exactly `tokens`, computing only the part that differs.

@@ -208,6 +208,7 @@ fn load_from(m: &Model, ctx: usize, gpu_mem: u64) -> Session {
             _ => evolve_llm::quant::Layout::Fast,
         },
         budget: (gpu_mem > 0).then_some(gpu_mem << 20),
+        stage: None,
     };
     let mut engine = Engine::with_options(gpu, g, opts).unwrap();
     // Resident weights in slices of up to 64 MB, fetched about 512 MB at a time.
@@ -314,6 +315,7 @@ fn main() {
                 binding_limit: None,
                 layout: evolve_llm::quant::Layout::Fast,
                 budget: (a.gpu_mem > 0).then_some(a.gpu_mem << 20),
+                stage: None,
             };
             let mut e = Engine::with_options(gpu, g, opts).unwrap_or_else(|err| panic!("{err}"));
             e.finish(a.ctx).unwrap_or_else(|err| panic!("{err}"));

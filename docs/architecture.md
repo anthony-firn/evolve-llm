@@ -156,6 +156,34 @@ a cache in front of the network:
 
 `web/remote-reader.mjs` is the browser side, `src/remote.rs` the native one.
 
+### One model across a person's devices
+
+A model too large for one device can run across several of the same person's
+(`web/devices.mjs`, `Stage` and `Remote` in `src/gpu/engine.rs`):
+
+- **Stages.** An engine built with `Options.stage` holds only layers `first..end`, plus the
+  embedding and output head when it is the device the chat runs on. Tensors outside the stage
+  are never allocated or read, and placement (resident, streamed, expert caches) applies to the
+  stage's share, so each device keeps as much of its layers on its GPU as its budget allows.
+  `web/split.mjs` gives each device a run of layers in proportion to its memory; the chat
+  device's share counts the embedding and head.
+- **Passes.** The chat device embeds the tokens and runs its layers, then hands the hidden state
+  to a `Remote` (the page, which sends it through each helper in layer order) and runs the head
+  on what comes back. A helper's `forward_hidden` reads the hidden state and returns its own.
+  The state is token-major: the residual stream, then (Kimi K3.1) each block checkpoint made so
+  far, so a batch can be cut or joined anywhere; it is about 28 KB per token for most models.
+  The whole batch goes through once per pass, so a long prompt costs one round trip per
+  layer-by-layer pass, and a helper that streams reads its weights once per prompt as well.
+  Recurrent snapshots and restores are mirrored to the helpers, which process messages in
+  order; speculative decoding is off (verifying a draft needs every token's logits from one
+  pass).
+- **Pairing.** The chat device shows a link with a random code. Pages announce themselves on a
+  Nostr topic derived from the code, with an HMAC of their role and per-visit key, so a relay
+  observer cannot join, and only a chat device and a helper connect. Offers and answers are
+  encrypted to their recipient, as for the swarm; hidden states travel over the WebRTC data
+  channel in 64 KiB frames. A helper receives the model's internal state for each step (derived from the conversation),
+  not the conversation's text; pair only devices you trust.
+
 ### Sharing pieces between visitors
 
 With sharing on, visitors running the same model file form a swarm and pass pieces browser to
