@@ -257,8 +257,9 @@ async function startLoad(source) {
     }
   }
   stopSharing();
-  if (source.stream && state.settings.share && source.parts?.length) startSharing(source);
-  worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx), gpu: state.settings.gpu, gpuMemory: state.settings.gpuMemory, cacheGb: Number(state.settings.cacheGb) });
+  const share = Boolean(source.stream && state.settings.share && source.parts?.length);
+  if (share) await startSharing(source);
+  worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx), gpu: state.settings.gpu, gpuMemory: state.settings.gpuMemory, cacheGb: Number(state.settings.cacheGb), share });
 }
 
 // ---- Sharing model pieces with other visitors (opt-in) ----
@@ -277,7 +278,7 @@ async function startSharing(source) {
     if (custom.manifests) swarmOptions.manifests = new (await import('./swarm-protocol.mjs')).Manifests(custom.manifests);
     if (Array.isArray(custom.relays)) swarmOptions.signal = new (await import('./swarm-signal.mjs')).Signal({ relays: custom.relays });
     if (Array.isArray(custom.iceServers)) swarmOptions.iceServers = custom.iceServers;
-    const session = await startSwarm({
+    const session = startSwarm({
       swarmOptions,
       parts: source.parts.map((p) => ({ sha256: p.sha256, bytes: p.bytes })),
       cacheKey: source.key,
@@ -285,11 +286,15 @@ async function startSharing(source) {
       uploadBytesPerSec: Number(state.settings.shareUpload) * 1e6,
       onStats: (s) => { state.swarmStats = s; renderSwarm(); },
     });
-    if (token !== swarmToken) { session?.stop(); return; }
+    if (token !== swarmToken) { session.stop(); return; }
     swarmSession = session;
-    state.swarmStats = session ? { peers: 0, fromPeers: 0, toPeers: 0 } : null;
-    if (!session) $('status-line').textContent = 'No piece manifest is published for this model yet, so it is read from Hugging Face only.';
-    renderSwarm();
+    // The worker's first reads already wait on the session; this only reports how it started.
+    session.ready.then((shared) => {
+      if (token !== swarmToken) return;
+      state.swarmStats = shared ? { peers: 0, fromPeers: 0, toPeers: 0 } : null;
+      if (!shared) $('status-line').textContent = 'No piece manifest is published for this model yet, so it is read from Hugging Face only.';
+      renderSwarm();
+    });
   } catch (e) {
     if (token === swarmToken) $('status-line').textContent = `Sharing could not start: ${e.message || e}`;
   }

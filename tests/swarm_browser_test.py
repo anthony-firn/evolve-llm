@@ -32,16 +32,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hf", default="bartowski/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct-Q8_0.gguf")
     ap.add_argument("--headed", action="store_true")
+    ap.add_argument("--url", help="a deployed page instead of dist/ (e.g. https://www.evolvetech.dev/play/evolve-llm/)")
+    ap.add_argument("--public-relays", action="store_true", help="find each other through the default public Nostr relays")
     a = ap.parse_args()
     relay = subprocess.Popen(["node", str(ROOT / "tests/fixtures/mini-nostr-relay.mjs")], stdout=subprocess.PIPE, text=True)
     port = int(relay.stdout.readline())
-    server = serve(ROOT / "dist")
-    url = f"http://127.0.0.1:{server.server_address[1]}/play/evolve-llm/"
+    url = a.url or f"http://127.0.0.1:{serve(ROOT / 'dist').server_address[1]}/play/evolve-llm/"
     prompt = "Name three planets in our solar system."
     problems = []
     settings = {"temperature": 0, "maxTokens": 12, "ctx": 2048, "thinking": False, "gpu": "high-performance",
                 "gpuMemory": "0.05", "cacheGb": 1, "share": True, "shareUpload": 0}
-    swarm = {"relays": [f"ws://127.0.0.1:{port}"], "iceServers": []}
+    swarm = {"iceServers": []} if a.public_relays else {"relays": [f"ws://127.0.0.1:{port}"], "iceServers": []}
     try:
         with sync_playwright() as p:
             # Host candidates as plain addresses, so two profiles on one machine reach each other.

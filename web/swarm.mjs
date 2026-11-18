@@ -10,6 +10,9 @@ export const MANIFESTS = 'https://raw.githubusercontent.com/anthony-firn/evolve-
 export const ICE_SERVERS = [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }];
 const MAX_PEERS = 8;
 const REQUEST_MS = 20000;
+// Right after starting, a piece no peer has yet is waited for this long while peers connect (a
+// model's first reads, its headers, come before any connection is up).
+const GRACE_MS = 6000;
 
 /** Wait until ICE gathering is complete, or `ms`, so one message carries every candidate. */
 function gathered(pc, ms) {
@@ -43,7 +46,9 @@ export class Swarm {
    * `read(sha, s, e)` returns chunks [s, e) of a file from this device's cache, or null.
    * `files`: [{sha, size}] the swarm is about.
    */
-  constructor({ files, read, uploadBytesPerSec = 1 << 20, manifests = new Manifests(MANIFESTS), signal, iceServers = ICE_SERVERS, RTC = globalThis.RTCPeerConnection, onStats = () => {} }) {
+  constructor({ files, read, uploadBytesPerSec = 1 << 20, manifests = new Manifests(MANIFESTS), signal, iceServers = ICE_SERVERS, RTC = globalThis.RTCPeerConnection, onStats = () => {}, graceMs = GRACE_MS }) {
+    this.graceMs = graceMs;
+    this.graceUntil = 0;
     this.files = new Map(files.map((f) => [f.sha, { ...f, have: new RangeSet() }]));
     this.read = read;
     this.manifests = manifests;
@@ -69,6 +74,7 @@ export class Swarm {
     }
     if (!usable.length) return usable;
     this.signal.start(usable);
+    this.graceUntil = Date.now() + this.graceMs;
     this.timer = setInterval(() => this.announce(), 30000);
     setTimeout(() => this.announce(), 1500);
     return usable;
@@ -184,7 +190,11 @@ export class Swarm {
       await this.limiter.take(part.byteLength);
       if (p.dc.readyState !== 'open') return;
       if (p.dc.bufferedAmount > 4 << 20) {
-        await new Promise((r) => p.dc.addEventListener('bufferedamountlow', r, { once: true }));
+        await new Promise((r) => {
+          p.dc.addEventListener('bufferedamountlow', r, { once: true });
+          p.dc.addEventListener('close', r, { once: true });
+        });
+        if (p.dc.readyState !== 'open') return;
       }
       p.dc.send(encodeFrame(m.id, at, part));
       this.stats.toPeers += part.byteLength;
@@ -226,11 +236,15 @@ export class Swarm {
   async get(sha, s, e) {
     if (!this.files.has(sha) || e - s > MAX_REQUEST_CHUNKS) return null;
     const tried = new Set();
+    const pick = () => [...this.peers.values()]
+      .filter((p) => p.dc?.readyState === 'open' && !tried.has(p.id) && p.have.get(sha)?.has(s, e))
+      .sort((a, b) => a.busy - b.busy)[0];
     for (let attempt = 0; attempt < 3; attempt++) {
-      const candidates = [...this.peers.values()]
-        .filter((p) => p.dc?.readyState === 'open' && !tried.has(p.id) && p.have.get(sha)?.has(s, e))
-        .sort((a, b) => a.busy - b.busy);
-      const p = candidates[0];
+      let p = pick();
+      while (!p && attempt === 0 && Date.now() < this.graceUntil) {
+        await new Promise((r) => setTimeout(r, 200));
+        p = pick();
+      }
       if (!p) return null;
       tried.add(p.id);
       const buf = await this.request(p, sha, s, e);

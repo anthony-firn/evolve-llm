@@ -228,7 +228,8 @@ function swarmGet(sha, s, e) {
     const id = ++swarmSeq;
     swarmCalls.set(id, resolve);
     post('swarm-get', { id, sha, s, e });
-    setTimeout(() => { if (swarmCalls.delete(id)) resolve(null); }, 30000);
+    // Up to three peers, each given 20 s, after a wait for peers at the start.
+    setTimeout(() => { if (swarmCalls.delete(id)) resolve(null); }, 75000);
   });
 }
 
@@ -548,8 +549,9 @@ const handlers = {
   async adapter({ gpu }) {
     post('adapter', { adapter: await describeAdapter(gpu) });
   },
-  async load({ source, ctx, gpu, gpuMemory, cacheGb }) {
+  async load({ source, ctx, gpu, gpuMemory, cacheGb, share }) {
     cancelLoad = false;
+    swarmOn = Boolean(share);
     unload();
     await ensureWasm();
     let files;

@@ -134,7 +134,7 @@ Reference results come from independent implementations (`tools/make_fixtures.py
 | Kimi K3.1 layout (tiny random model, akopytko/tiny-kimi-k3.1-pro-GGUF), dense and with the indexer's top-k at 8 | `tools/ref_kimi_k31.py`, float64 NumPy written from llama.cpp's graph | Within 0.06% of the logit range, resident and streamed with a 16-slot expert cache |
 | Llama 3.2 1B read from Hugging Face (`hf:` path, 300 MB GPU budget) | The same model from a local file | Identical greedy replies |
 | Kimi K3.1 Pro IQ1_S headers (14 parts, 2,693 tensors) | The engine's shape and format checks, over the network | Every tensor accepted |
-| Two visitors sharing pieces (`tests/swarm_browser_test.py`), SmolLM2 135M read from Hugging Face | The first visitor's reply | Identical; the second received 210 MB from the first over WebRTC and 8 MB from Hugging Face, loading and replying in 12 s instead of 142 s |
+| Two visitors sharing pieces (`tests/swarm_browser_test.py`), SmolLM2 135M read from Hugging Face | The first visitor's reply | Identical; the second received 219 MB from the first over WebRTC and 4 KB from Hugging Face, loading and replying in 11 s instead of 71 s; the same on evolvetech.dev through public Nostr relays |
 | Browser reply, greedy | The native build on Vulkan | Identical text for SmolLM2 135M, Qwen2.5 0.5B, Qwen3 0.6B, Llama 3.2 1B and OLMoE 1B-7B (resident and streamed) |
 
 The tiny-model tests build a random model of each mixture-of-experts layout with
