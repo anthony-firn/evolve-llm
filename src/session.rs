@@ -15,6 +15,8 @@ pub struct Session {
     /// Tokens whose keys and values are in the cache, in order.
     cached: Vec<u32>,
     logits: Vec<f32>,
+    /// Tokens the engine's recurrent-state snapshot has read (recurrent models only).
+    snapshot: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -36,6 +38,7 @@ impl Session {
             sampler: Sampler::new(SamplerConfig::default()),
             cached: Vec::new(),
             logits: Vec::new(),
+            snapshot: None,
         })
     }
 
@@ -69,6 +72,7 @@ impl Session {
     pub fn reset(&mut self) {
         self.cached.clear();
         self.logits.clear();
+        self.snapshot = None;
     }
 
     /// Bring the cache to exactly `tokens`, computing only the part that differs.
@@ -91,10 +95,24 @@ impl Session {
             .count();
         // The last prompt token always runs, because its logits pick the first reply token.
         common = common.min(tokens.len() - 1);
+        // A recurrent state cannot be rewound. When this prompt leaves the cache, or a pass
+        // stopped part way (the state no longer matches the cache), go back to the snapshot
+        // taken at the end of the last prompt if it is still a prefix, or start over.
+        let stale = self.engine.is_recurrent() && self.engine.recurrent_position() != self.cached.len();
+        if self.engine.is_recurrent() && (stale || common < self.cached.len()) {
+            common = match self.snapshot.filter(|&p| p <= common) {
+                Some(p) if self.engine.restore() == Some(p) => p,
+                _ => 0,
+            };
+        }
         self.cached.truncate(common);
         let rest = &tokens[common..];
         self.logits = self.engine.forward(rest, common).await?;
         self.cached.extend_from_slice(rest);
+        if self.engine.is_recurrent() {
+            self.engine.snapshot();
+            self.snapshot = Some(self.cached.len());
+        }
         Ok(Prefill {
             reused: common,
             computed: rest.len(),

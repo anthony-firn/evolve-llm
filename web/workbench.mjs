@@ -13,7 +13,7 @@ async function database(mode, value) {
       op.onsuccess=()=>result=op.result;tx.oncomplete=()=>{db.close();resolve(result)};tx.onerror=()=>{db.close();reject(new Error('Workspace could not be saved.'))};};
   });
 }
-export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwork, modelName }) {
+export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwork, modelName, taskTimeLimit = () => 180000 }) {
   const root=node('section',undefined,'workbench');root.id='workbench';root.hidden=true;root.setAttribute('aria-label','WASM terminal and Pi agent');
   const head=node('header'),title=node('div');title.append(node('strong','Terminal & Pi'),node('small','WASM workspace · local model'));
   const tokenLabel=node('label'),tokenLimit=node('select');tokenLimit.id='pi-output-tokens';for(const value of [1024,2048,4096]){const option=node('option',String(value));option.value=value;tokenLimit.append(option)}tokenLimit.value='2048';tokenLabel.append(node('span','Pi tokens'),tokenLimit);
@@ -60,7 +60,7 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   previewActions.append(button('Show/hide log',()=>console.classList.toggle('preview-expanded')),button('Full size',()=>root.classList.toggle('preview-wide')),button('Reload',()=>run(()=>openPreview(previewPath,{signal:task.signal}))),button('Test',()=>run(()=>openPreview(previewPath,{signal:task.signal,smoke:true}))),button('Stop preview',()=>{preview.stop();previewPanel.hidden=true;console.classList.remove('preview-expanded')}));
   function setBusy(value){busy=value;submit.disabled=value;stop.disabled=!value;for(const control of actions.querySelectorAll('button'))control.disabled=value;for(const control of files.querySelectorAll('button'))control.disabled=value;}
   async function run(fn,{rethrow=false}={}) {
-    if(busy){if(rethrow)throw new Error('Workspace is busy.');return;}externalTask=rethrow;setBusy(true);task=new AbortController();const deadline=setTimeout(()=>task?.abort(),180000);
+    if(busy){if(rethrow)throw new Error('Workspace is busy.');return;}externalTask=rethrow;setBusy(true);task=new AbortController();const limit=taskTimeLimit();const deadline=limit?setTimeout(()=>task?.abort(),limit):null;
     try{await boot();const result=await fn();await saving;status.textContent='Ready · files saved in this browser';return result;}
     catch(error){status.textContent=String(error.message||error);record('Error',String(error.message||error),'error');if(rethrow)throw error;}
     finally{clearTimeout(deadline);agent=null;task=null;externalTask=false;setBusy(false);if(!root.hidden)input.focus()}

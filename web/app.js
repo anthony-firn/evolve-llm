@@ -7,7 +7,7 @@ const $ = (id) => document.getElementById(id);
 const app = $('app');
 let worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 
-const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', internet: false, jinaKey: '' };
+const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', cacheGb: 10, internet: false, jinaKey: '' };
 const SUGGESTIONS = [
   'Make me a Snake game I can play.',
   'Write a haiku about running AI on my own laptop.',
@@ -134,7 +134,9 @@ function cachedEntry(key) {
 function catalogEntry(m) {
   const key = cacheKey(m.repo, m.file);
   const split = Boolean(splitParts(m.file));
-  return { kind: 'hf', id: m.id, key, repo: m.repo, file: m.file, revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, name: m.name, resolve: split };
+  // Models marked `stream` are read from Hugging Face as they run instead of downloaded.
+  const stream = Boolean(m.stream) && !cachedEntry(key)?.complete;
+  return { kind: 'hf', id: m.id, key, repo: m.repo, file: m.file, revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, name: m.name, resolve: split, stream };
 }
 
 const ALL = [...MODELS, ...LARGE];
@@ -151,6 +153,7 @@ function renderModels() {
       el('span', { class: 'tag', text: m.quant }),
       running ? el('span', { class: 'tag run', text: 'Running' }) : null,
       saved && !running ? el('span', { class: 'tag ok', text: 'Saved' }) : null,
+      m.stream && !saved ? el('span', { class: 'tag', text: 'Runs from Hugging Face' }) : null,
       partial ? el('span', { class: 'tag', text: `Paused at ${Math.round((cached.stored / cached.bytes) * 100)}%` }) : null,
       m.recommended && !saved && !running ? el('span', { class: 'tag rec', text: 'Recommended' }) : null,
       m.params ? el('span', { class: 'tag', text: m.params }) : null,
@@ -227,7 +230,7 @@ async function startLoad(source) {
   const first = source.kind === 'file' ? source.files[0].name : '';
   const known = source.kind === 'file' ? ALL.find((m) => m.file.split('/').pop().toLowerCase() === first.toLowerCase()) : null;
   const label = known ? known.name : source.kind === 'file' ? first.replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '') : source.name;
-  state.loading = { label, key: known ? cacheKey(known.repo, known.file) : source.key, id: known ? known.id : source.id, kind: source.kind };
+  state.loading = { label, key: known ? cacheKey(known.repo, known.file) : source.key, id: known ? known.id : source.id, kind: source.kind, stream: Boolean(source.stream) };
   state.loaded = null;
   for(const m of state.messages)m.developmentView?.dispose();
   state.messages = [];state.developmentActive=false;
@@ -235,9 +238,10 @@ async function startLoad(source) {
   $('loading-title').textContent = label;
   for (const li of $('loading-steps').children) li.dataset.state = '';
   const saved = source.kind === 'hf' && cachedEntry(source.key)?.complete;
-  setStep(source.kind === 'file' || saved ? 'upload' : 'download', source.kind === 'file' || saved);
+  const local = source.kind === 'file' || saved || source.stream;
+  setStep(local ? 'upload' : 'download', local);
   setProgress(0, 1, '');
-  $('loading-step').textContent = saved ? 'Saved on this device' : source.kind === 'file' ? 'From this device' : 'Downloading';
+  $('loading-step').textContent = saved ? 'Saved on this device' : source.kind === 'file' ? 'From this device' : source.stream ? 'Connecting to Hugging Face' : 'Downloading';
   loadStarted = performance.now();
   setPhase('loading');
   if (source.kind === 'hf') remember('evolve-llm-last', source.id);
@@ -251,7 +255,7 @@ async function startLoad(source) {
       return;
     }
   }
-  worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx), gpu: state.settings.gpu, gpuMemory: state.settings.gpuMemory });
+  worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx), gpu: state.settings.gpu, gpuMemory: state.settings.gpuMemory, cacheGb: Number(state.settings.cacheGb) });
 }
 
 function setStep(step, skipDownload = false) {
@@ -279,8 +283,11 @@ function onProgress({ phase, loaded, total, rate, part, parts }) {
     setStep('download');
     const left = rate > 0 ? (total - loaded) / rate : 0;
     setProgress(loaded, total, `${formatBytes(loaded)} of ${formatBytes(total)} · ${formatBytes(rate)}/s${left > 1 ? ` · about ${formatDuration(left)} left` : ''}`);
+  } else if (phase === 'connect') {
+    $('loading-step').textContent = 'Connecting to Hugging Face';
+    setProgress(0, 1, 'This model is read from Hugging Face as it runs, so it is not downloaded first.');
   } else if (phase === 'upload') {
-    $('loading-step').textContent = 'Moving weights to the GPU';
+    $('loading-step').textContent = state.loading?.stream ? 'Reading the GPU-resident weights from Hugging Face' : 'Moving weights to the GPU';
     setStep('upload', state.loading?.kind === 'file' || $('loading-steps').firstElementChild.dataset.state === 'skip');
     setProgress(loaded, total, `${formatBytes(loaded)} of ${formatBytes(total)} · ${formatBytes(rate)}/s`);
   } else {
@@ -288,6 +295,13 @@ function onProgress({ phase, loaded, total, rate, part, parts }) {
     setStep('prepare', $('loading-steps').firstElementChild.dataset.state === 'skip');
     setProgress(1, 1, 'Allocating the key-value cache and compiling GPU kernels');
   }
+}
+
+// A model read from Hugging Face can take minutes per token: show that it is working.
+function onStreamProgress({ fetched, cacheHit, rate }) {
+  const text = `Reading weights: ${formatBytes(fetched)} from Hugging Face at ${formatBytes(rate)}/s${cacheHit ? `, ${formatBytes(cacheHit)} from this device` : ''}`;
+  if (state.phase === 'loading') setProgress(0, 1, text);
+  else $('status-line').textContent = text;
 }
 
 function formatDuration(s) {
@@ -298,7 +312,7 @@ function formatDuration(s) {
 
 function onLoaded({ model, chat, source }) {
   const label = state.loading?.label || chat.name;
-  state.loaded = { ...source, key: state.loading?.key ?? source.key, label, info: model, chat };
+  state.loaded = { ...source, key: state.loading?.key ?? source.key, label, info: model, chat, stream: Boolean(state.loading?.stream) };
   state.loading = null;
   $('loading-bar').classList.remove('indeterminate');
   const secs = (performance.now() - loadStarted) / 1000;
@@ -433,7 +447,8 @@ function conversation() {
   const msgs = [];
   const system = state.settings.system.trim();
   if (system) msgs.push({ role: 'system', content: system });
-  for (const m of state.messages) if (!m.error && (m.role === 'user' || m.role === 'assistant')) msgs.push({ role: m.role, content: m.role === 'assistant' ? stripToolCalls(m.content) : m.content });
+  // Earlier answers go back without their thinking, as reasoning models' own templates do.
+  for (const m of state.messages) if (!m.error && (m.role === 'user' || m.role === 'assistant')) msgs.push({ role: m.role, content: m.role === 'assistant' ? stripToolCalls(m.content).replace(/<think>[\s\S]*?<\/think>\s*/g, '') : m.content });
   return msgs;
 }
 
@@ -501,7 +516,8 @@ function runGeneration() {
   worker.postMessage({
     type: 'generate',
     messages: history,
-    options: { date: [now.getFullYear(), now.getMonth() + 1, now.getDate()], enable_thinking: Boolean(s.thinking) },
+    // A model read from Hugging Face takes minutes per token: keep its thinking short.
+    options: { date: [now.getFullYear(), now.getMonth() + 1, now.getDate()], enable_thinking: Boolean(s.thinking), ...(state.loaded?.stream && { thinking_effort: 'low' }) },
     sampler: { temperature: Number(s.temperature), top_p: Number(s.top_p), top_k: Number(s.top_k), min_p: Number(s.min_p), repeat_penalty: Number(s.repeat_penalty), repeat_last_n: 64, seed: (Math.random() * 2 ** 32) >>> 0 },
     maxTokens: Number(s.maxTokens),
     internet: { enabled: Boolean(s.internet), jinaKey: s.jinaKey || '' },
@@ -536,7 +552,10 @@ function onDone(d) {
   const why = d.reason === 'stopped' ? ' · stopped' : d.reason === 'length' ? ' · reached the reply limit' : '';
   const st = d.stream || {};
   const stream = st.bytes_read ? ` · read ${formatBytes(st.bytes_read)} from storage${st.expert_requests ? `, ${Math.round((100 * st.expert_hits) / st.expert_requests)}% of experts already on the GPU` : ''}` : '';
-  m.stats = `${d.tokens} tokens · ${rate} tokens/s${prompt}${why}${stream}`;
+  const n = d.net;
+  const net = n && (n.fetched || n.cacheHit) ? ` · ${formatBytes(n.fetched)} from Hugging Face${n.cacheHit ? `, ${formatBytes(n.cacheHit)} from this device's cache` : ''}` : '';
+  const slow = d.tokens > 0 && d.ms / d.tokens > 10000 ? `${d.tokens} tokens · ${formatDuration(d.ms / 1000 / d.tokens)} per token` : `${d.tokens} tokens · ${rate} tokens/s`;
+  m.stats = `${slow}${prompt}${why}${stream}${net}`;
   if (!m.content.trim()) m.content = d.reason === 'stopped' ? '' : '(no reply)';
   state.live = null;
   $('status-line').textContent = `Context: ${d.used.toLocaleString()} of ${d.context.toLocaleString()} tokens used`;
@@ -584,6 +603,7 @@ function onWorkerMessage(event) {
     case 'adapter': showGpu(msg.adapter); break;
     case 'cache': state.cache = msg; renderModels(); break;
     case 'progress': onProgress(msg); break;
+    case 'stream-progress': onStreamProgress(msg); break;
     case 'inspected': break;
     case 'loaded': onLoaded(msg); break;
     case 'prefill': onPrefill(msg); break;
@@ -669,7 +689,7 @@ function hfSource(ref, file) {
   const first = splitParts(file)?.[0] || file;
   const key = cacheKey(ref.repo, first, ref.revision);
   return { kind: 'hf', id: key, key, repo: ref.repo, file: first, revision: ref.revision, url: hfUrl(ref.repo, first, ref.revision), bytes: 0,
-    name: first.split('/').pop().replace(/(-\d{5}-of-\d{5})?\.gguf$/i, ''), resolve: true };
+    name: first.split('/').pop().replace(/(-\d{5}-of-\d{5})?\.gguf$/i, ''), resolve: true, stream: $('hf-stream').checked };
 }
 
 $('hf-form').addEventListener('submit', async (e) => {
@@ -727,6 +747,7 @@ function fillSettings() {
   form.elements.ctx.value = String(s.ctx);
   form.elements.gpu.value = s.gpu;
   form.elements.gpuMemory.value = String(s.gpuMemory);
+  form.elements.cacheGb.value = String(s.cacheGb ?? 10);
   form.elements.thinking.checked = Boolean(s.thinking);
   form.elements.internet.checked = Boolean(s.internet);
   form.elements.jinaKey.value = s.jinaKey || '';
@@ -750,7 +771,7 @@ form.addEventListener('input', (e) => {
   saveSettings();
 });
 form.addEventListener('change', (e) => {
-  if (['ctx', 'gpu', 'gpuMemory'].includes(e.target.name) && state.loaded) $('status-line').textContent = 'This setting applies the next time a model loads.';
+  if (['ctx', 'gpu', 'gpuMemory', 'cacheGb'].includes(e.target.name) && state.loaded) $('status-line').textContent = 'This setting applies the next time a model loads.';
 });
 $('open-settings').addEventListener('click', () => { fillSettings(); dialog.showModal(); });
 $('reset-settings').addEventListener('click', () => {
@@ -779,13 +800,22 @@ function restartEngine(reason) {
   worker=new Worker(new URL('./worker.js',import.meta.url),{type:'module'});worker.onmessage=onWorkerMessage;worker.onerror=onWorkerError;
   setPhase('starting');worker.postMessage({type:'hello',gpu:state.settings.gpu});$('status-line').textContent=reason+' Choose a saved model to reload it.';
 }
+// Time limits for Pi, in ms (0: none). A model read from Hugging Face can take minutes to hours
+// per token, and one that streams from this device's storage seconds, so they get longer ones;
+// `stop` is how long a cancelled turn may take to wind down before the worker is restarted.
+function piLimits() {
+  if (state.loaded?.stream) return { turn: 0, task: 0, stop: 120000 };
+  if (state.loaded?.chat?.placement?.streaming) return { turn: 1800000, task: 7200000, stop: 60000 };
+  return { turn: 120000, task: 180000, stop: 10000 };
+}
 function agentTurn(messages,tools,{signal,onToken,maxTokens=2048}={}) {
   if(state.phase!=='agent'||agentRequest)return Promise.reject(new Error('The model is busy.'));
   if(signal?.aborted)return Promise.reject(new Error('Pi model turn cancelled.'));
   return new Promise((resolve,reject)=>{
     const id=++agentSequence;
-    const abort=()=>{if(agentRequest?.id!==id)return;agentRequest.aborted=true;worker.postMessage({type:'stop'});agentRequest.cancelTimer=setTimeout(()=>restartEngine('Pi cancellation released an unresponsive worker.'),10000)};
-    agentRequest={id,resolve,reject,onToken,signal,abort,timer:setTimeout(()=>restartEngine('Pi model turn exceeded its two-minute limit.'),120000)};
+    const limits=piLimits();
+    const abort=()=>{if(agentRequest?.id!==id)return;agentRequest.aborted=true;worker.postMessage({type:'stop'});agentRequest.cancelTimer=setTimeout(()=>restartEngine('Pi cancellation released an unresponsive worker.'),limits.stop)};
+    agentRequest={id,resolve,reject,onToken,signal,abort,timer:limits.turn?setTimeout(()=>restartEngine(`Pi model turn exceeded its ${Math.round(limits.turn/60000)}-minute limit.`),limits.turn):null};
     signal?.addEventListener('abort',abort,{once:true});
     worker.postMessage({type:'agent_turn',requestId:id,messages,tools,maxTokens:Math.max(64,Math.min(4096,Number(maxTokens)||2048)),sampler:{temperature:0,top_p:.95,top_k:40,min_p:.05,repeat_penalty:1.1,repeat_last_n:64,seed:1}});
   });
@@ -795,7 +825,7 @@ function networkChanged() {
 }
 async function ensureWorkbench(){
   workbenchPromise ||= import('./workbench.mjs').then(({mountWorkbench})=>mountWorkbench({
-    ready:()=>['ready','preparing'].includes(state.phase)&&Boolean(state.loaded),turn:agentTurn,modelName:()=>state.loaded?.label||'Local model',
+    ready:()=>['ready','preparing'].includes(state.phase)&&Boolean(state.loaded),turn:agentTurn,modelName:()=>state.loaded?.label||'Local model',taskTimeLimit:()=>piLimits().task,
     lease:()=>{if(!['ready','preparing'].includes(state.phase)||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?(state.live?.development?'preparing':'ready'):'idle');}};},
     getNetwork:()=>({enabled:Boolean(state.settings.internet),jinaKey:state.settings.jinaKey||''}),
     setNetwork:enabled=>{state.settings.internet=enabled;saveSettings();syncWebToggle();networkChanged();},

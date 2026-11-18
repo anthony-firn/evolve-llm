@@ -3,8 +3,9 @@
 use super::{read_back, shaders, Gpu};
 use crate::gguf::Gguf;
 use crate::model::{self, Config, Gating};
+use std::cell::Cell;
 use crate::quant::{self, GpuFormat, Layout};
-use crate::source::WeightSource;
+use crate::source::{Span, WeightSource};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
@@ -159,6 +160,10 @@ enum Grid {
     ExpertTiles { rows: u32, experts: u32 },
     /// A single workgroup whatever the token count.
     Single,
+    /// A fixed number of workgroups whatever the token count (kernels that walk the tokens).
+    Groups(u32),
+    /// (blocks of 256 cached positions, n_tokens).
+    KeyBlocks(u32),
     /// (256-value blocks of `width`, n_tokens).
     Width(u32),
 }
@@ -187,6 +192,14 @@ enum Kernel {
     MatmulIdGemm(GpuFormat),
     RouteSort,
     MoeSum,
+    ResMix,
+    Fill,
+    KdaConv,
+    L2Norm,
+    Kda,
+    IdxStore,
+    IdxScore,
+    IdxTopK,
 }
 
 struct Op {
@@ -207,6 +220,14 @@ struct Layouts {
     attention: wgpu::BindGroupLayout,
     topk: wgpu::BindGroupLayout,
     mla: wgpu::BindGroupLayout,
+    res_mix: wgpu::BindGroupLayout,
+    fill: wgpu::BindGroupLayout,
+    kda_conv: wgpu::BindGroupLayout,
+    l2norm: wgpu::BindGroupLayout,
+    kda: wgpu::BindGroupLayout,
+    mla_attn: wgpu::BindGroupLayout,
+    idx: wgpu::BindGroupLayout,
+    idx_topk: wgpu::BindGroupLayout,
 }
 
 /// Op ranges of one layer: attention up to the expert choice, the expert projections, the rest.
@@ -234,6 +255,10 @@ struct State {
     route_staging: wgpu::Buffer,
     emap: wgpu::Buffer,
     bytes: u64,
+    /// Per linear-attention layer: its recurrent state and convolution inputs, and a copy of
+    /// both taken at the end of the last prompt (a recurrent state cannot be rewound).
+    kda: Vec<(wgpu::Buffer, wgpu::Buffer)>,
+    kda_snap: Vec<(wgpu::Buffer, wgpu::Buffer)>,
 }
 
 pub struct Engine {
@@ -258,8 +283,11 @@ pub struct Engine {
     ring_head: Vec<String>,
     plan_index: HashMap<String, usize>,
     stream: RefCell<Stream>,
-    source: RefCell<Option<Box<dyn WeightSource>>>,
+    source: RefCell<Option<std::rc::Rc<dyn WeightSource>>>,
     pub placement: Placement,
+    /// Tokens the recurrent state has read, and the position of its snapshot.
+    recurrent_pos: Cell<usize>,
+    snapshot_pos: Cell<Option<usize>>,
 }
 
 fn storage(ro: bool, binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -431,7 +459,8 @@ impl Engine {
                 for l in (0..cfg.n_layer).filter(|&l| cfg.is_moe(l)) {
                     let names = ["gate", "up", "down"].map(|k| format!("blk.{l}.ffn_{k}_exps.weight"));
                     let types = [ty(&names[0]), ty(&names[1]), ty(&names[2])];
-                    let shape = [(e.n_ff, cfg.n_embd), (e.n_ff, cfg.n_embd), (cfg.n_embd, e.n_ff)];
+                    let w = cfg.expert_in();
+                    let shape = [(e.n_ff, w), (e.n_ff, w), (w, e.n_ff)];
                     let p = match pools.iter().position(|p| p.types == types) {
                         Some(p) => p,
                         None => {
@@ -702,6 +731,14 @@ impl Engine {
             attention: layout(device, "uurrrw"),
             topk: layout(device, "uurrw"),
             mla: layout(device, "uurrrw"),
+            res_mix: layout(device, "uurrww"),
+            fill: layout(device, "uuw"),
+            kda_conv: layout(device, "uurww"),
+            l2norm: layout(device, "uuw"),
+            kda: layout(device, "uurrrrrww"),
+            mla_attn: layout(device, "uurrrwrr"),
+            idx: layout(device, "uurrrw"),
+            idx_topk: layout(device, "uurw"),
         };
         let dummy = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dummy"),
@@ -740,6 +777,8 @@ impl Engine {
             }),
             source: RefCell::new(None),
             placement,
+            recurrent_pos: Cell::new(0),
+            snapshot_pos: Cell::new(None),
         };
         e.compile()?;
         Ok(e)
@@ -759,6 +798,12 @@ impl Engine {
             return;
         }
         let device = &self.gpu.device;
+        let source = match self.cfg.situ {
+            Some((b, l)) => source
+                .replace("const SITU_B: f32 = 4.0;", &format!("const SITU_B: f32 = {b:?};"))
+                .replace("const SITU_L: f32 = 25.0;", &format!("const SITU_L: f32 = {l:?};")),
+            None => source,
+        };
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&key),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -828,8 +873,28 @@ impl Engine {
             self.pipeline("topk".into(), shaders::topk(), &tk);
         }
         if self.cfg.mla.is_some() {
+            let ma = self.layouts.mla_attn.clone();
             self.pipeline("mla-store".into(), shaders::mla_store(), &ml);
-            self.pipeline("mla-attention".into(), shaders::mla_attention(), &ml);
+            self.pipeline("mla-attention".into(), shaders::mla_attention(), &ma);
+        }
+        if self.cfg.indexer.is_some() {
+            let (ix, it) = (self.layouts.idx.clone(), self.layouts.idx_topk.clone());
+            self.pipeline("idx-store".into(), shaders::idx_store(), &ix);
+            self.pipeline("idx-score".into(), shaders::idx_score(), &ix);
+            self.pipeline("idx-topk".into(), shaders::idx_topk(), &it);
+        }
+        let l = &self.layouts;
+        let (rm, fl, kc, l2, kd) = (l.res_mix.clone(), l.fill.clone(), l.kda_conv.clone(), l.l2norm.clone(), l.kda.clone());
+        if self.cfg.attn_res_block > 0 {
+            self.pipeline("res-mix".into(), shaders::res_mix(), &rm);
+        }
+        if self.cfg.expert_latent > 0 {
+            self.pipeline("fill".into(), shaders::fill(), &fl);
+        }
+        if self.cfg.kda.is_some() {
+            self.pipeline("kda-conv".into(), shaders::kda_conv(), &kc);
+            self.pipeline("l2norm".into(), shaders::l2norm(), &l2);
+            self.pipeline("kda".into(), shaders::kda(), &kd);
         }
         match self.gpu.take_error() {
             Some(e) => Err(format!("shader compilation failed: {e}")),
@@ -899,16 +964,34 @@ impl Engine {
     /// GPU memory for activations and the KV cache at a given context length.
     pub fn state_bytes(cfg: &Config, ctx: usize) -> u64 {
         let t = MAX_BATCH as u64;
-        let mut acts = 2 * cfg.n_embd + 2 * cfg.q_dim() + 2 * cfg.kv_dim() + cfg.n_ff;
+        let mut acts = 2 * cfg.n_embd + 2 * cfg.q_dim() + 2 * cfg.kv_dim() + cfg.n_ff.max(cfg.moe.as_ref().map_or(0, |e| e.n_ff_shared));
         if let Some(e) = &cfg.moe {
             acts += e.n_expert + 3 * e.n_used + e.n_used * e.n_ff + e.n_ff_shared + e.n_used * cfg.n_embd;
         }
         if let Some(m) = &cfg.mla {
             acts += m.q_lora + m.kv_lora + m.rope + 2 * cfg.n_head * m.kv_lora + cfg.n_head * m.v_dim;
         }
-        let kv = cfg.n_layer as u64 * ctx as u64 * cfg.cache_dim() as u64 * 2;
+        let attn_layers = (0..cfg.n_layer).filter(|&l| !cfg.is_kda(l)).count() as u64;
+        let kv = attn_layers * ctx as u64 * cfg.cache_dim() as u64 * 2;
         let rope = ctx as u64 * (cfg.rope_dim / 2) as u64 * 8;
-        t * acts as u64 * 4 + kv + rope + cfg.n_vocab as u64 * 8
+        let mut extra = 0u64;
+        if let Some(k) = &cfg.kda {
+            let d = k.width();
+            acts += 5 * d + k.head_dim + k.n_head;
+            let layers = k.layers.iter().filter(|&&x| x).count() as u64;
+            // State and convolution inputs, twice (the snapshot).
+            extra += layers * (k.n_head * k.head_dim * k.head_dim + 3 * d * 3) as u64 * 4 * 2;
+        }
+        if cfg.attn_res_block > 0 {
+            acts += cfg.n_embd * (1 + cfg.n_layer.div_ceil(cfg.attn_res_block));
+        }
+        acts += 2 * cfg.expert_latent;
+        if let Some(i) = &cfg.indexer {
+            acts += i.n_head * i.head_dim + i.head_dim + i.n_head + ctx + 1;
+            let layers = (0..cfg.n_layer).filter(|&l| i.full[l] && !cfg.is_kda(l)).count() as u64;
+            extra += layers * ctx as u64 * i.head_dim as u64 * 2;
+        }
+        t * acts as u64 * 4 + kv + rope + cfg.n_vocab as u64 * 8 + extra
     }
 
     /// Allocate activations and the KV cache, and record the dispatch plan.
@@ -932,18 +1015,53 @@ impl Engine {
         let mla = c.mla.clone();
         let v_width = mla.as_ref().map_or(c.q_dim(), |m| c.n_head * m.v_dim);
         let ff_width = c.n_ff.max(moe.as_ref().map_or(0, |e| e.n_ff_shared));
+        let kda = c.kda.clone();
+        let kd = kda.as_ref().map_or(0, |k| k.width());
+        let ein = c.expert_in();
+        let latent = c.expert_latent;
+        let bs = c.attn_res_block;
+        let n_ckpt = if bs > 0 { c.n_layer.div_ceil(bs) } else { 0 };
+        let act_mode = if c.situ.is_some() { 4 } else { 2 };
         let x = buf("x", t * c.n_embd);
         let xn = buf("xn", t * c.n_embd);
         let q = buf("q", t * c.q_dim());
         let k = buf("k", t * c.kv_dim());
         let v = buf("v", t * c.kv_dim());
-        let att = buf("att", t * c.q_dim().max(v_width));
+        let att = buf("att", t * c.q_dim().max(v_width).max(kd));
+        // Residuals across blocks: the mixed sub-layer input and the banked checkpoints.
+        let xm = buf("x-mix", if bs > 0 { t * c.n_embd } else { 1 });
+        let ck = buf("checkpoints", t * n_ckpt.max(1) * c.n_embd);
+        // Linear attention: q, k, v per token, the decay gate and its low-rank input, beta.
+        let kqv = buf("kda-qkv", t * 3 * kd);
+        let gk = buf("kda-gate", t * kd);
+        let fa = buf("kda-gate-a", t * kda.as_ref().map_or(1, |k| k.head_dim));
+        let betab = buf("kda-beta", t * kda.as_ref().map_or(1, |k| k.n_head));
+        // Latent experts: their input and their summed output.
+        let xl = buf("expert-in", t * latent.max(1));
+        let ml = buf("expert-out", t * latent.max(1));
+        // DSA indexer: queries, keys, head weights, per-layer key caches (f16), the scores of
+        // every cached position and each token's selection threshold.
+        let ix = c.indexer.clone();
+        let (iqb, ikb, iwb, iscore, ithr) = match &ix {
+            Some(i) => (
+                buf("idx-q", t * i.n_head * i.head_dim),
+                buf("idx-k", t * i.head_dim),
+                buf("idx-w", t * i.n_head),
+                buf("idx-score", t * ctx),
+                buf("idx-thr", t),
+            ),
+            None => (buf("unused", 4), buf("unused", 4), buf("unused", 4), buf("unused", 4), buf("unused", 4)),
+        };
+        let icache: Vec<Option<wgpu::Buffer>> = (0..c.n_layer)
+            .map(|l| ix.as_ref().filter(|i| i.full[l] && !c.is_kda(l)).map(|i| buf("idx-cache", ctx * i.head_dim / 2)))
+            .collect();
         let gate = buf("gate", t * ff_width);
         let xf = buf("xf", c.n_embd);
         let logits = buf("logits", c.n_vocab);
         let tokens = buf("tokens", t);
         let (kc, vc): (Vec<_>, Vec<_>) = (0..c.n_layer)
-            .map(|_| match &mla {
+            .map(|l| match &mla {
+                _ if c.is_kda(l) => (buf("unused", 4), buf("unused", 4)),
                 Some(m) => (buf("latent-cache", ctx * (m.kv_lora + m.rope) / 2), buf("unused", 4)),
                 None => (
                     buf("k-cache", ctx * c.kv_dim() / 2),
@@ -979,7 +1097,7 @@ impl Engine {
         let (rsort, dout) = match &moe {
             Some(e) => (
                 buf("route sort", 2 * e.n_expert + t * e.n_used),
-                buf("expert out", t * e.n_used * c.n_embd),
+                buf("expert out", t * e.n_used * c.n_embd.max(ein)),
             ),
             None => (buf("unused", 4), buf("unused", 4)),
         };
@@ -1045,6 +1163,15 @@ impl Engine {
                 entries: &entries,
             })
         };
+        let mut kda_state = Vec::new();
+        let mut kda_snap = Vec::new();
+        if let Some(kk) = &kda {
+            for _ in kk.layers.iter().filter(|&&x| x) {
+                let pair = || (buf("kda-state", kk.n_head * kk.head_dim * kk.head_dim), buf("kda-conv", 3 * kd * 3));
+                kda_state.push(pair());
+                kda_snap.push(pair());
+            }
+        }
         let mut ops: Vec<Op> = Vec::new();
         let dummy = &self.dummy;
         let tables = &self.tables;
@@ -1052,22 +1179,26 @@ impl Engine {
         let (spare_a, spare_b) = (buf("unused", 4), buf("unused", 4));
         let route_w = (t * moe.as_ref().map_or(0, |e| e.n_used)) as u32;
 
-        // y (+)= W x for every shard of a matrix.
-        let matmul = |ops: &mut Vec<Op>,
-                      name: &str,
-                      x: &wgpu::Buffer,
-                      y: &wgpu::Buffer,
-                      mode: u32,
-                      bias: Option<&wgpu::Buffer>,
-                      gemv: bool,
-                      input: Input| {
+        // y (+)= W x for every shard of a matrix; `out` places the rows in a wider output
+        // (row stride per token, first row).
+        #[allow(clippy::too_many_arguments)]
+        let matmul_at = |ops: &mut Vec<Op>,
+                         name: &str,
+                         x: &wgpu::Buffer,
+                         y: &wgpu::Buffer,
+                         mode: u32,
+                         bias: Option<&wgpu::Buffer>,
+                         gemv: bool,
+                         input: Input,
+                         out: Option<(usize, usize)>| {
             let m = &self.mats[name];
+            let (ostride, ooff) = out.unwrap_or((m.total_rows(), 0));
             for s in &m.shards {
                 let p = params(&words(&[
                     m.k as u32,
                     s.rows as u32,
-                    m.total_rows() as u32,
-                    s.row0 as u32,
+                    ostride as u32,
+                    (ooff + s.row0) as u32,
                     mode,
                     bias.is_some() as u32,
                     0,
@@ -1107,6 +1238,15 @@ impl Engine {
                 });
             }
         };
+        #[allow(clippy::too_many_arguments)]
+        let matmul = |ops: &mut Vec<Op>,
+                      name: &str,
+                      x: &wgpu::Buffer,
+                      y: &wgpu::Buffer,
+                      mode: u32,
+                      bias: Option<&wgpu::Buffer>,
+                      gemv: bool,
+                      input: Input| matmul_at(ops, name, x, y, mode, bias, gemv, input, None);
         // Expert projections of layer `l`: gate/up (`down` = false) or down. One token runs the
         // matrix-vector kernels (down adds the weighted sum to x); a prompt runs matrix-matrix
         // products per expert (down writes each pair's row for `moe_sum`).
@@ -1124,12 +1264,12 @@ impl Engine {
                     params(&words(&[
                         m.k as u32,
                         s.rows as u32,
-                        if down { c.n_embd } else { m.rows } as u32,
+                        if down { ein } else { m.rows } as u32,
                         0,
                         mode,
                         0,
                         0,
-                        if down { m.k } else { c.n_embd } as u32,
+                        if down { m.k } else { ein } as u32,
                         0,
                         0,
                         e.n_used as u32,
@@ -1260,7 +1400,7 @@ impl Engine {
             Some(m) => {
                 let mut sd = words(&[m.kv_lora as u32, m.rope as u32, (m.kv_lora + m.rope) as u32, c.rope_neox as u32]);
                 sd.extend(c.rms_eps.to_le_bytes());
-                sd.extend(words(&[0, 0, 0]));
+                sd.extend(words(&[!m.rotate as u32, 0, 0]));
                 let mut ad = words(&[
                     c.n_head as u32,
                     m.kv_lora as u32,
@@ -1270,10 +1410,10 @@ impl Engine {
                     (m.kv_lora + m.rope) as u32,
                 ]);
                 ad.extend(c.kq_scale.to_le_bytes());
-                ad.extend(words(&[mla_heads(&c) as u32]));
+                ad.extend(words(&[mla_heads(&c) as u32, c.indexer.as_ref().map_or(0, |i| i.top_k) as u32, ctx as u32, 0, 0]));
                 (params(&sd), params(&ad))
             }
-            None => (params(&[0u8; 32]), params(&[0u8; 32])),
+            None => (params(&[0u8; 32]), params(&[0u8; 48])),
         };
         let sort_p = params(&words(&[
             moe.as_ref().map_or(0, |e| e.n_expert) as u32,
@@ -1303,14 +1443,84 @@ impl Engine {
             }
             None => params(&[0u8; 48]),
         };
+        // Mix the residual stream with the banked block checkpoints into `dst`, optionally
+        // banking the stream as checkpoint `n_ckpt`.
+        let res_mix = |ops: &mut Vec<Op>, w: &wgpu::Buffer, n_ckpt: usize, bank: bool, dst: &wgpu::Buffer| {
+            let mut d = words(&[c.n_embd as u32, n_ckpt as u32, bank as u32]);
+            d.extend(c.rms_eps.to_le_bytes());
+            d.extend(words(&[t as u32, 0, 0, 0]));
+            ops.push(Op {
+                when: When::Always,
+                kernel: Kernel::ResMix,
+                grid: Grid::Tokens,
+                bind: bind(&self.layouts.res_mix, "res-mix", &[&step, &params(&d), &x, w, &ck, dst]),
+            });
+        };
         let embed_end = ops.len();
         let mut layers = Vec::with_capacity(c.n_layer);
+        let mut kda_index = 0;
         for l in 0..c.n_layer {
             let n = |s: &str| format!("blk.{l}.{s}");
             let start = ops.len();
             let (mut route_end, mut experts_end) = (0, 0);
-            norm(&mut ops, &x, &self.vecs[&n("attn_norm.weight")], &xn, c.n_embd, false);
-            if let Some(m) = &mla {
+            // A layer that starts a block banks its input and restarts the stream from its
+            // attention output.
+            let banked = bs > 0 && l % bs == 0;
+            let out_mode = if banked { 0 } else { 1 };
+            if bs > 0 {
+                let before = if l == 0 { 0 } else { (l - 1) / bs + 1 };
+                res_mix(&mut ops, &self.vecs[&n("attn_res_score.weight")], before, banked, &xm);
+                norm(&mut ops, &xm, &self.vecs[&n("attn_norm.weight")], &xn, c.n_embd, false);
+            } else {
+                norm(&mut ops, &x, &self.vecs[&n("attn_norm.weight")], &xn, c.n_embd, false);
+            }
+            if c.is_kda(l) {
+                let kk = kda.as_ref().unwrap();
+                let input = Input::rows(c.n_embd);
+                for (j, w) in ["attn_q", "attn_k", "attn_v"].iter().enumerate() {
+                    matmul_at(&mut ops, &n(&format!("{w}.weight")), &xn, &kqv, 0, None, false, input, Some((3 * kd, j * kd)));
+                }
+                let (state, conv) = &kda_state[kda_index];
+                kda_index += 1;
+                for (j, w) in ["q", "k", "v"].iter().enumerate() {
+                    let p = params(&words(&[kd as u32, (3 * kd) as u32, (j * kd) as u32, (j * kd) as u32]));
+                    ops.push(Op {
+                        when: When::Always,
+                        kernel: Kernel::KdaConv,
+                        grid: Grid::Groups(kd.div_ceil(256) as u32),
+                        bind: bind(&self.layouts.kda_conv, "kda-conv", &[&step, &p, &self.vecs[&n(&format!("ssm_conv1d_{w}.weight"))], &kqv, conv]),
+                    });
+                }
+                let mut d = words(&[kk.head_dim as u32, (2 * kk.n_head) as u32, (3 * kd) as u32]);
+                d.extend(c.rms_eps.to_le_bytes());
+                ops.push(Op {
+                    when: When::Always,
+                    kernel: Kernel::L2Norm,
+                    grid: Grid::Heads((2 * kk.n_head) as u32),
+                    bind: bind(&self.layouts.l2norm, "l2norm", &[&step, &params(&d), &kqv]),
+                });
+                matmul(&mut ops, &n("ssm_f_a.weight"), &xn, &fa, 0, None, false, input);
+                matmul(&mut ops, &n("ssm_f_b.weight"), &fa, &gk, 0, None, false, Input::rows(kk.head_dim));
+                matmul(&mut ops, &n("ssm_beta.weight"), &xn, &betab, 0, None, false, input);
+                let mut d = words(&[kk.n_head as u32, kd as u32, (3 * kd) as u32]);
+                d.extend((1.0 / (kk.head_dim as f32).sqrt()).to_le_bytes());
+                d.extend(kk.gate_lower_bound.to_le_bytes());
+                d.extend(words(&[0, 0, 0]));
+                ops.push(Op {
+                    when: When::Always,
+                    kernel: Kernel::Kda,
+                    grid: Grid::Groups((2 * kk.n_head) as u32),
+                    bind: bind(
+                        &self.layouts.kda,
+                        "kda",
+                        &[&step, &params(&d), &kqv, &gk, &betab, &self.vecs[&n("ssm_dt.bias")], &self.vecs[&n("ssm_a")], state, &att],
+                    ),
+                });
+                // Per-head RMSNorm, then the sigmoid output gate.
+                norm_inplace(&mut ops, &att, &self.vecs[&n("ssm_norm.weight")], kk.head_dim, kk.n_head);
+                matmul(&mut ops, &n("ssm_g.weight"), &xn, &att, 5, None, false, input);
+                matmul(&mut ops, &n("attn_output.weight"), &att, &x, out_mode, None, false, Input::rows(kd));
+            } else if let Some(m) = &mla {
                 if m.q_lora > 0 {
                     matmul(&mut ops, &n("attn_q_a.weight"), &xn, &qa, 0, None, false, Input::rows(c.n_embd));
                     norm_inplace(&mut ops, &qa, &self.vecs[&n("attn_q_a_norm.weight")], m.q_lora, 1);
@@ -1319,13 +1529,46 @@ impl Engine {
                     matmul(&mut ops, &n("attn_q.weight"), &xn, &q, 0, None, false, Input::rows(c.n_embd));
                 }
                 matmul(&mut ops, &n("attn_kv_a_mqa.weight"), &xn, &kva, 0, None, false, Input::rows(c.n_embd));
+                // DSA: score every cached position and pick each token's top_k (layers without
+                // their own indexer reuse the last selection).
+                if let (Some(i), Some(cache)) = (&ix, &icache[l]) {
+                    matmul(&mut ops, &n("indexer.attn_q_b.weight"), &qa, &iqb, 0, None, false, Input::rows(m.q_lora));
+                    matmul(&mut ops, &n("indexer.attn_k.weight"), &xn, &ikb, 0, None, false, Input::rows(c.n_embd));
+                    matmul(&mut ops, &n("indexer.proj.weight"), &xn, &iwb, 0, None, false, Input::rows(c.n_embd));
+                    let mut d = words(&[i.head_dim as u32]);
+                    d.extend(i.eps.to_le_bytes());
+                    d.extend(words(&[0, 0]));
+                    ops.push(Op {
+                        when: When::Always,
+                        kernel: Kernel::IdxStore,
+                        grid: Grid::Tokens,
+                        bind: bind(&self.layouts.idx, "idx-store", &[&step, &params(&d), &ikb, &self.vecs[&n("indexer.k_norm.weight")], &self.vecs[&n("indexer.k_norm.bias")], cache]),
+                    });
+                    let mut d = words(&[i.n_head as u32, i.head_dim as u32, ctx as u32, i.top_k as u32]);
+                    d.extend((1.0 / ((i.head_dim * i.n_head) as f32).sqrt()).to_le_bytes());
+                    d.extend(words(&[0, 0, 0]));
+                    ops.push(Op {
+                        when: When::Always,
+                        kernel: Kernel::IdxScore,
+                        grid: Grid::KeyBlocks(ctx.div_ceil(256) as u32),
+                        bind: bind(&self.layouts.idx, "idx-score", &[&step, &params(&d), &iqb, &iwb, cache, &iscore]),
+                    });
+                    ops.push(Op {
+                        when: When::Always,
+                        kernel: Kernel::IdxTopK,
+                        grid: Grid::Tokens,
+                        bind: bind(&self.layouts.idx_topk, "idx-topk", &[&step, &params(&words(&[ctx as u32, i.top_k as u32, 0, 0])), &iscore, &ithr]),
+                    });
+                }
                 // Rotate the tail of every query head (the key's rotated part goes to the cache).
-                ops.push(Op {
-                    when: When::Always,
-                    kernel: Kernel::Rope,
-                    grid: Grid::Heads(c.n_head as u32),
-                    bind: bind(&self.layouts.rope, "rope-q", &[&step, &rope_p, &q, dummy, dummy, &spare_a, &spare_b, &rope_table]),
-                });
+                if m.rotate {
+                    ops.push(Op {
+                        when: When::Always,
+                        kernel: Kernel::Rope,
+                        grid: Grid::Heads(c.n_head as u32),
+                        bind: bind(&self.layouts.rope, "rope-q", &[&step, &rope_p, &q, dummy, dummy, &spare_a, &spare_b, &rope_table]),
+                    });
+                }
                 ops.push(Op {
                     when: When::Always,
                     kernel: Kernel::MlaStore,
@@ -1351,7 +1594,7 @@ impl Engine {
                     when: When::Always,
                     kernel: Kernel::MlaAttention,
                     grid: Grid::Heads((c.n_head / mla_heads(&c)) as u32),
-                    bind: bind(&self.layouts.mla, "mla-attention", &[&step, &mla_attn_p, &qlat, &q, &kc[l], &olat]),
+                    bind: bind(&self.layouts.mla_attn, "mla-attention", &[&step, &mla_attn_p, &qlat, &q, &kc[l], &olat, &iscore, &ithr]),
                 });
                 matmul(
                     &mut ops,
@@ -1367,7 +1610,10 @@ impl Engine {
                         group_stride: m.kv_lora,
                     },
                 );
-                matmul(&mut ops, &n("attn_output.weight"), &att, &x, 1, None, false, Input::rows(v_width));
+                if c.attn_gate {
+                    matmul(&mut ops, &n("attn_gate.weight"), &xn, &att, 5, None, false, Input::rows(c.n_embd));
+                }
+                matmul(&mut ops, &n("attn_output.weight"), &att, &x, out_mode, None, false, Input::rows(v_width));
             } else {
                 let bias = |s: &str| {
                     if c.qkv_bias {
@@ -1399,12 +1645,29 @@ impl Engine {
                     grid: Grid::Heads(c.n_head as u32),
                     bind: bind(&self.layouts.attention, "attention", &[&step, &attn_p, &q, &kc[l], &vc[l], &att]),
                 });
-                matmul(&mut ops, &n("attn_output.weight"), &att, &x, 1, None, false, Input::rows(c.q_dim()));
+                matmul(&mut ops, &n("attn_output.weight"), &att, &x, out_mode, None, false, Input::rows(c.q_dim()));
             }
-            norm(&mut ops, &x, &self.vecs[&n("ffn_norm.weight")], &xn, c.n_embd, false);
+            if bs > 0 {
+                res_mix(&mut ops, &self.vecs[&n("ffn_res_score.weight")], l / bs + 1, false, &xm);
+                norm(&mut ops, &xm, &self.vecs[&n("ffn_norm.weight")], &xn, c.n_embd, false);
+            } else {
+                norm(&mut ops, &x, &self.vecs[&n("ffn_norm.weight")], &xn, c.n_embd, false);
+            }
             let input = Input::rows(c.n_embd);
             match moe.as_ref().filter(|_| c.is_moe(l)) {
                 Some(e) => {
+                    // Latent experts read a down-projection of the input and write a sum that is
+                    // normalised and projected back up.
+                    if latent > 0 {
+                        matmul(&mut ops, &n("ffn_routed_down.weight"), &xn, &xl, 0, None, false, input);
+                        ops.push(Op {
+                            when: When::Always,
+                            kernel: Kernel::Fill,
+                            grid: Grid::Width(latent as u32),
+                            bind: bind(&self.layouts.fill, "fill", &[&step, &params(&words(&[latent as u32, 0, 0, 0])), &ml]),
+                        });
+                    }
+                    let (xin, target) = if latent > 0 { (&xl, &ml) } else { (&xn, &x) };
                     matmul(&mut ops, &n("ffn_gate_inp.weight"), &xn, &rlog, 0, None, false, input);
                     let bias = if e.probs_bias { &self.vecs[&n("exp_probs_b.bias")] } else { dummy };
                     ops.push(Op {
@@ -1420,26 +1683,32 @@ impl Engine {
                         grid: Grid::Single,
                         bind: bind(&self.layouts.route_sort, "route-sort", &[&step, &sort_p, &route, &rsort]),
                     });
-                    matmul_id(&mut ops, l, &n("ffn_gate_exps.weight"), &xn, &hexp, 0, false);
-                    matmul_id(&mut ops, l, &n("ffn_up_exps.weight"), &xn, &hexp, 2, false);
-                    matmul_id(&mut ops, l, &n("ffn_down_exps.weight"), &hexp, &x, 1, true);
-                    let sum_p = params(&words(&[c.n_embd as u32, e.n_used as u32, route_w, (l * e.n_expert) as u32]));
+                    matmul_id(&mut ops, l, &n("ffn_gate_exps.weight"), xin, &hexp, 0, false);
+                    matmul_id(&mut ops, l, &n("ffn_up_exps.weight"), xin, &hexp, act_mode, false);
+                    matmul_id(&mut ops, l, &n("ffn_down_exps.weight"), &hexp, target, 1, true);
+                    let sum_p = params(&words(&[ein as u32, e.n_used as u32, route_w, (l * e.n_expert) as u32]));
                     ops.push(Op {
                         when: When::Prompt,
                         kernel: Kernel::MoeSum,
-                        grid: Grid::Width(c.n_embd as u32),
-                        bind: bind(&self.layouts.moe_sum, "moe-sum", &[&step, &sum_p, &route, &emap, &dout, &x]),
+                        grid: Grid::Width(ein as u32),
+                        bind: bind(&self.layouts.moe_sum, "moe-sum", &[&step, &sum_p, &route, &emap, &dout, target]),
                     });
                     experts_end = ops.len();
+                    if latent > 0 {
+                        if let Some(w) = self.vecs.get(&n("ffn_routed_norm.weight")) {
+                            norm_inplace(&mut ops, &ml, w, latent, 1);
+                        }
+                        matmul(&mut ops, &n("ffn_routed_up.weight"), &ml, &x, 1, None, false, Input::rows(latent));
+                    }
                     if e.n_ff_shared > 0 {
                         matmul(&mut ops, &n("ffn_gate_shexp.weight"), &xn, &gate, 0, None, false, input);
-                        matmul(&mut ops, &n("ffn_up_shexp.weight"), &xn, &gate, 2, None, false, input);
+                        matmul(&mut ops, &n("ffn_up_shexp.weight"), &xn, &gate, act_mode, None, false, input);
                         matmul(&mut ops, &n("ffn_down_shexp.weight"), &gate, &x, 1, None, false, Input::rows(e.n_ff_shared));
                     }
                 }
                 None => {
                     matmul(&mut ops, &n("ffn_gate.weight"), &xn, &gate, 0, None, false, input);
-                    matmul(&mut ops, &n("ffn_up.weight"), &xn, &gate, 2, None, false, input);
+                    matmul(&mut ops, &n("ffn_up.weight"), &xn, &gate, act_mode, None, false, input);
                     matmul(&mut ops, &n("ffn_down.weight"), &gate, &x, 1, None, false, Input::rows(c.n_ff));
                 }
             }
@@ -1456,7 +1725,12 @@ impl Engine {
             });
         }
         let head_start = ops.len();
-        norm(&mut ops, &x, &self.vecs["output_norm.weight"], &xf, c.n_embd, true);
+        if bs > 0 {
+            res_mix(&mut ops, &self.vecs["output_res_score.weight"], n_ckpt, false, &xm);
+            norm(&mut ops, &xm, &self.vecs["output_norm.weight"], &xf, c.n_embd, true);
+        } else {
+            norm(&mut ops, &x, &self.vecs["output_norm.weight"], &xf, c.n_embd, true);
+        }
         let head = if c.tied_embeddings {
             "token_embd.weight"
         } else {
@@ -1486,6 +1760,8 @@ impl Engine {
             route_staging,
             emap,
             bytes,
+            kda: kda_state,
+            kda_snap,
         });
         match self.gpu.take_error() {
             Some(e) => Err(format!("could not prepare the model on the GPU: {e}")),
@@ -1553,6 +1829,14 @@ impl Engine {
             (Kernel::MlaStore, Grid::Tokens) => ("mla-store".into(), (t, 1)),
             (Kernel::RouteSort, Grid::Single) => ("route-sort".into(), (1, 1)),
             (Kernel::MoeSum, Grid::Width(w)) => ("moe-sum".into(), (w.div_ceil(256), t)),
+            (Kernel::ResMix, Grid::Tokens) => ("res-mix".into(), (t, 1)),
+            (Kernel::Fill, Grid::Width(w)) => ("fill".into(), (w.div_ceil(256), t)),
+            (Kernel::KdaConv, Grid::Groups(n)) => ("kda-conv".into(), (n, 1)),
+            (Kernel::L2Norm, Grid::Heads(h)) => ("l2norm".into(), (h, t)),
+            (Kernel::Kda, Grid::Groups(n)) => ("kda".into(), (n, 1)),
+            (Kernel::IdxStore, Grid::Tokens) => ("idx-store".into(), (t, 1)),
+            (Kernel::IdxScore, Grid::KeyBlocks(n)) => ("idx-score".into(), (n, t)),
+            (Kernel::IdxTopK, Grid::Tokens) => ("idx-topk".into(), (t, 1)),
             _ => unreachable!(),
         }
     }
@@ -1636,7 +1920,70 @@ impl Engine {
     }
 
     /// Run `tokens` at positions `pos0..` and return the logits after the last one.
+    /// True when the model keeps a recurrent state, which can only move forward.
+    pub fn is_recurrent(&self) -> bool {
+        self.cfg.kda.is_some()
+    }
+
+    /// Copy the recurrent state, to come back to this position later.
+    pub fn snapshot(&self) {
+        self.copy_state(true);
+        self.snapshot_pos.set(Some(self.recurrent_pos.get()));
+    }
+
+    /// Return to the snapshot; the position it was taken at, if there is one.
+    pub fn restore(&self) -> Option<usize> {
+        let pos = self.snapshot_pos.get()?;
+        self.copy_state(false);
+        self.recurrent_pos.set(pos);
+        Some(pos)
+    }
+
+    fn copy_state(&self, save: bool) {
+        let Some(st) = self.state.as_ref() else { return };
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        for (live, snap) in st.kda.iter().zip(&st.kda_snap) {
+            let (from, to) = if save { (live, snap) } else { (snap, live) };
+            enc.copy_buffer_to_buffer(&from.0, 0, &to.0, 0, from.0.size());
+            enc.copy_buffer_to_buffer(&from.1, 0, &to.1, 0, from.1.size());
+        }
+        self.gpu.queue.submit([enc.finish()]);
+    }
+
+    /// Logits after reading `tokens` at positions from `pos0`. A model with a recurrent state
+    /// must continue where it stopped, or start over at 0.
     pub async fn forward(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, String> {
+        if self.is_recurrent() && pos0 != 0 && pos0 != self.recurrent_pos.get() {
+            return Err(format!(
+                "this model's recurrent state is at position {}, not {pos0}",
+                self.recurrent_pos.get()
+            ));
+        }
+        let out = self.forward_at(tokens, pos0).await;
+        match &out {
+            Ok(_) => self.recurrent_pos.set(pos0 + tokens.len()),
+            Err(_) => {
+                // A pass that stopped part way (a cancelled or failed read) leaves some layers'
+                // recurrent state ahead of the others, and expert slots that may not hold what
+                // the cache thinks: start both again.
+                self.recurrent_pos.set(usize::MAX);
+                let mut st = self.stream.borrow_mut();
+                for lru in &mut st.lru {
+                    lru.owner.iter_mut().for_each(|o| *o = None);
+                    lru.used.iter_mut().for_each(|u| *u = 0);
+                    lru.slot_of.clear();
+                }
+            }
+        }
+        out
+    }
+
+    /// Tokens the recurrent state has read (usize::MAX after a pass that did not finish).
+    pub fn recurrent_position(&self) -> usize {
+        self.recurrent_pos.get()
+    }
+
+    async fn forward_at(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, String> {
         if self.placement.streaming {
             return self.forward_streamed(tokens, pos0).await;
         }
@@ -1679,7 +2026,7 @@ impl Engine {
 
     /// Where weights that are not resident are read from (required when `placement.streaming`).
     pub fn set_source(&self, source: Box<dyn WeightSource>) {
-        *self.source.borrow_mut() = Some(source);
+        *self.source.borrow_mut() = Some(source.into());
     }
 
     /// Streaming counters since the last call.
@@ -1706,18 +2053,90 @@ impl Engine {
         &self.plan[self.plan_index[name]]
     }
 
+    /// Let the weight source fetch what the next reads need, together (it matters when the
+    /// weights come over the network: many requests in flight instead of one at a time).
+    async fn prefetch(&self, spans: &[Span]) -> Result<(), String> {
+        if spans.is_empty() {
+            return Ok(());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let t0 = std::time::Instant::now();
+        let src = self.source.borrow().clone();
+        let src = src.ok_or("this model streams weights but has no weight source")?;
+        src.prefetch(spans).await?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.stream.borrow_mut().stats.read_seconds += t0.elapsed().as_secs_f64();
+        }
+        Ok(())
+    }
+
+    /// Row slices of a ring matrix, as `upload_rings` reads them.
+    fn ring_slices(&self, name: &str) -> Vec<(usize, usize)> {
+        let tp = self.tensor(name);
+        // About 32 MB each, so a large head never needs one huge buffer.
+        let step = ((32u64 << 20) / tp.row_bytes).max(1) as usize;
+        let total = self.mats[name].total_rows();
+        (0..total).step_by(step).map(|r| (r, step.min(total - r))).collect()
+    }
+
+    fn ring_spans(&self, names: &[String]) -> Vec<Span> {
+        let mut out = Vec::new();
+        for name in names {
+            let tp = self.tensor(name);
+            for (r, n) in self.ring_slices(name) {
+                out.push(Span {
+                    file: tp.file,
+                    offset: tp.offset + r as u64 * tp.row_bytes,
+                    len: n * tp.row_bytes as usize,
+                    every_token: true,
+                });
+            }
+        }
+        out
+    }
+
+    /// What `load_expert` reads for each expert of layer `l`.
+    fn expert_spans(&self, p: usize, l: usize, experts: &[u32]) -> Vec<Span> {
+        let pool = &self.pools[p];
+        let mut out = Vec::new();
+        for &e in experts {
+            for (i, kind) in ["gate", "up", "down"].iter().enumerate() {
+                let tp = self.tensor(&format!("blk.{l}.ffn_{kind}_exps.weight"));
+                let len = pool.shape[i].0 * tp.row_bytes as usize;
+                out.push(Span {
+                    file: tp.file,
+                    offset: tp.offset + e as u64 * len as u64,
+                    len,
+                    every_token: false,
+                });
+            }
+        }
+        out
+    }
+
+    fn embed_spans(&self, tokens: &[u32]) -> Vec<Span> {
+        let tp = self.tensor("token_embd.weight");
+        let mut seen = std::collections::HashSet::new();
+        tokens
+            .iter()
+            .filter(|&&t| (t as u64) < tp.rows && seen.insert(t))
+            .map(|&t| Span {
+                file: tp.file,
+                offset: tp.offset + t as u64 * tp.row_bytes,
+                len: tp.row_bytes as usize,
+                every_token: false,
+            })
+            .collect()
+    }
+
     /// Read whole ring matrices into their slots before the ops that use them.
     fn upload_rings(&self, names: &[String]) -> Result<u64, String> {
         let mut bytes = 0;
         for name in names {
             let m = &self.mats[name];
             let tp = self.tensor(name).clone();
-            // In slices of about 32 MB, so a large head never needs one huge buffer.
-            let step = ((32u64 << 20) / tp.row_bytes).max(1) as usize;
-            let total = m.total_rows();
-            let mut r = 0;
-            while r < total {
-                let n = step.min(total - r);
+            for (r, n) in self.ring_slices(name) {
                 let raw = self.read(&tp, r as u64 * tp.row_bytes, n * tp.row_bytes as usize)?;
                 #[cfg(not(target_arch = "wasm32"))]
                 let t0 = std::time::Instant::now();
@@ -1727,7 +2146,6 @@ impl Engine {
                 {
                     self.stream.borrow_mut().stats.upload_seconds += t0.elapsed().as_secs_f64();
                 }
-                r += n;
             }
             bytes += tp.bytes;
         }
@@ -1847,12 +2265,14 @@ impl Engine {
             q.write_buffer(&st.step, 0, &words(&[n as u32, pos as u32, (pos + n) as u32, n as u32 - 1]));
             q.write_buffer(&st.tokens, 0, &words(chunk));
             if self.placement.cpu_embeddings || st.embed_end == 0 {
+                self.prefetch(&self.embed_spans(chunk)).await?;
                 q.write_buffer(&st.x, 0, &floats(&self.embed_cpu(chunk)?));
             } else {
                 q.submit([self.encode_range(0..st.embed_end, n, false)]);
             }
             let mut queued = 0u64;
             for (l, lo) in st.layers.iter().enumerate() {
+                self.prefetch(&self.ring_spans(&self.ring_layers[l])).await?;
                 queued += self.upload_rings(&self.ring_layers[l])?;
                 match self.layer_pool[l] {
                     Some(_) => {
@@ -1876,6 +2296,9 @@ impl Engine {
                         }
                         let pool = self.layer_pool[l].unwrap();
                         for (pass, loads) in self.plan_experts(l, &ids)? {
+                            // One pass at a time, so the fetched experts never exceed the cache.
+                            let missing: Vec<u32> = loads.iter().map(|&(_, e)| e).collect();
+                            self.prefetch(&self.expert_spans(pool, l, &missing)).await?;
                             // Queued after the previous pass's work, so reused slots are safe.
                             for (slot, e) in loads {
                                 self.load_expert(pool, slot, l, e)?;
@@ -1901,6 +2324,7 @@ impl Engine {
                 }
             }
             if last {
+                self.prefetch(&self.ring_spans(&self.ring_head)).await?;
                 self.upload_rings(&self.ring_head)?;
                 q.submit([self.encode_range(st.head_start..st.ops.len(), n, true)]);
             }

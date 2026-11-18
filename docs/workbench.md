@@ -67,12 +67,23 @@ to the existing Rust/WASM/WebGPU model. It reuses the loaded weights. The Pi bun
 kernel load on demand when opening Terminal, with no second model or provider account.
 Pi gets sequential `bash`, `read`, `write`, `edit`, `web_search`, `open_url`, `preview`, and `browser_test` tools.
 The UI displays tool arguments, actual results, and completion counts. Each task allows 10 model
-turns, 12 tool calls, up to 3 tools per model response, and 3 minutes total; tool output sent to the model is
-bounded. Up to two format retries count toward the turn limit. Invalid or truncated calls never
-execute; failed tool calls are shown alongside the actual file-change count. Edits require a prior
-read and a nonempty exact substring from that read. Network tools are offered only with Web on.
-Stop cancels inference and outstanding reads. If inference will not stop, its worker is
+turns, 12 tool calls and up to 3 tools per model response; tool output sent to the model is
+bounded. A task may take 3 minutes when the model fits on the GPU, 2 hours (30 minutes per model
+turn) when it streams from this device's storage, and as long as it needs when it is read from
+Hugging Face, where a token can take minutes or hours. Up to two format retries count toward the
+turn limit. Invalid or truncated calls never execute; failed tool calls are shown alongside the
+actual file-change count. Edits require a prior read and a nonempty exact substring from that read.
+Network tools are offered only with Web on. Stop cancels inference and outstanding reads,
+including weights still arriving from Hugging Face. If inference will not stop, its worker is
 restarted and the model must be reloaded. Chat and model loading wait while Pi owns the engine.
+
+Pi reads tool calls in each model's own syntax: Qwen and Hermes `<tool_call>` JSON, Qwen3 Coder's
+`<function=…>` parameters, Llama 3's JSON object, Mistral's `[TOOL_CALLS]`, DeepSeek V3 and V3.1,
+Kimi K2, and Kimi K3 and K3.1, whose tool markers are control tokens the page keeps for this. Earlier
+calls and results go back to the model as structured messages, so its template shows them the way
+it was trained to see them. Models whose templates have no tools (SmolLM2, OLMoE) get JSON
+instructions instead. `tests/tool_templates.rs` renders a call with each family's template and
+`tests/tool-formats.test.mjs` parses it back.
 
 Tool reliability depends on the model. Small models can choose the wrong arguments, ignore
 parts of a task or finish without executing tools. Inspect the displayed results and saved files;

@@ -7,6 +7,8 @@ pub mod gpu;
 pub mod iq_tables;
 pub mod model;
 pub mod quant;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub mod remote;
 pub mod sampler;
 pub mod session;
 pub mod source;

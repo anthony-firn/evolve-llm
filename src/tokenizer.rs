@@ -233,6 +233,13 @@ impl Tokenizer {
         self.eog.contains(&id)
     }
 
+    /// The text of a control token that is not an end of generation (`<|open|>`, DeepSeek's
+    /// tool-call markers…). Decoding hides these; a reply parser may need them.
+    pub fn control_text(&self, id: u32) -> Option<&str> {
+        let i = id as usize;
+        (self.types.get(i) == Some(&CONTROL) && !self.eog.contains(&id)).then(|| self.tokens[i].as_str())
+    }
+
     pub fn end_tokens(&self) -> Vec<u32> {
         let mut v: Vec<u32> = self.eog.iter().copied().collect();
         v.sort();

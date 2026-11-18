@@ -35,6 +35,26 @@ fn xbase(r: u32) -> u32 {
 
 struct W8 { a: vec4<f32>, b: vec4<f32> }
 
+// Kimi K3's situ gate: its betas are replaced with the model's when kernels compile.
+const SITU_B: f32 = 4.0;
+const SITU_L: f32 = 25.0;
+// tanh that cannot overflow.
+fn stanh(x: f32) -> f32 {
+    let e = exp(-2.0 * abs(x));
+    return sign(x) * (1.0 - e) / (1.0 + e);
+}
+// The gated activation: the gate `g` already in the output, the up projection `v` arriving.
+// Mode 4 is situ, otherwise SiLU.
+fn gate(g: f32, v: f32) -> f32 {
+    if (p.mode == 4u) {
+        var u = v;
+        if (SITU_L > 0.0) { u = SITU_L * stanh(v / SITU_L); }
+        return SITU_B * stanh(g / SITU_B) / (1.0 + exp(-g)) * u;
+    }
+    return g / (1.0 + exp(-g)) * v;
+}
+
+// Modes: 0 store, 1 add, 2 SiLU gate, 4 situ gate, 5 multiply by sigmoid (an output gate).
 fn finish(t: u32, r: u32, acc: f32) {
     var v = acc;
     if (p.has_bias == 1u) { v += bias[p.out_offset + r]; }
@@ -43,9 +63,10 @@ fn finish(t: u32, r: u32, acc: f32) {
         y[i] = v;
     } else if (p.mode == 1u) {
         y[i] = y[i] + v;
+    } else if (p.mode == 5u) {
+        y[i] = y[i] / (1.0 + exp(-v));
     } else {
-        let g = y[i];
-        y[i] = g / (1.0 + exp(-g)) * v;
+        y[i] = gate(y[i], v);
     }
 }
 "#;
@@ -333,11 +354,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let wr = row0 + (li >> 2u);
     let wslot = (li >> 2u) * WS + (li & 3u) * 2u;
     for (var k0 = 0u; k0 < p.K; k0 += 32u) {
+        // Inputs narrower than a 32-value step (K a multiple of 8) leave the rest zero.
         var xv = vec4<f32>(0.0);
-        if (xt < T) { xv = x[((xbase(row0) + xt * p.x_stride + k0) >> 2u) + (li & 7u)]; }
+        if (xt < T && k0 + (li & 7u) * 4u < p.K) { xv = x[((xbase(row0) + xt * p.x_stride + k0) >> 2u) + (li & 7u)]; }
         xs[li] = xv;
         var w = W8(vec4<f32>(0.0), vec4<f32>(0.0));
-        if (wr < p.N) { w = load8(wr, k0 + (li & 3u) * 8u); }
+        if (wr < p.N && k0 + (li & 3u) * 8u < p.K) { w = load8(wr, k0 + (li & 3u) * 8u); }
         ws[wslot] = w.a;
         ws[wslot + 1u] = w.b;
         workgroupBarrier();
@@ -641,7 +663,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
     if (in_shard && lane == 0u && row < p.exp_rows) {
         let i = pair * p.out_stride + row;
-        if (p.mode == 0u) { y[i] = red[li]; } else { let g = y[i]; y[i] = g / (1.0 + exp(-g)) * red[li]; }
+        if (p.mode == 0u) { y[i] = red[li]; } else { y[i] = gate(y[i], red[li]); }
     }
 }
 "#
@@ -819,7 +841,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 
 /// MLA: normalise the latent half of `kv_a`, rotate its key half, and store both in the f16 cache.
 pub const MLA_STORE: &str = r#"
-struct P { lat: u32, rope: u32, cdim: u32, neox: u32, eps: f32, pad0: u32, pad1: u32, pad2: u32 }
+struct P { lat: u32, rope: u32, cdim: u32, neox: u32, eps: f32, no_rotate: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(1) var<uniform> p: P;
 @group(0) @binding(2) var<storage, read> kva: array<f32>;
 @group(0) @binding(3) var<storage, read> w: array<f32>;
@@ -862,7 +884,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let csb = pos * (p.rope / 2u);
     for (var e = li; e < p.rope / 2u; e += 256u) {
         let d = 2u * e;
-        cache[cb + p.lat / 2u + e] = pack2x16float(vec2<f32>(rot(base + p.lat, d, csb), rot(base + p.lat, d + 1u, csb)));
+        var pe = vec2<f32>(kva[base + p.lat + d], kva[base + p.lat + d + 1u]);
+        if (p.no_rotate == 0u) { pe = vec2<f32>(rot(base + p.lat, d, csb), rot(base + p.lat, d + 1u, csb)); }
+        cache[cb + p.lat / 2u + e] = pack2x16float(pe);
     }
 }
 "#;
@@ -870,12 +894,21 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /// MLA attention: several query heads per workgroup share each read of the latent cache.
 /// Scores use [absorbed query | rotated query] against [latent | rotated key]; values are the latent.
 pub const MLA_ATTENTION: &str = r#"
-struct P { n_head: u32, lat: u32, rope: u32, qstride: u32, qrope: u32, cdim: u32, scale: f32, heads: u32 }
+struct P { n_head: u32, lat: u32, rope: u32, qstride: u32, qrope: u32, cdim: u32, scale: f32, heads: u32,
+           top_k: u32, ctx: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(1) var<uniform> p: P;
 @group(0) @binding(2) var<storage, read> qlat: array<f32>;
 @group(0) @binding(3) var<storage, read> q: array<f32>;
 @group(0) @binding(4) var<storage, read> cache: array<u32>;
 @group(0) @binding(5) var<storage, read_write> o: array<f32>;
+// DSA: per token, indexer scores of every cached position and the order key of the top_k-th best.
+@group(0) @binding(6) var<storage, read> iscore: array<f32>;
+@group(0) @binding(7) var<storage, read> ithr: array<u32>;
+
+fn order_key(x: f32) -> u32 {
+    let b = bitcast<u32>(x);
+    return select(b | 0x80000000u, ~b, (b & 0x80000000u) != 0u);
+}
 
 const HM: u32 = 4u;
 const NEG: f32 = -3.4e38;
@@ -897,6 +930,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
     workgroupBarrier();
     let n_keys = step.pos0 + t + 1u;
+    // Past top_k cached positions, only the ones the indexer chose take part.
+    let sparse = p.top_k > 0u && n_keys > p.top_k;
+    let thr = select(0u, ithr[t], sparse);
     let nd = (L + 255u) / 256u;
     var m = array<f32, 4>(NEG, NEG, NEG, NEG);
     var l = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
@@ -905,7 +941,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     for (var j0 = 0u; j0 < n_keys; j0 += 256u) {
         let j = j0 + li;
         var sc = array<f32, 4>(NEG, NEG, NEG, NEG);
-        if (j < n_keys) {
+        if (j < n_keys && (!sparse || order_key(iscore[t * p.ctx + j]) >= thr)) {
             let kb = j * (D / 2u);
             var dv = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
             for (var e = 0u; e < D / 2u; e++) {
@@ -927,7 +963,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             let m_new = max(m[h], red[0]);
             workgroupBarrier();
             var pj = 0.0;
-            if (j < n_keys) { pj = exp(sc[h] - m_new); }
+            if (j < n_keys && (!sparse || order_key(iscore[t * p.ctx + j]) >= thr)) { pj = exp(sc[h] - m_new); }
             pr[li * HM + h] = pj;
             red[li] = pj;
             workgroupBarrier();
@@ -1071,7 +1107,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 fn put(pair: u32, r: u32, v: f32) {
     if (pair == 0xffffffffu || r >= p.exp_rows) { return; }
     let i = pair * p.out_stride + r;
-    if (p.mode == 2u) { let g = y[i]; y[i] = g / (1.0 + exp(-g)) * v; } else { y[i] = v; }
+    if (p.mode == 2u || p.mode == 4u) { y[i] = gate(y[i], v); } else { y[i] = v; }
 }
 "#
     )
@@ -1139,4 +1175,350 @@ pub fn route_sort() -> String {
 
 pub fn moe_sum() -> String {
     format!("{COMMON}{MOE_SUM}")
+}
+
+/// Residuals that attend across blocks (Kimi K3): each token's input to a sub-layer is a
+/// softmax-weighted sum of the residual stream and the block checkpoints banked so far,
+/// scored by an RMS-normalised dot product with a learned vector. Optionally banks the
+/// current stream as the next checkpoint.
+pub const RES_MIX: &str = r#"
+struct P { len: u32, n_ckpt: u32, bank: u32, eps: f32, tstride: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> x: array<f32>;
+@group(0) @binding(3) var<storage, read> w: array<f32>;
+// Checkpoint s of token t starts at (s * tstride + t) * len.
+@group(0) @binding(4) var<storage, read_write> ck: array<f32>;
+@group(0) @binding(5) var<storage, read_write> o: array<f32>;
+var<workgroup> rs: array<f32, 256>;
+var<workgroup> rd: array<f32, 256>;
+var<workgroup> score: array<f32, 17>;
+
+fn src(s: u32, t: u32, i: u32) -> f32 {
+    if (s == p.n_ckpt) { return x[t * p.len + i]; }
+    return ck[(s * p.tstride + t) * p.len + i];
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.x;
+    let n = p.n_ckpt + 1u;
+    for (var s = 0u; s < n && p.n_ckpt > 0u; s++) {
+        var ss = 0.0;
+        var sd = 0.0;
+        for (var i = li; i < p.len; i += 256u) { let v = src(s, t, i); ss += v * v; sd += v * w[i]; }
+        rs[li] = ss;
+        rd[li] = sd;
+        workgroupBarrier();
+        for (var k = 128u; k > 0u; k >>= 1u) {
+            if (li < k) { rs[li] += rs[li + k]; rd[li] += rd[li + k]; }
+            workgroupBarrier();
+        }
+        if (li == 0u) { score[s] = rd[0] * inverseSqrt(rs[0] / f32(p.len) + p.eps); }
+        workgroupBarrier();
+    }
+    var m = -3.4e38;
+    for (var s = 0u; s < n; s++) { m = max(m, score[s]); }
+    var z = 0.0;
+    for (var s = 0u; s < n; s++) { z += exp(score[s] - m); }
+    for (var i = li; i < p.len; i += 256u) {
+        var acc = x[t * p.len + i];
+        if (p.n_ckpt > 0u) {
+            acc = 0.0;
+            for (var s = 0u; s < n; s++) { acc += exp(score[s] - m) / z * src(s, t, i); }
+        }
+        o[t * p.len + i] = acc;
+        if (p.bank == 1u) { ck[(p.n_ckpt * p.tstride + t) * p.len + i] = x[t * p.len + i]; }
+    }
+}
+"#;
+
+/// Zero `len` values per token.
+pub const FILL: &str = r#"
+struct P { len: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let i = wg.x * 256u + li;
+    if (i < p.len) { y[wg.y * p.len + i] = 0.0; }
+}
+"#;
+
+/// The short causal convolution of Kimi delta attention, then SiLU, in place: each channel
+/// mixes its last `3` inputs (kept between calls, zero at the start of a sequence) with the
+/// current one. One thread per channel walks the tokens in order.
+pub const KDA_CONV: &str = r#"
+struct P { width: u32, tstride: u32, offset: u32, soff: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read_write> buf: array<f32>;
+// Three inputs per channel; q, k and v channels follow each other from `soff`.
+@group(0) @binding(4) var<storage, read_write> state: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let c = wg.x * 256u + li;
+    if (c >= p.width) { return; }
+    var s0 = 0.0; var s1 = 0.0; var s2 = 0.0;
+    let sc = (p.soff + c) * 3u;
+    if (step.pos0 > 0u) { s0 = state[sc]; s1 = state[sc + 1u]; s2 = state[sc + 2u]; }
+    let w0 = w[c * 4u]; let w1 = w[c * 4u + 1u]; let w2 = w[c * 4u + 2u]; let w3 = w[c * 4u + 3u];
+    for (var t = 0u; t < step.n_tokens; t++) {
+        let i = t * p.tstride + p.offset + c;
+        let xt = buf[i];
+        let v = w0 * s0 + w1 * s1 + w2 * s2 + w3 * xt;
+        buf[i] = v / (1.0 + exp(-v));
+        s0 = s1; s1 = s2; s2 = xt;
+    }
+    state[sc] = s0; state[sc + 1u] = s1; state[sc + 2u] = s2;
+}
+"#;
+
+/// L2 normalisation of `rows` consecutive 128-value rows per token, in place.
+pub const L2NORM: &str = r#"
+struct P { len: u32, rows: u32, tstride: u32, eps: f32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read_write> buf: array<f32>;
+var<workgroup> red: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.y;
+    let base = t * p.tstride + wg.x * p.len;
+    var v = 0.0;
+    if (li < p.len) { v = buf[base + li]; }
+    red[li] = v * v;
+    workgroupBarrier();
+    for (var k = 64u; k > 0u; k >>= 1u) {
+        if (li < k) { red[li] += red[li + k]; }
+        workgroupBarrier();
+    }
+    if (li < p.len) { buf[base + li] = v * inverseSqrt(red[0] + p.eps); }
+}
+"#;
+
+/// Kimi delta attention: per head, a 128 x 128 state S (key channel i, value channel j) that
+/// decays per key channel and moves toward each token's value along its key (the gated delta
+/// rule), read out with the query. Each thread owns one value channel j and walks the tokens
+/// in order; the state lives in the buffer and starts at zero for a new sequence.
+///   decay_i = exp(lb * sigmoid(-a_h * (g_i + dt_i)))
+///   d_j     = beta * (v_j - sum_i S_ij decay_i k_i)
+///   S_ij    = S_ij decay_i + k_i d_j
+///   o_j     = scale * sum_i S_ij q_i
+pub const KDA: &str = r#"
+struct P { n_head: u32, d: u32, tstride: u32, scale: f32, lb: f32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+// Per token: q (d), k (d), v (d), after the convolution, q and k L2-normalised.
+@group(0) @binding(2) var<storage, read> qkv: array<f32>;
+// Per token: the decay gate before its bias and activation (d), and beta logits (n_head).
+@group(0) @binding(3) var<storage, read> gk: array<f32>;
+@group(0) @binding(4) var<storage, read> beta: array<f32>;
+@group(0) @binding(5) var<storage, read> dt: array<f32>;
+@group(0) @binding(6) var<storage, read> a: array<f32>;
+@group(0) @binding(7) var<storage, read_write> state: array<f32>;
+@group(0) @binding(8) var<storage, read_write> o: array<f32>;
+var<workgroup> ks: array<f32, 128>;
+var<workgroup> qs: array<f32, 128>;
+var<workgroup> es: array<f32, 128>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let h = wg.x / 2u;
+    let j = (wg.x % 2u) * 64u + li;
+    let hb = h * 128u;
+    let sb = h * 16384u;
+    let ah = -a[h];
+    var fresh = step.pos0 == 0u;
+    for (var t = 0u; t < step.n_tokens; t++) {
+        let tb = t * p.tstride;
+        for (var i = li; i < 128u; i += 64u) {
+            qs[i] = qkv[tb + hb + i];
+            ks[i] = qkv[tb + p.d + hb + i];
+            let g = gk[t * p.d + hb + i] + dt[hb + i];
+            es[i] = exp(p.lb / (1.0 + exp(-ah * g)));
+        }
+        workgroupBarrier();
+        let v = qkv[tb + 2u * p.d + hb + j];
+        let b = 1.0 / (1.0 + exp(-beta[t * p.n_head + h]));
+        var sk = 0.0;
+        if (!fresh) {
+            for (var i = 0u; i < 128u; i++) { sk += state[sb + i * 128u + j] * es[i] * ks[i]; }
+        }
+        let dj = (v - sk) * b;
+        var acc = 0.0;
+        for (var i = 0u; i < 128u; i++) {
+            var s = ks[i] * dj;
+            if (!fresh) { s += state[sb + i * 128u + j] * es[i]; }
+            state[sb + i * 128u + j] = s;
+            acc += s * qs[i];
+        }
+        o[t * p.d + hb + j] = acc * p.scale;
+        fresh = false;
+        workgroupBarrier();
+    }
+}
+"#;
+
+pub fn res_mix() -> String {
+    format!("{COMMON}{RES_MIX}")
+}
+
+pub fn fill() -> String {
+    format!("{COMMON}{FILL}")
+}
+
+pub fn kda_conv() -> String {
+    format!("{COMMON}{KDA_CONV}")
+}
+
+pub fn l2norm() -> String {
+    format!("{COMMON}{L2NORM}")
+}
+
+pub fn kda() -> String {
+    format!("{COMMON}{KDA}")
+}
+
+/// DSA lightning indexer, keys: LayerNorm of each token's indexer key, stored (f16) at its
+/// position.
+pub const IDX_STORE: &str = r#"
+struct P { dim: u32, eps: f32, pad0: u32, pad1: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> k: array<f32>;
+@group(0) @binding(3) var<storage, read> w: array<f32>;
+@group(0) @binding(4) var<storage, read> b: array<f32>;
+@group(0) @binding(5) var<storage, read_write> cache: array<u32>;
+var<workgroup> red: array<f32, 128>;
+var<workgroup> outv: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.x;
+    var v = 0.0;
+    if (li < p.dim) { v = k[t * p.dim + li]; }
+    red[li] = v;
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s >>= 1u) { if (li < s) { red[li] += red[li + s]; } workgroupBarrier(); }
+    let mean = red[0] / f32(p.dim);
+    workgroupBarrier();
+    var c = 0.0;
+    if (li < p.dim) { c = v - mean; }
+    red[li] = c * c;
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s >>= 1u) { if (li < s) { red[li] += red[li + s]; } workgroupBarrier(); }
+    let inv = inverseSqrt(red[0] / f32(p.dim) + p.eps);
+    if (li < p.dim) { outv[li] = c * inv * w[li] + b[li]; }
+    workgroupBarrier();
+    if (li < p.dim / 2u) {
+        cache[(step.pos0 + t) * (p.dim / 2u) + li] = pack2x16float(vec2<f32>(outv[2u * li], outv[2u * li + 1u]));
+    }
+}
+"#;
+
+/// DSA lightning indexer, scores: sum over heads of relu(q_h . k_s) * w_h for every cached
+/// position s of every token (only when there are more than top_k).
+pub const IDX_SCORE: &str = r#"
+struct P { n_head: u32, dim: u32, ctx: u32, top_k: u32, scale: f32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> iq: array<f32>;
+@group(0) @binding(3) var<storage, read> iw: array<f32>;
+@group(0) @binding(4) var<storage, read> cache: array<u32>;
+@group(0) @binding(5) var<storage, read_write> score: array<f32>;
+var<workgroup> qs: array<f32, 1024>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.y;
+    let n_keys = step.pos0 + t + 1u;
+    if (n_keys <= p.top_k || wg.x * 256u >= n_keys) { return; }
+    let s = wg.x * 256u + li;
+    let hd = p.dim / 2u;
+    var acc = 0.0;
+    let per = 1024u / p.dim;
+    for (var h0 = 0u; h0 < p.n_head; h0 += per) {
+        for (var i = li; i < per * p.dim; i += 256u) {
+            let h = h0 + i / p.dim;
+            var v = 0.0;
+            if (h < p.n_head) { v = iq[(t * p.n_head + h0) * p.dim + i]; }
+            qs[i] = v;
+        }
+        workgroupBarrier();
+        if (s < n_keys) {
+            for (var hh = 0u; hh < per && h0 + hh < p.n_head; hh++) {
+                var d = 0.0;
+                for (var e = 0u; e < hd; e++) {
+                    let kk = unpack2x16float(cache[s * hd + e]);
+                    d += qs[hh * p.dim + 2u * e] * kk.x + qs[hh * p.dim + 2u * e + 1u] * kk.y;
+                }
+                acc += max(d, 0.0) * iw[t * p.n_head + h0 + hh];
+            }
+        }
+        workgroupBarrier();
+    }
+    if (s < n_keys) { score[t * p.ctx + s] = acc * p.scale; }
+}
+"#;
+
+/// DSA lightning indexer, selection: the order key of each token's top_k-th best score, by an
+/// exact radix select (four 8-bit passes over the scores).
+pub const IDX_TOPK: &str = r#"
+struct P { ctx: u32, top_k: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> score: array<f32>;
+@group(0) @binding(3) var<storage, read_write> thr: array<u32>;
+var<workgroup> hist: array<atomic<u32>, 256>;
+var<workgroup> pick: vec2<u32>;
+
+fn order_key(x: f32) -> u32 {
+    let b = bitcast<u32>(x);
+    return select(b | 0x80000000u, ~b, (b & 0x80000000u) != 0u);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.x;
+    let n_keys = step.pos0 + t + 1u;
+    if (n_keys <= p.top_k) { return; }
+    var prefix = 0u;
+    var mask = 0u;
+    var k = p.top_k;
+    for (var round = 0u; round < 4u; round++) {
+        let shift = 24u - 8u * round;
+        atomicStore(&hist[li], 0u);
+        workgroupBarrier();
+        for (var s = li; s < n_keys; s += 256u) {
+            let key = order_key(score[t * p.ctx + s]);
+            if ((key & mask) == prefix) { atomicAdd(&hist[(key >> shift) & 255u], 1u); }
+        }
+        workgroupBarrier();
+        if (li == 0u) {
+            var cum = 0u;
+            var bin = 0u;
+            for (var b = 255; b >= 0; b--) {
+                let c = atomicLoad(&hist[u32(b)]);
+                if (cum + c >= k) { bin = u32(b); break; }
+                cum += c;
+            }
+            pick = vec2<u32>(bin, k - cum);
+        }
+        let pk = workgroupUniformLoad(&pick);
+        prefix |= pk.x << shift;
+        mask |= 255u << shift;
+        k = pk.y;
+    }
+    if (li == 0u) { thr[t] = prefix; }
+}
+"#;
+
+pub fn idx_store() -> String {
+    format!("{COMMON}{IDX_STORE}")
+}
+
+pub fn idx_score() -> String {
+    format!("{COMMON}{IDX_SCORE}")
+}
+
+pub fn idx_topk() -> String {
+    format!("{COMMON}{IDX_TOPK}")
 }

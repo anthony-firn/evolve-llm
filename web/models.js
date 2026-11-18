@@ -5,6 +5,7 @@ const LLAMA = { license: 'Llama 3.2 Community License', licenseUrl: 'https://www
 const APACHE = { license: 'Apache 2.0', licenseUrl: 'https://www.apache.org/licenses/LICENSE-2.0' };
 const MIT = { license: 'MIT', licenseUrl: 'https://opensource.org/license/mit' };
 const KIMI = { license: 'Modified MIT', licenseUrl: 'https://huggingface.co/moonshotai/Kimi-K2-Instruct-0905/blob/main/LICENSE' };
+const KIMI_K31 = { license: 'Kimi K3.1 Pro License', licenseUrl: 'https://huggingface.co/moonshotai/Kimi-K3.1-Pro/blob/main/LICENSE' };
 
 export const MODELS = [
   { id: 'smollm2-135m', name: 'SmolLM2 135M', maker: 'Hugging Face', repo: 'bartowski/SmolLM2-135M-Instruct-GGUF',
@@ -33,7 +34,9 @@ export const MODELS = [
 
 // Mixture-of-experts models. The ones larger than GPU memory keep their attention weights on the
 // GPU and read the experts each token chooses from browser storage, so they run slowly but run.
-// `bytes` is the download size; split models list their parts when they are chosen.
+// Models marked `stream` are larger than most devices can store: they are read from Hugging Face
+// while they run, with as much as the storage setting allows kept on the device.
+// `bytes` is the model's size; split models list their parts when they are chosen.
 export const LARGE = [
   { id: 'olmoe-1b-7b', name: 'OLMoE 1B-7B', maker: 'Ai2', repo: 'allenai/OLMoE-1B-7B-0125-Instruct-GGUF',
     file: 'OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf', bytes: 4210000000, quant: 'Q4_K_M', params: '7B, 1.3B active',
@@ -43,16 +46,19 @@ export const LARGE = [
     note: 'Strong general model. Streams experts from storage when GPU memory is short.', ...APACHE },
   { id: 'qwen3-235b-a22b', name: 'Qwen3 235B-A22B', maker: 'Qwen', repo: 'unsloth/Qwen3-235B-A22B-Instruct-2507-GGUF',
     file: 'UD-Q2_K_XL/Qwen3-235B-A22B-Instruct-2507-UD-Q2_K_XL-00001-of-00002.gguf', bytes: 88770000000, quant: 'UD-Q2_K_XL', params: '235B, 22B active',
-    note: 'Two files. Needs about 90 GB of free browser storage; each token reads gigabytes, so replies are slow.', ...APACHE },
+    note: 'Read from Hugging Face as it runs, nothing to download first. Each token reads gigabytes: expect minutes per token on a home connection, faster as the device cache fills.', stream: true, ...APACHE },
   { id: 'qwen3-coder-480b', name: 'Qwen3 Coder 480B-A35B', maker: 'Qwen', repo: 'unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF',
     file: 'Qwen3-Coder-480B-A35B-Instruct-UD-IQ1_M.gguf', bytes: 149720000000, quant: 'UD-IQ1_M', params: '480B, 35B active',
-    note: 'Needs about 150 GB of free browser storage. Slow: expect seconds per token.', ...APACHE },
+    note: 'Read from Hugging Face as it runs, nothing to download first. Very slow: minutes per token on a home connection.', stream: true, ...APACHE },
   { id: 'deepseek-v3.1', name: 'DeepSeek V3.1', maker: 'DeepSeek', repo: 'unsloth/DeepSeek-V3.1-GGUF',
     file: 'UD-IQ1_S/DeepSeek-V3.1-UD-IQ1_S-00001-of-00004.gguf', bytes: 192310000000, quant: 'UD-IQ1_S', params: '671B, 37B active',
-    note: 'Four files, about 190 GB of storage. Latent attention keeps the context small. Slow.', ...MIT },
+    note: 'Read from Hugging Face as it runs, nothing to download first. Latent attention keeps the context small. Very slow.', stream: true, ...MIT },
   { id: 'kimi-k2', name: 'Kimi K2 Instruct', maker: 'Moonshot AI', repo: 'unsloth/Kimi-K2-Instruct-0905-GGUF',
     file: 'UD-TQ1_0/Kimi-K2-Instruct-0905-UD-TQ1_0-00001-of-00006.gguf', bytes: 248610000000, quant: 'UD-TQ1_0', params: '1T, 32B active',
-    note: 'One trillion parameters in six files, about 250 GB of storage. Slow.', ...KIMI },
+    note: 'One trillion parameters, read from Hugging Face as it runs, nothing to download first. Very slow.', stream: true, ...KIMI },
+  { id: 'kimi-k3.1-pro', name: 'Kimi K3.1 Pro', maker: 'Moonshot AI', repo: 'KarLexAI/Kimi-K3.1-Pro-GGUF',
+    file: 'KLX-IQ1_S/Kimi-K3.1-Pro-KLX-IQ1_S-00001-of-00014.gguf', bytes: 592670000000, quant: 'IQ1_S', params: '2.8T, 106B active',
+    note: 'The strongest open coding model as of November 2026. Read from Hugging Face as it runs: every token reads about 57 GB, so expect a minute or more per token once your device storage holds it, and hours per token over a home connection.', stream: true, ...KIMI_K31 },
 ];
 
 /** For `name-00001-of-00004.gguf`, every part's path; null for a single file. */

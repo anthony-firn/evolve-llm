@@ -17,7 +17,7 @@ required-features = ["native"]
 
 [features]
 default = ["native"]
-native = ["dep:pollster", "wgpu/vulkan", "wgpu/metal", "wgpu/dx12"]
+native = ["dep:pollster", "dep:ureq", "wgpu/vulkan", "wgpu/metal", "wgpu/dx12"]
 
 [dependencies]
 fancy-regex = { version = "0.20", default-features = false, features = ["std", "unicode"] }
@@ -28,6 +28,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 unicode-normalization = "0.1"
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl"] }
 pollster = { version = "0.4", optional = true }
+# Native reads of models that stay on Hugging Face (the browser uses fetch instead).
+ureq = { version = "3.5", optional = true, default-features = false, features = ["rustls"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl", "webgpu"] }

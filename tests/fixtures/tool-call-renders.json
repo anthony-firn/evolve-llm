@@ -1,0 +1,9 @@
+{
+  "qwen2.5": "<tool_call>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"WebGPU spec\", \"limit\": 3}}\n</tool_call><|im_end|>\n",
+  "qwen3": "<tool_call>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"WebGPU spec\", \"limit\": 3}}\n</tool_call><|im_end|>\n",
+  "qwen3-coder": "<tool_call>\n<function=web_search>\n<parameter=query>\nWebGPU spec\n</parameter>\n<parameter=limit>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>\n",
+  "llama3.2": "{\"name\": \"web_search\", \"parameters\": {\"query\": \"WebGPU spec\", \"limit\": 3}}<|eot_id|>",
+  "deepseek-v3.1": "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>web_search<｜tool▁sep｜>{\"query\":\"WebGPU spec\",\"limit\":3}<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜>",
+  "kimi-k2": "<|tool_calls_section_begin|><|tool_call_begin|>functions.web_search:0<|tool_call_argument_begin|>{\"query\": \"WebGPU spec\", \"limit\": 3}<|tool_call_end|><|tool_calls_section_end|><|im_end|>",
+  "kimi-k3.1": "<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"web_search\" index=\"1\"<|sep|><|open|>argument key=\"query\" type=\"string\"<|sep|>WebGPU spec<|close|>argument<|sep|><|open|>argument key=\"limit\" type=\"number\"<|sep|>3<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>"
+}

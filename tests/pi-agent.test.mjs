@@ -243,3 +243,22 @@ test('only http and https pages can be opened, without embedded credentials', ()
   for (const bad of ['javascript:alert(1)', 'file:///etc/passwd', 'data:text/html,hi', 'https://user:pw@example.com/', ''])
     assert.throws(() => normalizeBrowserUrl(bad), bad);
 });
+
+test('Pi runs tools a model calls in its own syntax (Kimi K3.1) and returns structured history',async()=>{
+ const files=new Map();let round=0;let history=null;
+ const workspace={async request(name,args){if(name==='write'){files.set(args.path,args.text);return {ok:true}}throw Error('Unexpected operation')}};
+ const k3=(name,args)=>`<|open|>response<|sep|>Writing it.<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool="${name}" index="1"<|sep|>`+Object.entries(args).map(([k,v])=>`<|open|>argument key="${k}" type="string"<|sep|>${v}<|close|>argument<|sep|>`).join('')+'<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>';
+ const task=createPiTask({workspace,network:{options:()=>({enabled:false})},turn:async(messages)=>{
+  round++;
+  if(round===1)return {text:k3('write',{path:'/workspace/a.txt',text:'<b>kimi</b>'}),reason:'end',n:40};
+  history=messages;
+  return {text:'<|open|>response<|sep|>Done.<|close|>response<|sep|><|close|>message<|sep|>',reason:'end',n:5};
+ }});
+ const result=await task.run('Write a file');
+ assert.equal(files.get('/workspace/a.txt'),'<b>kimi</b>');assert.equal(result.calls,1);
+ const call=history.find(m=>m.role==='assistant'&&m.tool_calls);
+ assert.deepEqual(call.tool_calls[0].function,{name:'write',arguments:{path:'/workspace/a.txt',text:'<b>kimi</b>'}});
+ assert.equal(call.content,'Writing it.');
+ const res=history.find(m=>m.role==='tool');
+ assert.equal(res.name,'write');assert.equal(res.tool_call_id,call.tool_calls[0].id);assert.match(call.tool_calls[0].id,/^functions\.write:\d+$/);
+});

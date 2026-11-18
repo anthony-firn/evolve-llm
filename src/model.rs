@@ -19,6 +19,10 @@ pub enum Arch {
     Deepseek2,
     /// OLMoE: experts, with RMSNorm over the whole query and key projections.
     Olmoe,
+    /// Kimi K3.1: Kimi delta attention (a linear-attention recurrence) in most layers, latent
+    /// attention without rotation in the rest, residuals that attend across earlier blocks,
+    /// and experts that work in a smaller latent space.
+    KimiK31,
 }
 
 /// How router scores become expert probabilities.
@@ -65,6 +69,40 @@ pub struct Mla {
     /// Rotated dimensions, shared by all heads on the key side.
     pub rope: usize,
     pub v_dim: usize,
+    /// The `rope` part is rotated (false: no position encoding, Kimi K3).
+    pub rotate: bool,
+}
+
+/// Kimi delta attention: per head, a head_dim x head_dim state that decays per key channel and
+/// is corrected toward each new value (the gated delta rule), after a short causal convolution.
+#[derive(Clone, Debug, Serialize)]
+pub struct Kda {
+    pub n_head: usize,
+    pub head_dim: usize,
+    /// Convolution width, including the current token.
+    pub conv: usize,
+    /// Decay gates are `lower_bound * sigmoid(...)`, so each step keeps at least exp(lower_bound).
+    pub gate_lower_bound: f32,
+    /// Which layers use it; the others use latent attention.
+    pub layers: Vec<bool>,
+}
+
+impl Kda {
+    pub fn width(&self) -> usize {
+        self.n_head * self.head_dim
+    }
+}
+
+/// The lightning indexer of DeepSeek sparse attention: it scores every cached position and
+/// latent attention reads only the best `top_k`.
+#[derive(Clone, Debug, Serialize)]
+pub struct Indexer {
+    pub n_head: usize,
+    pub head_dim: usize,
+    pub top_k: usize,
+    /// Layers that score their own selection; other latent-attention layers reuse the last one.
+    pub full: Vec<bool>,
+    pub eps: f32,
 }
 
 /// YaRN context extension: rotation frequencies blend between interpolated and original.
@@ -109,6 +147,16 @@ pub struct Config {
     pub rope_mscale: f32,
     /// Scale of query-key dot products.
     pub kq_scale: f32,
+    pub kda: Option<Kda>,
+    /// Layers per block of residuals that attend across blocks (0: a plain residual stream).
+    pub attn_res_block: usize,
+    /// Kimi K3's situ gate (beta, linear beta) in place of SiLU.
+    pub situ: Option<(f32, f32)>,
+    /// Width of the space routed experts work in (0: they read the hidden state).
+    pub expert_latent: usize,
+    /// A sigmoid gate on the attention output before its projection.
+    pub attn_gate: bool,
+    pub indexer: Option<Indexer>,
 }
 
 impl Config {
@@ -121,6 +169,14 @@ impl Config {
     /// True when layer `l` uses experts.
     pub fn is_moe(&self, l: usize) -> bool {
         self.moe.as_ref().is_some_and(|m| l >= m.dense_lead)
+    }
+    /// True when layer `l` is a linear-attention (KDA) layer.
+    pub fn is_kda(&self, l: usize) -> bool {
+        self.kda.as_ref().is_some_and(|k| k.layers[l])
+    }
+    /// Width of what routed experts read and write.
+    pub fn expert_in(&self) -> usize {
+        if self.expert_latent > 0 { self.expert_latent } else { self.n_embd }
     }
     /// Values cached per token and layer: f16 keys and values, or the MLA latent and rotated key.
     pub fn cache_dim(&self) -> usize {
@@ -156,9 +212,11 @@ pub fn arch_of(g: &Gguf) -> Result<Arch, String> {
         "qwen3moe" => Arch::Qwen3Moe,
         "deepseek2" => Arch::Deepseek2,
         "olmoe" => Arch::Olmoe,
+        // Kimi K3 is the same model without the sparse-attention indexer.
+        "kimi-k31" | "kimi-k3" => Arch::KimiK31,
         other => {
             return Err(format!(
-                "the {other} architecture is not supported yet (supported: llama, mistral, qwen2, qwen3, qwen3moe, deepseek2, olmoe)"
+                "the {other} architecture is not supported yet (supported: llama, mistral, qwen2, qwen3, qwen3moe, deepseek2, olmoe, kimi-k3, kimi-k31)"
             ))
         }
     })
@@ -175,9 +233,15 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
     };
     let n_embd = need("embedding_length")?;
     let n_head = need("attention.head_count")?;
+    // Kimi K3.1 lists it per layer: 0 marks a linear-attention layer.
+    let kv_per_layer: Option<Vec<u64>> = g
+        .get(&key("attention.head_count_kv"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|v| v.as_u64().unwrap_or(0)).collect());
     let n_head_kv = g
         .u64(&key("attention.head_count_kv"))
         .map(|v| v as usize)
+        .or_else(|| kv_per_layer.as_ref().and_then(|a| a.iter().copied().find(|&v| v > 0)).map(|v| v as usize))
         .unwrap_or(n_head);
     let head_dim = g
         .u64(&key("attention.key_length"))
@@ -221,7 +285,7 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
                 gating,
                 // Llama (Mixtral) and Qwen3 always renormalise, OLMoE never; DeepSeek says in its metadata.
                 norm: match arch {
-                    Arch::Deepseek2 => g.bool(&key("expert_weights_norm")).unwrap_or(false),
+                    Arch::Deepseek2 | Arch::KimiK31 => g.bool(&key("expert_weights_norm")).unwrap_or(false),
                     Arch::Olmoe => false,
                     _ => true,
                 },
@@ -234,7 +298,7 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
         }
         _ => None,
     };
-    let mla = if arch == Arch::Deepseek2 {
+    let mla = if matches!(arch, Arch::Deepseek2 | Arch::KimiK31) {
         let kv_lora = need("attention.kv_lora_rank")?;
         let k_mla = opt("attention.key_length_mla").ok_or(
             "this DeepSeek file predates split attn_k_b/attn_v_b tensors; use a GGUF converted by llama.cpp from mid-2025 or later",
@@ -246,6 +310,9 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
             nope: k_mla - rope,
             rope,
             v_dim: need("attention.value_length_mla")?,
+            // Kimi K3 latent attention has no position encoding (the recurrent layers carry
+            // order); its files still describe a 64-wide unrotated key part.
+            rotate: arch != Arch::KimiK31,
         })
     } else {
         None
@@ -275,18 +342,58 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
         (None, _) => (1.0, 1.0 / (head_dim as f32).sqrt()),
     };
     let first_attn = if arch == Arch::Deepseek2 { "blk.0.attn_kv_a_mqa.weight" } else { "blk.0.attn_q.weight" };
-    if g.tensor(first_attn).is_none() && g.tensor("blk.0.attn_qkv.weight").is_some() {
+    if arch != Arch::KimiK31 && g.tensor(first_attn).is_none() && g.tensor("blk.0.attn_qkv.weight").is_some() {
         return Err("fused attn_qkv tensors are not supported yet".into());
     }
     if g.tensor(&format!("blk.{}.ffn_gate_up_exps.weight", moe.as_ref().map_or(0, |m| m.dense_lead))).is_some() {
         return Err("fused ffn_gate_up_exps tensors are not supported yet".into());
     }
+    let n_layer = need("block_count")?;
+    let kda = match (arch, &kv_per_layer) {
+        (Arch::KimiK31, Some(per)) => {
+            if per.len() != n_layer {
+                return Err("attention.head_count_kv does not list every layer".into());
+            }
+            Some(Kda {
+                n_head,
+                head_dim: need("kda.head_dim")?,
+                conv: need("ssm.conv_kernel")?,
+                gate_lower_bound: g.f64(&key("kda.gate_lower_bound")).unwrap_or(f64::NEG_INFINITY) as f32,
+                layers: per.iter().map(|&v| v == 0).collect(),
+            })
+        }
+        (Arch::KimiK31, None) => return Err("Kimi K3 files list attention.head_count_kv per layer".into()),
+        _ => None,
+    };
+    if kda.as_ref().is_some_and(|k| !k.gate_lower_bound.is_finite()) {
+        return Err("Kimi Linear's softplus decay gate is not supported yet (only Kimi K3's bounded gate)".into());
+    }
+    let first_mla = (0..n_layer).find(|&l| !kda.as_ref().is_some_and(|k| k.layers[l])).unwrap_or(0);
+    let indexer = match opt("attention.indexer.top_k") {
+        Some(top_k) if top_k > 0 => {
+            let full: Vec<bool> = match g.get(&key("attention.indexer.types")).and_then(|v| v.as_array()) {
+                Some(a) => a.iter().map(|v| v.as_bool().unwrap_or(true)).collect(),
+                None => vec![true; n_layer],
+            };
+            Some(Indexer {
+                n_head: need("attention.indexer.head_count")?,
+                head_dim: need("attention.indexer.key_length")?,
+                top_k,
+                full,
+                eps: g.f64(&key("attention.layer_norm_epsilon")).unwrap_or(1e-5) as f32,
+            })
+        }
+        _ => None,
+    };
+    let situ = g
+        .f64(&key("activation.situ_beta"))
+        .map(|b| (b as f32, g.f64(&key("activation.situ_linear_beta")).unwrap_or(0.0) as f32));
     let cfg = Config {
         arch,
         name: g.str("general.name").unwrap_or("model").to_string(),
         n_vocab,
         n_embd,
-        n_layer: need("block_count")?,
+        n_layer,
         n_head,
         n_head_kv,
         head_dim,
@@ -312,6 +419,12 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
         yarn,
         rope_mscale,
         kq_scale,
+        kda,
+        attn_res_block: opt("attn_res.block_size").unwrap_or(0),
+        situ,
+        expert_latent: opt("expert_latent_length").unwrap_or(0),
+        attn_gate: arch == Arch::KimiK31 && g.tensor(&format!("blk.{first_mla}.attn_gate.weight")).is_some(),
+        indexer,
     };
     validate(g, &cfg)?;
     Ok(cfg)
@@ -336,6 +449,14 @@ fn validate(g: &Gguf, c: &Config) -> Result<(), String> {
         if m.n_expert > 1024 || m.n_used > 32 || m.n_used > m.n_expert || m.n_expert % m.n_group != 0 {
             return Err(format!("unsupported expert layout {} / {}", m.n_used, m.n_expert));
         }
+    }
+    if let Some(k) = &c.kda {
+        if k.head_dim != 128 || k.conv != 4 {
+            return Err(format!("unsupported linear-attention sizes: head {} and convolution {}", k.head_dim, k.conv));
+        }
+    }
+    if c.attn_res_block > 0 && c.n_layer.div_ceil(c.attn_res_block) > 16 {
+        return Err("more than 16 residual blocks are not supported".into());
     }
     if scaling_is_unsupported(g) {
         return Err("this model needs LongRoPE scaling, which is not supported yet".into());
@@ -396,6 +517,18 @@ pub fn matrices(c: &Config) -> Vec<(String, usize, usize, usize)> {
     for i in 0..c.n_layer {
         let b = |s: &str| format!("blk.{i}.{s}.weight");
         match &c.mla {
+            _ if c.is_kda(i) => {
+                let k = c.kda.as_ref().unwrap();
+                let d = k.width();
+                m.push((b("attn_q"), d, c.n_embd, 1));
+                m.push((b("attn_k"), d, c.n_embd, 1));
+                m.push((b("attn_v"), d, c.n_embd, 1));
+                m.push((b("ssm_f_a"), k.head_dim, c.n_embd, 1));
+                m.push((b("ssm_f_b"), d, k.head_dim, 1));
+                m.push((b("ssm_beta"), k.n_head, c.n_embd, 1));
+                m.push((b("ssm_g"), d, c.n_embd, 1));
+                m.push((b("attn_output"), c.n_embd, d, 1));
+            }
             Some(a) => {
                 if a.q_lora > 0 {
                     m.push((b("attn_q_a"), a.q_lora, c.n_embd, 1));
@@ -406,6 +539,14 @@ pub fn matrices(c: &Config) -> Vec<(String, usize, usize, usize)> {
                 m.push((b("attn_kv_a_mqa"), a.kv_lora + a.rope, c.n_embd, 1));
                 m.push((b("attn_k_b"), a.kv_lora, a.nope, c.n_head));
                 m.push((b("attn_v_b"), a.v_dim, a.kv_lora, c.n_head));
+                if c.attn_gate {
+                    m.push((b("attn_gate"), c.n_head * a.v_dim, c.n_embd, 1));
+                }
+                if let Some(ix) = c.indexer.as_ref().filter(|ix| ix.full[i]) {
+                    m.push((b("indexer.attn_q_b"), ix.n_head * ix.head_dim, a.q_lora, 1));
+                    m.push((b("indexer.attn_k"), ix.head_dim, c.n_embd, 1));
+                    m.push((b("indexer.proj"), ix.n_head, c.n_embd, 1));
+                }
                 m.push((b("attn_output"), c.n_embd, c.n_head * a.v_dim, 1));
             }
             None => {
@@ -418,9 +559,14 @@ pub fn matrices(c: &Config) -> Vec<(String, usize, usize, usize)> {
         match c.moe.as_ref().filter(|_| c.is_moe(i)) {
             Some(e) => {
                 m.push((b("ffn_gate_inp"), e.n_expert, c.n_embd, 1));
-                m.push((b("ffn_gate_exps"), e.n_ff, c.n_embd, e.n_expert));
-                m.push((b("ffn_up_exps"), e.n_ff, c.n_embd, e.n_expert));
-                m.push((b("ffn_down_exps"), c.n_embd, e.n_ff, e.n_expert));
+                let w = c.expert_in();
+                m.push((b("ffn_gate_exps"), e.n_ff, w, e.n_expert));
+                m.push((b("ffn_up_exps"), e.n_ff, w, e.n_expert));
+                m.push((b("ffn_down_exps"), w, e.n_ff, e.n_expert));
+                if c.expert_latent > 0 {
+                    m.push((b("ffn_routed_down"), w, c.n_embd, 1));
+                    m.push((b("ffn_routed_up"), c.n_embd, w, 1));
+                }
                 if e.n_ff_shared > 0 {
                     m.push((b("ffn_gate_shexp"), e.n_ff_shared, c.n_embd, 1));
                     m.push((b("ffn_up_shexp"), e.n_ff_shared, c.n_embd, 1));
@@ -443,9 +589,31 @@ pub fn vectors(c: &Config) -> Vec<(String, usize)> {
     if c.has_rope_freqs {
         v.push(("rope_freqs.weight".into(), c.rope_dim / 2));
     }
+    if c.attn_res_block > 0 {
+        v.push(("output_res_score.weight".into(), c.n_embd));
+    }
     for i in 0..c.n_layer {
         v.push((format!("blk.{i}.attn_norm.weight"), c.n_embd));
         v.push((format!("blk.{i}.ffn_norm.weight"), c.n_embd));
+        if c.attn_res_block > 0 {
+            v.push((format!("blk.{i}.attn_res_score.weight"), c.n_embd));
+            v.push((format!("blk.{i}.ffn_res_score.weight"), c.n_embd));
+        }
+        if let Some(k) = c.kda.as_ref().filter(|_| c.is_kda(i)) {
+            for x in ["q", "k", "v"] {
+                v.push((format!("blk.{i}.ssm_conv1d_{x}.weight"), k.width() * k.conv));
+            }
+            v.push((format!("blk.{i}.ssm_dt.bias"), k.width()));
+            v.push((format!("blk.{i}.ssm_a"), k.n_head));
+            v.push((format!("blk.{i}.ssm_norm.weight"), k.head_dim));
+            if let Some(e) = c.moe.as_ref().filter(|e| e.probs_bias && c.is_moe(i)) {
+                v.push((format!("blk.{i}.exp_probs_b.bias"), e.n_expert));
+            }
+            if c.expert_latent > 0 && c.is_moe(i) {
+                v.push((format!("blk.{i}.ffn_routed_norm.weight"), c.expert_latent));
+            }
+            continue;
+        }
         if c.qkv_bias {
             v.push((format!("blk.{i}.attn_q.bias"), c.q_dim()));
             v.push((format!("blk.{i}.attn_k.bias"), c.kv_dim()));
@@ -462,8 +630,15 @@ pub fn vectors(c: &Config) -> Vec<(String, usize)> {
             }
             v.push((format!("blk.{i}.attn_kv_a_norm.weight"), a.kv_lora));
         }
+        if let Some(ix) = c.indexer.as_ref().filter(|ix| ix.full[i]) {
+            v.push((format!("blk.{i}.indexer.k_norm.weight"), ix.head_dim));
+            v.push((format!("blk.{i}.indexer.k_norm.bias"), ix.head_dim));
+        }
         if let Some(e) = c.moe.as_ref().filter(|e| e.probs_bias && c.is_moe(i)) {
             v.push((format!("blk.{i}.exp_probs_b.bias"), e.n_expert));
+        }
+        if c.expert_latent > 0 && c.is_moe(i) {
+            v.push((format!("blk.{i}.ffn_routed_norm.weight"), c.expert_latent));
         }
     }
     v

@@ -1,9 +1,10 @@
 // Runs the WebAssembly engine off the main thread: downloads, GPU upload and generation.
 import init, { create_loader, inspect, inspect_parts } from './pkg/evolve_llm.js';
 import { formatBytes } from './models.js';
-import { nativeToolFormat, toolTransport } from './tool-transport.mjs';
+import { assistantWithCalls, nativeToolFormat, toolResult, toolTransport } from './tool-transport.mjs';
 import { openModelReaders, storageError } from './model-readers.mjs';
-import { TOOL_SCHEMAS, parseToolCalls, runTool, webSearch } from './tools.js';
+import { RangeCache, RemoteModel } from './remote-reader.mjs';
+import { TOOL_SCHEMAS, displayText, parseToolCalls, rawPiece, runTool, schemaTypes, webSearch } from './tools.js';
 
 const CHUNK = 16 << 20; // bytes read from the file per upload call
 const post = (type, data = {}) => self.postMessage({ type, ...data });
@@ -13,8 +14,12 @@ let chat = null;
 // Synchronous readers of the loaded model's files, kept open while it runs: weights that do not
 // fit on the GPU are read again from them.
 let readers = [];
-// Whether the loaded model's chat template offers tools to the model.
+// The network reader of a model that stays on Hugging Face (null for stored models).
+let remote = null;
+// Whether the loaded model's chat template offers tools to the model, and whether it wants each
+// call's arguments as JSON text rather than an object (DeepSeek).
 let toolTemplate = false;
+let argsAsString = false;
 let stopRequested = false;
 let cancelLoad = false;
 let webAbort = new AbortController();
@@ -208,6 +213,43 @@ async function download(entry) {
   return names;
 }
 
+// ---- Reading models that stay on Hugging Face ----
+
+// A model larger than this browser can store is read from Hugging Face as it runs. The cache
+// directory keeps up to `cacheGb` of it on this device between runs.
+async function openRemote(source, cacheGb) {
+  const parts = source.parts?.length ? source.parts : [{ file: source.file, url: source.url, bytes: source.bytes }];
+  let cache = null;
+  if (cacheGb > 0 && navigator.storage?.getDirectory) {
+    try {
+      try { await navigator.storage.persist?.(); } catch { /* best effort */ }
+      const root = await navigator.storage.getDirectory();
+      const dir = await (await root.getDirectoryHandle('stream', { create: true })).getDirectoryHandle(source.key, { create: true });
+      cache = await RangeCache.open(dir, cacheGb * 1e9);
+    } catch {
+      cache = null; // another tab holds it, or storage is unavailable: run without a cache
+    }
+  }
+  const r = new RemoteModel(parts.map((p) => p.url), { cache });
+  let last = 0;
+  const t0 = performance.now();
+  r.onPiece = () => {
+    const now = performance.now();
+    if (now - last < 500) return;
+    last = now;
+    post('stream-progress', { fetched: r.stats.fetched, cacheHit: r.stats.cacheHit, rate: r.stats.fetched / Math.max(0.001, (now - t0) / 1000) });
+  };
+  post('progress', { phase: 'connect', loaded: 0, total: 1 });
+  await r.open();
+  return r;
+}
+
+async function removeStreamCache(key) {
+  const root = await navigator.storage.getDirectory();
+  const dir = await root.getDirectoryHandle('stream', { create: true });
+  await dir.removeEntry(key, { recursive: true }).catch(() => {});
+}
+
 // ---- Reading model files ----
 
 // A synchronous random-access reader: an OPFS access handle for stored models, or
@@ -217,6 +259,8 @@ function closeReaders() {
     try { r.close(); } catch { /* already closed */ }
   }
   readers = [];
+  if (remote) remote.aborted = true;
+  remote = null;
 }
 
 // ---- Loading onto the GPU ----
@@ -243,7 +287,11 @@ function readHeader(reader) {
 }
 
 async function loadModel(source, wantCtx, lowPower, budgetPref) {
-  readers = await openModelReaders(source, modelsDir);
+  readers = source.remote ? source.remote.readers() : await openModelReaders(source, modelsDir);
+  remote = source.remote || null;
+  // Headers come over the network together; later reads of a longer header fall back to
+  // synchronous requests.
+  if (remote) await remote.prefetch(readers.map((r, i) => ({ file: i, offset: 0, len: Math.min(r.size, 8 << 20), every: true })));
   const first = readHeader(readers[0]);
   if (first.result.error) throw new Error(first.result.error);
   const headers = [first.bytes];
@@ -280,11 +328,18 @@ async function loadModel(source, wantCtx, lowPower, budgetPref) {
     let done = 0;
     let last = 0;
     const t0 = performance.now();
+    const reads = [];
     for (const p of plan) {
       const rows = Math.max(1, Math.floor(CHUNK / p.row_bytes));
-      for (let r = 0; r < p.rows; r += rows) {
+      for (let r = 0; r < p.rows; r += rows) reads.push({ p, r, n: Math.min(rows, p.rows - r) });
+    }
+    // Over the network, about 256 MB is requested at a time, many requests in flight.
+    const BATCH = remote ? 16 : 1;
+    for (let b = 0; b < reads.length; b += BATCH) {
+      const batch = reads.slice(b, b + BATCH);
+      if (remote) await remote.prefetch(batch.map(({ p, r, n }) => ({ file: p.file, offset: p.offset + r * p.row_bytes, len: n * p.row_bytes, every: false })));
+      for (const { p, r, n } of batch) {
         if (cancelLoad) throw new Error('Loading was cancelled.');
-        const n = Math.min(rows, p.rows - r);
         const bytes = readBytes(readers[p.file], p.offset + r * p.row_bytes, n * p.row_bytes);
         loader.upload(p.name, r, bytes);
         done += bytes.length;
@@ -298,13 +353,25 @@ async function loadModel(source, wantCtx, lowPower, budgetPref) {
       }
     }
     const files = readers;
-    loader.set_source((file, offset, target) => files[file].read(offset, target));
+    const net = remote;
+    loader.set_source((file, offset, target) => files[file].read(offset, target), net ? (quads) => net.prefetch(quads) : undefined);
     post('progress', { phase: 'prepare', loaded: total, total });
     chat = loader.finish(ctx);
     try {
       toolTemplate = nativeToolFormat(chat.render(JSON.stringify([{ role: 'user', content: 'Hi' }]), JSON.stringify({ tools: TOOL_SCHEMAS })));
     } catch {
       toolTemplate = false;
+    }
+    argsAsString = false;
+    if (toolTemplate) {
+      // A conversation with one tool call and its result, as each template expects it.
+      const probe = (args) => JSON.stringify([
+        { role: 'user', content: 'Hi' },
+        assistantWithCalls('', [{ id: 'call_0', name: 'web_search', args }]),
+        toolResult('call_0', 'web_search', 'Result'),
+      ]);
+      const renders = (args) => { try { chat.render(probe(args), JSON.stringify({ tools: TOOL_SCHEMAS })); return true; } catch { return false; } };
+      if (!renders({ query: 'x' }) && renders(JSON.stringify({ query: 'x' }))) argsAsString = true;
     }
   } finally {
     loader.free();
@@ -350,24 +417,31 @@ async function turn(messages, opts, maxTokens, ctx, emit = post, preserveTask = 
   const limit = Math.min(maxTokens, ctx - tokens.length - 1);
   let n = 0;
   let reason = 'length';
-  let text = '';
+  // The raw reply keeps the control tokens that carry markup (Kimi K3 channels, DeepSeek and
+  // Kimi tool calls), so calls can be read from it; the person sees `displayText` of it.
+  let raw = '';
+  let shown = '';
+  const show = () => {
+    const d = displayText(raw);
+    if (d.length > shown.length && d.startsWith(shown)) {
+      emit('token', { text: d.slice(shown.length) });
+      shown = d;
+    }
+  };
   while (n < limit) {
     if (stopRequested) { reason = 'stopped'; break; }
     const id = await chat.next();
     n++;
     if (chat.is_end(id)) { reason = 'end'; break; }
-    const piece = chat.piece(id);
+    const piece = rawPiece(chat.control_text(id), chat.piece(id));
     if (piece) {
-      text += piece;
-      emit('token', { text: piece });
+      raw += piece;
+      show();
     }
   }
-  const tail = chat.flush();
-  if (tail) {
-    text += tail;
-    emit('token', { text: tail });
-  }
-  return { text, n, reason, ms: performance.now() - t1, promptTokens: tokens.length };
+  raw += chat.flush();
+  show();
+  return { text: raw, display: displayText(raw), n, reason, ms: performance.now() - t1, promptTokens: tokens.length };
 }
 
 const MAX_TOOL_ROUNDS = 3;
@@ -375,6 +449,7 @@ const MAX_TOOL_ROUNDS = 3;
 async function generate({ messages, options, sampler, maxTokens, internet }) {
   if (!chat) throw new Error('Load a model first.');
   stopRequested = false;
+  remote?.resume();
   chat.set_sampler(JSON.stringify(sampler));
   const ctx = chat.context_length();
   const opts = { ...(options || {}) };
@@ -397,23 +472,26 @@ async function generate({ messages, options, sampler, maxTokens, internet }) {
   let ms = 0;
   let reason = 'end';
   const done = new Set();
+  // DeepSeek's template wants each call's arguments as JSON text.
+  const shaped = (m) => (argsAsString ? toolTransport(m, [], true, { argsAsString }).messages : m);
   for (let round = 0; ; round++) {
-    const r = await turn(msgs, opts, maxTokens, ctx);
+    const r = await turn(shaped(msgs), opts, maxTokens, ctx);
     tokens += r.n;
     ms += r.ms;
     reason = r.reason;
     if (!opts.tools || reason === 'stopped') break;
-    const calls = parseToolCalls(r.text);
+    const calls = parseToolCalls(r.text, undefined, schemaTypes(TOOL_SCHEMAS));
     if (!calls.length) break;
     const fresh = calls.filter((c) => !done.has(JSON.stringify(c))).slice(0, 3);
     if (fresh.length && round < MAX_TOOL_ROUNDS) {
-      msgs = [...msgs, { role: 'assistant', content: r.text }];
-      for (const c of fresh) {
+      const ids = fresh.map((c, i) => `functions.${c.name}:${round * 3 + i}`);
+      msgs = [...msgs, assistantWithCalls(r.display, fresh.map((c, i) => ({ ...c, id: ids[i] })))];
+      for (const [i, c] of fresh.entries()) {
         done.add(JSON.stringify(c));
         post('tool', c);
         const res = await runTool(c, tools);
         post('tool-result', { ...c, sources: res.sources });
-        msgs.push({ role: 'tool', content: res.text });
+        msgs.push(toolResult(ids[i], c.name, res.text));
       }
       if (stopRequested) { reason = 'stopped'; break; }
       post('round');
@@ -422,13 +500,13 @@ async function generate({ messages, options, sampler, maxTokens, internet }) {
     // The model repeats itself or used its rounds: answer from what was found, without tools.
     delete opts.tools;
     post('round');
-    const final = await turn(msgs, opts, maxTokens, ctx);
+    const final = await turn(shaped(msgs), opts, maxTokens, ctx);
     tokens += final.n;
     ms += final.ms;
     reason = final.reason;
     break;
   }
-  post('done', { reason, tokens, ms, used: chat.context_used(), context: ctx, stream: JSON.parse(chat.stats()) });
+  post('done', { reason, tokens, ms, used: chat.context_used(), context: ctx, stream: JSON.parse(chat.stats()), net: remote?.takeStats() ?? null });
 }
 
 // ---- Messages from the page ----
@@ -443,13 +521,15 @@ const handlers = {
   async adapter({ gpu }) {
     post('adapter', { adapter: await describeAdapter(gpu) });
   },
-  async load({ source, ctx, gpu, gpuMemory }) {
+  async load({ source, ctx, gpu, gpuMemory, cacheGb }) {
     cancelLoad = false;
     unload();
     await ensureWasm();
     let files;
     if (source.kind === 'file') {
       files = { files: source.files || [source.file] };
+    } else if (source.stream) {
+      files = { remote: await openRemote(source, Number(cacheGb) || 0) };
     } else {
       files = { names: await download(source) };
       post('cache', await listCached().catch(() => ({ models: [], supported: false })));
@@ -467,13 +547,16 @@ const handlers = {
     stopRequested = false;
     chat.set_sampler(JSON.stringify(msg.sampler));
     const schemas = msg.tools || [];
-    const { messages, options } = toolTransport(msg.messages, schemas, toolTemplate);
+    remote?.resume();
+    const { messages, options } = toolTransport(msg.messages, schemas, toolTemplate, { argsAsString });
     const result = await turn(messages, options, msg.maxTokens || 512, chat.context_length(), (type,data) => post('agent_event',{requestId:msg.requestId,event:{type,...data}}), true);
     post('agent_done',{requestId:msg.requestId,...result});
   },
   stop() {
     stopRequested = true;
     webAbort.abort();
+    // A model read from the network can spend minutes in one token: end its reads now.
+    remote?.cancel();
   },
   cancel() {
     cancelLoad = true;
@@ -491,6 +574,7 @@ const handlers = {
   },
   async removeCache({ key }) {
     await removeCached(key);
+    await removeStreamCache(key).catch(() => {});
     post('cache', await listCached());
   },
 };

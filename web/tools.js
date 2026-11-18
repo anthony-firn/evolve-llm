@@ -28,17 +28,108 @@ function parseJson(text) {
 }
 
 /**
- * Tool calls in a model's reply: Qwen/Hermes `<tool_call>{json}</tool_call>` blocks, or a reply
- * that is one JSON call object (bare, fenced, or after `<|python_tag|>`).
+ * Control tokens that carry reply markup (thinking and response channels, tool calls). Decoding
+ * hides control tokens; the worker keeps these in the raw reply so calls can be read from it.
+ * Kimi K2's GGUF names its tool markers as reserved tokens, so those are mapped to their names.
  */
-export function parseToolCalls(text, allowed = NAMES) {
+export const MARKUP = new Set([
+  '<|open|>', '<|sep|>', '<|close|>', '<|end_of_msg|>',
+  '<｜tool▁calls▁begin｜>', '<｜tool▁call▁begin｜>', '<｜tool▁sep｜>', '<｜tool▁call▁end｜>', '<｜tool▁calls▁end｜>',
+  '<|tool_calls_section_begin|>', '<|tool_calls_section_end|>', '<|tool_call_begin|>', '<|tool_call_argument_begin|>', '<|tool_call_end|>',
+  '<|python_tag|>', '[TOOL_CALLS]',
+]);
+const RESERVED = {
+  '<|reserved_token_163595|>': '<|tool_calls_section_begin|>',
+  '<|reserved_token_163596|>': '<|tool_calls_section_end|>',
+  '<|reserved_token_163597|>': '<|tool_call_begin|>',
+  '<|reserved_token_163598|>': '<|tool_call_argument_begin|>',
+  '<|reserved_token_163599|>': '<|tool_call_end|>',
+};
+
+/** The raw-reply text of one generated token: its markup if it is a markup control token. */
+export function rawPiece(controlText, piece) {
+  const t = RESERVED[controlText] || controlText;
+  return t && MARKUP.has(t) ? t : piece;
+}
+
+const unescapeAttr = (s) => s.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+
+/** A parameter value as its schema type wants it (integers, booleans, objects…). */
+function coerce(value, type) {
+  const v = String(value);
+  if (type === 'integer' || type === 'number') return Number.isFinite(Number(v.trim())) ? Number(v.trim()) : v;
+  if (type === 'boolean') return v.trim() === 'true' ? true : v.trim() === 'false' ? false : v;
+  if (type === 'object' || type === 'array' || type === 'null') return parseJson(v) ?? v;
+  return v;
+}
+
+// Each family's call syntax, as (name, arguments object or JSON text) pairs.
+function familyCalls(text, types) {
+  // Kimi K3: <|open|>call tool="name" index="1"<|sep|> typed arguments or a JSON block <|close|>call<|sep|>
+  const k3 = [...text.matchAll(/<\|open\|>call tool="([^"]*)"[^<]*<\|sep\|>([\s\S]*?)<\|close\|>call<\|sep\|>/g)];
+  if (k3.length) return k3.map((m) => {
+    const json = /<\|open\|>json[^<]*<\|sep\|>([\s\S]*?)<\|close\|>json<\|sep\|>/.exec(m[2]);
+    if (json) return { name: unescapeAttr(m[1]), arguments: json[1] };
+    const args = {};
+    for (const a of m[2].matchAll(/<\|open\|>argument key="([^"]*)" type="([^"]*)"<\|sep\|>([\s\S]*?)<\|close\|>argument<\|sep\|>/g)) {
+      args[unescapeAttr(a[1])] = coerce(a[3], a[2]);
+    }
+    return { name: unescapeAttr(m[1]), arguments: args };
+  });
+  // DeepSeek V3.1: <｜tool▁call▁begin｜>name<｜tool▁sep｜>{json}<｜tool▁call▁end｜>; V3 puts
+  // `function` first and the name and a fenced block after the separator.
+  const ds = [...text.matchAll(/<｜tool▁call▁begin｜>([\s\S]*?)<｜tool▁sep｜>([\s\S]*?)<｜tool▁call▁end｜>/g)];
+  if (ds.length) return ds.map((m) => {
+    if (m[1].trim() === 'function') {
+      const v3 = /^\s*([^\n]+)\n```(?:json)?\n([\s\S]*?)\n```/.exec(m[2]);
+      return v3 ? { name: v3[1].trim(), arguments: v3[2] } : { name: '', arguments: null };
+    }
+    return { name: m[1].trim(), arguments: m[2] };
+  });
+  // Kimi K2: <|tool_call_begin|>functions.name:0<|tool_call_argument_begin|>{json}<|tool_call_end|>
+  const k2 = [...text.matchAll(/<\|tool_call_begin\|>\s*([^<]*?)\s*<\|tool_call_argument_begin\|>([\s\S]*?)<\|tool_call_end\|>/g)];
+  if (k2.length) return k2.map((m) => ({ name: m[1].replace(/^functions\./, '').replace(/:\d+$/, ''), arguments: m[2] }));
+  // Qwen3 Coder: <function=name><parameter=key>\nvalue\n</parameter></function>
+  const qc = [...text.matchAll(/<function=([^>\n]+)>([\s\S]*?)<\/function>/g)];
+  if (qc.length) return qc.map((m) => {
+    const name = m[1].trim();
+    const args = {};
+    for (const a of m[2].matchAll(/<parameter=([^>\n]+)>\n?([\s\S]*?)\n?<\/parameter>/g)) {
+      const key = a[1].trim();
+      args[key] = coerce(a[2], types?.[name]?.[key]);
+    }
+    return { name, arguments: args };
+  });
+  // Mistral: [TOOL_CALLS] [{"name": …, "arguments": {…}}]
+  const ms = /\[TOOL_CALLS\]\s*(\[[\s\S]*\])/.exec(text);
+  if (ms) {
+    const list = parseJson(ms[1]);
+    if (Array.isArray(list)) return list.map((c) => ({ name: c?.name, arguments: c?.arguments ?? c?.parameters ?? {} }));
+  }
+  return null;
+}
+
+/**
+ * Tool calls in a model's raw reply, in whichever syntax its template taught it: Kimi K3 and
+ * K2, DeepSeek V3 and V3.1, Qwen3 Coder, Mistral, Qwen/Hermes `<tool_call>{json}</tool_call>`
+ * blocks, or a reply that is one JSON call object (bare, fenced, or after `<|python_tag|>`, as
+ * Llama 3 writes it). `types` maps tool name -> parameter -> JSON-schema type, for syntaxes
+ * whose values are untyped text. A reply whose calls are all invalid yields none.
+ */
+export function parseToolCalls(text, allowed = NAMES, types = null) {
+  text = String(text);
+  const native = familyCalls(text, types);
+  if (native) {
+    const parsed = native.map((c) => call({ name: c.name, arguments: c.arguments }, allowed));
+    return parsed.every(Boolean) ? parsed : [];
+  }
   const calls = [];
-  for (const m of String(text).matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g)) {
+  for (const m of text.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g)) {
     const c = call(parseJson(m[1]), allowed);
     if (c) calls.push(c);
   }
   if (calls.length) return calls;
-  const bare = String(text).replace(/^\s*<\|python_tag\|>/, '').trim();
+  const bare = text.replace(/^\s*<\|python_tag\|>/, '').trim();
   // A reply consisting entirely of complete JSON blocks is another call
   // envelope. Prose, truncated blocks, and invalid calls reject the whole reply.
   const fencePattern = /```(?:json)?\s*\n([\s\S]*?)\n```/g;
@@ -54,12 +145,47 @@ export function parseToolCalls(text, allowed = NAMES) {
   return calls;
 }
 
+/** True when a raw reply tried to call a tool in any known syntax (valid or not). */
+export function attemptedToolCall(text) {
+  return /<tool_call>|"name"\s*:|<\|open\|>tools<\|sep\|>|<｜tool▁call|<\|tool_call_begin\|>|<function=|\[TOOL_CALLS\]/.test(String(text));
+}
+
+/**
+ * The raw reply as the person should see it: tool-call markup removed (an unfinished call too),
+ * Kimi K3's thinking channel as <think>…</think> and its other channel tags removed, and a
+ * markup tag still being written held back, so the text only grows while a reply streams.
+ */
+export function displayText(raw) {
+  let t = String(raw)
+    .replace(/<\|open\|>tools<\|sep\|>[\s\S]*?(<\|close\|>tools<\|sep\|>|$)/g, '')
+    .replace(/<\|open\|>think<\|sep\|>/g, '<think>')
+    .replace(/<\|close\|>think<\|sep\|>/g, '</think>')
+    .replace(/<\|(?:open|close)\|>[^<]*?<\|sep\|>/g, '')
+    .replace(/<\|end_of_msg\|>/g, '')
+    .replace(/<｜tool▁calls▁begin｜>[\s\S]*?(<｜tool▁calls▁end｜>|$)/g, '')
+    .replace(/<\|tool_calls_section_begin\|>[\s\S]*?(<\|tool_calls_section_end\|>|$)/g, '')
+    .replace(/\[TOOL_CALLS\][\s\S]*$/, '')
+    .replace(/<tool_call>[\s\S]*?(<\/tool_call>|$)/g, '')
+    .replace(/<\|python_tag\|>/g, '');
+  return t.replace(/<\|(?:open|close)\|>[^<]*$/, '');
+}
+
 /** The reply without tool-call markup, for display (an unfinished call is hidden too). */
 export function stripToolCalls(text) {
-  let t = String(text).replace(/<tool_call>[\s\S]*?(<\/tool_call>|$)/g, '');
-  const bare = t.replace(/^\s*<\|python_tag\|>/, '').trim();
+  let t = displayText(text);
+  const bare = t.trim();
   if (bare.startsWith('{') && /"(name|function)"\s*:/.test(bare) && /"(web_search|open_url)"/.test(bare)) t = '';
   return t;
+}
+
+/** Parameter types of tool schemas (OpenAI style), for `parseToolCalls`. */
+export function schemaTypes(schemas) {
+  const out = {};
+  for (const s of schemas || []) {
+    const f = s.function || s;
+    out[f.name] = Object.fromEntries(Object.entries(f.parameters?.properties || {}).map(([k, v]) => [k, v.type]));
+  }
+  return out;
 }
 
 const strip = (html) => String(html || '').replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&#039;/g, "'").replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');

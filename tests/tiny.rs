@@ -134,3 +134,18 @@ fn deepseek_v3_matches_transformers() {
 fn deepseek_v2_lite_matches_transformers() {
     check("deepseek2lite");
 }
+
+/// Kimi K3.1 (linear attention, latent attention without rotation, block residuals, latent
+/// experts, situ) against tools/ref_kimi_k31.py, a NumPy implementation of llama.cpp's graph,
+/// on the tiny random model akopytko/tiny-kimi-k3.1-pro-GGUF.
+#[test]
+fn kimi_k31_matches_reference() {
+    run("kimik31", "", 5e-3);
+}
+
+/// The same with the indexer's top_k patched to 8 (tools/ref_kimi_k31.py --top-k 8), so the
+/// 20-token prompt goes through DSA's selection of cached positions.
+#[test]
+fn kimi_k31_sparse_attention_matches_reference() {
+    run("kimik31-topk8", "", 5e-3);
+}

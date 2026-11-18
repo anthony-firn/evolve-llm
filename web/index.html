@@ -31,11 +31,11 @@
     <aside class="sidebar" id="sidebar" aria-labelledby="models-title">
       <div class="side-head">
         <h2 id="models-title">Models</h2>
-        <p>Each model downloads once from Hugging Face, then runs from this browser.</p>
+        <p>Each model downloads once from Hugging Face, then runs from this browser. The largest run from Hugging Face directly, without a download.</p>
       </div>
       <ul class="model-list" id="model-list"></ul>
       <h3 class="list-title" id="large-title">Large models</h3>
-      <p class="list-note">Mixture-of-experts models. OLMoE 1B-7B has been run in the browser; the largest entries have architecture tests but have not run end to end. Their speed is unmeasured.</p>
+      <p class="list-note">Mixture-of-experts models. OLMoE 1B-7B has been run in the browser. The entries marked “Runs from Hugging Face” are larger than most devices can store: they are read over the network as they run, a token at a time, and can take minutes to hours per token. They have architecture tests but have not produced a reply end to end.</p>
       <ul class="model-list" id="large-list" aria-labelledby="large-title"></ul>
       <details class="other" id="other-sources">
         <summary>Other models</summary>
@@ -45,7 +45,8 @@
             <input id="hf-input" name="ref" autocomplete="off" spellcheck="false" placeholder="owner/repo or owner/repo/model.gguf" aria-describedby="hf-help">
             <button type="submit">Get</button>
           </div>
-          <p class="hint" id="hf-help">Llama, Mistral, Qwen2, Qwen3, Qwen3-MoE, Mixtral, OLMoE, DeepSeek V2 and V3, and Kimi K2 layouts. Weights from 1-bit IQ1 to F16, split files included.</p>
+          <label class="check"><input type="checkbox" id="hf-stream"> Run it from Hugging Face without downloading it first (for models larger than this device can store; slow)</label>
+          <p class="hint" id="hf-help">Llama, Mistral, Qwen2, Qwen3, Qwen3-MoE, Mixtral, OLMoE, DeepSeek V2 and V3, Kimi K2 and Kimi K3.1 layouts. Weights from 1-bit IQ1 to F16, split files included.</p>
           <ul class="hf-results" id="hf-results" hidden></ul>
         </form>
         <label class="file-pick">
@@ -167,6 +168,19 @@
           <option value="all">All of the model</option>
         </select>
         <small>Weights beyond this stay in browser storage and are read while the model runs: slower, but larger models fit. If the GPU runs out of memory, less is kept on it. Used when a model loads.</small>
+      </label>
+      <label class="block">Device storage for models read from Hugging Face
+        <select name="cacheGb">
+          <option value="0">None</option>
+          <option value="5">5 GB</option>
+          <option value="10">10 GB</option>
+          <option value="25">25 GB</option>
+          <option value="50">50 GB</option>
+          <option value="100">100 GB</option>
+          <option value="250">250 GB</option>
+          <option value="600">600 GB</option>
+        </select>
+        <small>The largest models are read from Hugging Face while they run. What fits here is kept for the next token and the next visit; the weights every token reads are kept first.</small>
       </label>
       <label class="check"><input type="checkbox" name="thinking"> Let reasoning models think before answering</label>
       <fieldset class="block web">

@@ -169,18 +169,46 @@ pub fn state_bytes(headers: js_sys::Array, ctx: u32) -> Result<f64, JsValue> {
 }
 
 /// Reads weights through a synchronous JavaScript function `(file, offset, target)` that fills
-/// `target` (a view of WebAssembly memory) from an OPFS access handle or a `File`.
-struct JsSource(js_sys::Function);
+/// `target` (a view of WebAssembly memory) from an OPFS access handle, a `File`, or bytes a
+/// network reader fetched beforehand. The optional `prefetch(spans)` receives the spans the
+/// next reads will ask for, as a Float64Array of (file, offset, length, every_token) quads, and
+/// returns a Promise that settles when they can be read.
+struct JsSource {
+    read: js_sys::Function,
+    prefetch: Option<js_sys::Function>,
+}
+
+fn js_error(e: JsValue) -> String {
+    e.as_string()
+        .or_else(|| js_sys::Reflect::get(&e, &"message".into()).ok().and_then(|m| m.as_string()))
+        .unwrap_or_else(|| format!("{e:?}"))
+}
 
 impl WeightSource for JsSource {
     fn read(&self, file: usize, offset: u64, len: usize) -> Result<Vec<u8>, String> {
         let mut buf = vec![0u8; len];
         // The view stays valid because the callback does not call back into WebAssembly.
         let view = unsafe { js_sys::Uint8Array::view_mut_raw(buf.as_mut_ptr(), len) };
-        self.0
+        self.read
             .call3(&JsValue::NULL, &JsValue::from(file as f64), &JsValue::from(offset as f64), &view)
-            .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))?;
+            .map_err(js_error)?;
         Ok(buf)
+    }
+
+    fn prefetch<'a>(&'a self, spans: &'a [crate::source::Span]) -> crate::source::Ready<'a> {
+        Box::pin(async move {
+            let Some(f) = &self.prefetch else { return Ok(()) };
+            let quads: Vec<f64> = spans
+                .iter()
+                .flat_map(|s| [s.file as f64, s.offset as f64, s.len as f64, s.every_token as u8 as f64])
+                .collect();
+            let arr = js_sys::Float64Array::from(&quads[..]);
+            let promise = f.call1(&JsValue::NULL, &arr).map_err(js_error)?;
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(promise))
+                .await
+                .map_err(js_error)?;
+            Ok(())
+        })
     }
 }
 
@@ -257,9 +285,10 @@ impl Loader {
         json(&self.engine.as_ref().unwrap().placement)
     }
 
-    /// The reader for weights that are not resident.
-    pub fn set_source(&self, read: js_sys::Function) {
-        self.engine.as_ref().unwrap().set_source(Box::new(JsSource(read)));
+    /// The reader for weights that are not resident, and optionally a prefetch function for
+    /// readers that are slow to start a read (the network).
+    pub fn set_source(&self, read: js_sys::Function, prefetch: Option<js_sys::Function>) {
+        self.engine.as_ref().unwrap().set_source(Box::new(JsSource { read, prefetch }));
     }
 
     pub fn upload(&mut self, name: &str, row0: u32, bytes: &[u8]) -> Result<(), JsValue> {
@@ -380,6 +409,12 @@ impl Chat {
 
     pub fn flush(&self) -> String {
         self.decoder.borrow_mut().flush()
+    }
+
+    /// The text of a control token that `piece` hides (empty for every other token), so the
+    /// page can read markup such as tool calls that models write with control tokens.
+    pub fn control_text(&self, id: u32) -> String {
+        self.inner.borrow().tok.control_text(id).unwrap_or("").to_string()
     }
 
     pub fn is_end(&self, id: u32) -> bool {

@@ -108,6 +108,63 @@ system's file cache keeps recently read weights in RAM, which is the middle tier
 and the disk; the engine does not keep its own RAM copy. Streaming results are bit-identical to
 resident runs in the tests.
 
+## Models larger than the device
+
+The largest open models are bigger than most laptops' free storage (Kimi K3.1 Pro: 593 GB at
+IQ1_S). Those read their weights from Hugging Face while they run, with the device's storage as
+a cache in front of the network:
+
+1. **Addresses.** Each part's `resolve` URL is requested once with `Range: bytes=0-0`; the
+   response gives the part's size and the signed CDN address it redirects to, which is reused
+   until shortly before its `Expires=` time. Hugging Face's API therefore sees one request per
+   file and hour, not one per read. The CDN answers byte ranges with
+   `access-control-allow-origin: *`, so the page can read them directly under the same content
+   security policy (`https://*.hf.co`).
+2. **Prefetch.** `WeightSource::prefetch` takes the spans the next reads will ask for. The
+   streamed forward pass calls it before each layer's attention and shared weights, and again
+   for each expert-cache pass's missing experts once routing is known, so a long prompt never
+   holds more experts than the GPU cache. A network source splits the spans into requests of
+   up to 16 MB and keeps 6 (browser) or 8 (native) in flight; the reads that follow are served
+   from memory. A read nothing prefetched falls back to one synchronous request, which a worker
+   may make.
+3. **Cache.** Fetched ranges are kept on the device up to a cap: files named
+   `{part}-{offset}-{length}.{t|e}` in the origin-private file system (browser) or in
+   `~/.cache/evolve-llm/stream/` (native), written under a temporary name and moved into place.
+   Ranges every token reads (`t`) are kept first and never evicted by experts (`e`), which share
+   what is left, least recently used first. Plain least-recently-used eviction would get no hits
+   at all from a cache smaller than one token's reads, because every token reads the same
+   weights in the same order.
+
+`web/remote-reader.mjs` is the browser side, `src/remote.rs` the native one.
+
+## Kimi K3.1
+
+Kimi K3.1 Pro (`kimi-k31`, 93 layers) differs from DeepSeek V3 in five ways, each with its own
+kernels:
+
+- **Kimi delta attention** in 69 layers. Queries, keys and values pass through a short causal
+  convolution (width 4, its last three inputs kept between calls) and SiLU; queries and keys are
+  L2-normalised per head. Each head keeps a 128 x 128 state that decays per key channel by
+  `exp(-5 * sigmoid(...))` and moves toward each token's value along its key (the gated delta
+  rule); the query reads it out. One thread owns one value channel and walks the tokens in
+  order, so there is no cross-thread reduction. The output is RMS-normalised per head and gated
+  by a sigmoid. The state is 434 MB for the whole model and cannot be rewound, so the session
+  keeps a copy taken at the end of each prompt and returns to it when a new turn changes later
+  text.
+- **Latent attention without rotation** in the other 24 layers, with a sigmoid gate on its
+  output before the projection.
+- **DeepSeek sparse attention.** Past 2048 cached positions, each query attends only to the 2048
+  that a lightning indexer scores highest: per head, `relu(q . k)` against LayerNorm'd keys cached
+  in f16, weighted per head and summed. An exact radix select (four 8-bit passes) finds each
+  token's 2048th-best score, and the attention kernel skips positions below it.
+- **Residuals across blocks.** Every 12 layers the residual stream is banked as a checkpoint and
+  restarted; each sub-layer's input is a softmax-weighted mix of the stream and the checkpoints,
+  scored by an RMS-normalised dot product with a learned vector.
+- **Latent experts.** 896 experts, 16 per token, work in a 3584-wide projection of the 7168-wide
+  hidden state; their weighted sum is normalised and projected back, and two shared experts
+  read the full width. Feed-forward blocks use the situ gate,
+  `4 tanh(g / 4) sigmoid(g) * 25 tanh(u / 25)`, an epilogue of the matrix kernels.
+
 ## Text in, text out
 
 - `src/tokenizer.rs` implements byte-level BPE with each model family's pre-tokenizer

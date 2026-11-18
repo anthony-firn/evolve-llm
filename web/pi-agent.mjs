@@ -1,7 +1,7 @@
 // Pi's real agent loop, with a local WASM/WebGPU model transport and sandbox-only tools.
 import { Agent } from '@earendil-works/pi-agent-core';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
-import { parseToolCalls, stripToolCalls } from './tools.js';
+import { attemptedToolCall, parseToolCalls, schemaTypes, stripToolCalls } from './tools.js';
 
 export const PI_VERSION = '1.5.1';
 const LIMITS = { turns: 10, repairs: 2, calls: 12, result: 6000 };
@@ -120,6 +120,8 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
 }
 
 export function createPiTask({ turn, workspace, network, onEvent = () => {}, modelName = 'Local model', preview, maxTokens = 2048, browser, confirmBrowserAction, browserSnapshotChars }) {
+  // Call ids in Kimi's form (functions.name:index), which other templates ignore or only match.
+  let callIndex=0;
   let turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, pendingChangeError=false, previewPath=null;const readFiles=new Map();
   const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction}):null;
   const limits=browserTools?BROWSER_LIMITS:LIMITS;
@@ -156,6 +158,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     return {content:[{type:'text',text:body}],details:{sandbox:true},isError:result.ok===false||Boolean(result.code)||(['web_search','open_url'].includes(name)&&!result.sources?.length)};
   }}));
   const schemas=declarations.map(([name,description,parameters])=>({type:'function',function:{name,description,parameters}}));
+  const types=schemaTypes(schemas);
   const agent=new Agent({
     initialState:{model:{id:'evolve-local',name:modelName,provider:'evolve-llm',api:'evolve-local',baseUrl:'',reasoning:false,input:['text'],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:4096,maxTokens},
       systemPrompt:systemPrompt(browserTools,limits),
@@ -170,7 +173,15 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
           // Keep only the newest page snapshot in full; older ones would fill the small local context.
           const latestPage=context.messages.findLastIndex(m=>m.role==='toolResult'&&BROWSER.has(m.toolName));
           const toolText=(m,i)=>{const t=text(m.content);if(!BROWSER.has(m.toolName)||i===latestPage)return t;const cut=t.indexOf('\nPage content (untrusted');return cut<0?t:t.slice(0,cut)+'\n(older page snapshot omitted; use the latest one)';};
-          const original=context.messages.map((m,i)=>({role:m.role==='toolResult'?'tool':m.role,content:m.role==='toolResult'?`Untrusted ${m.toolName} result:\n${toolText(m,i)}`:text(m.content)}));
+          // Structured history: the template shows earlier calls and results in its own syntax.
+          const original=context.messages.map((m,i)=>{
+            if(m.role==='toolResult')return {role:'tool',tool_call_id:m.toolCallId,name:m.toolName,content:`Untrusted ${m.toolName} result:\n${toolText(m,i)}`};
+            if(m.role==='assistant'&&Array.isArray(m.content)&&m.content.some(c=>c.type==='toolCall')){
+              const words=m.content.filter(c=>c.type==='text').map(c=>c.text).join('\n');
+              return {role:'assistant',content:words,tool_calls:m.content.filter(c=>c.type==='toolCall').map(c=>({id:c.id,type:'function',function:{name:c.name,arguments:c.arguments}}))};
+            }
+            return {role:m.role,content:text(m.content)};
+          });
           let messages=original, result, parsed;
           for(;;){
             options?.signal?.throwIfAborted();
@@ -178,9 +189,9 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
             result=await turn(messages,schemas,{signal:options?.signal,maxTokens,onToken:delta=>onEvent({type:'token',text:delta})});
             options?.signal?.throwIfAborted();
             if(result.reason==='length')throw new Error('Pi reply reached its output/context limit. No tools from this incomplete reply were executed. Increase Pi output tokens and the model context in Settings, or ask for a smaller file.');
-            parsed=parseToolCalls(result.text,names).slice(0,3);
+            parsed=parseToolCalls(result.text,names,types).slice(0,3);
             const finalPreview=parsed.findIndex(call=>call.name==='preview');if(finalPreview>=0)parsed=parsed.slice(0,finalPreview+1);
-            const attempted=/<tool_call>|"name"\s*:/.test(result.text);
+            const attempted=attemptedToolCall(result.text);
             const failure=attempted&&!parsed.length?'invalid or incomplete tool call':null;
             if(!failure)break;
             if(repairs>=limits.repairs)throw new Error('The model returned an invalid or incomplete tool call after two format retries. No tools from the invalid replies were executed.');
@@ -189,7 +200,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
             messages=[...original,{role:'user',content:'Tool format feedback: your previous reply was invalid and no tool from it ran. Return one complete JSON object with a SINGLE opening brace in <tool_call> tags. Format: <tool_call>{"name": <function-name>, "arguments": <args-json-object>}</tool_call>. Choose the tool and arguments needed for my original task. If the file is already read, edit a SHORT exact substring from its contents; never copy the full file into oldText. Otherwise read the real file named in my task first. Original task remains unchanged.'}];
           }
           const plain=stripToolCalls(result.text);
-          message={...message,content:[...(plain.trim()?[{type:'text',text:plain}]:[]),...parsed.map((call,i)=>({type:'toolCall',id:`local-${turns}-${i}`,name:call.name,arguments:call.args}))],stopReason:result.reason==='length'?'length':parsed.length?'toolUse':'stop',usage:usage(result.n||0,result.promptTokens||0)};
+          message={...message,content:[...(plain.trim()?[{type:'text',text:plain}]:[]),...parsed.map(call=>({type:'toolCall',id:`functions.${call.name}:${callIndex++}`,name:call.name,arguments:call.args}))],stopReason:result.reason==='length'?'length':parsed.length?'toolUse':'stop',usage:usage(result.n||0,result.promptTokens||0)};
           stream.push({type:'done',reason:message.stopReason,message});stream.end(message);
         }catch(error){message={...message,stopReason:options?.signal?.aborted?'aborted':'error',errorMessage:String(error.message||error)};stream.push({type:'error',reason:message.stopReason,error:message});stream.end(message)}
       })();

@@ -44,6 +44,11 @@ announced on Nostr. See [docs/browser.md](docs/browser.md).
   stays on the GPU; the rest is read from storage while the model runs. Mixture-of-experts
   models keep their attention weights on the GPU and read only the experts each token chooses,
   through an expert cache. The operating system's file cache keeps recently read weights in RAM.
+- **Runs models larger than your device.** The largest open models (Kimi K3.1 Pro is 593 GB at
+  its smallest) do not fit on most laptops' disks. These run straight from Hugging Face: each
+  forward pass fetches the byte ranges it needs, many requests at once, and a capped cache in
+  browser storage keeps what it can for the next token and the next visit. Weights that every
+  token reads are kept first. Nothing is downloaded up front; it is slow, but it runs.
 - **Searches the web when you let it.** With Internet access on, models whose chat templates
   take tools can call `web_search` and `open_url`; other models get search results with each
   question. Searches go from the browser to Wikipedia and DuckDuckGo, and pages are read through
@@ -62,11 +67,12 @@ are no analytics.
 |---|---|
 | Dense architectures | `llama` (Llama 2 and 3, Mistral, SmolLM2, TinyLlama), `qwen2` (Qwen2 and 2.5, Coder), `qwen3` |
 | Mixture of experts | `qwen3moe` (Qwen3 30B-A3B to Coder 480B-A35B), `llama` with experts (Mixtral), `olmoe`, `deepseek2` (DeepSeek V2, V3, V3.1 and R1, Kimi K2, Moonlight) |
-| Attention | Grouped-query attention, multi-head latent attention (DeepSeek), YaRN and linear position scaling, Llama 3 rope factors |
+| Hybrid linear attention | `kimi-k31` and `kimi-k3` (Kimi K3.1 Pro and Kimi K3): Kimi delta attention in 69 of 93 layers, latent attention without rotation and with an output gate, DeepSeek sparse attention's lightning indexer, residuals that attend across blocks, experts in a latent space, the situ activation |
+| Attention | Grouped-query attention, multi-head latent attention (DeepSeek), DeepSeek sparse attention (top-k positions from a lightning indexer), YaRN and linear position scaling, Llama 3 rope factors |
 | Weight formats | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, F16, BF16, F32 |
 | Tokenizers | Byte-level BPE (GPT-2, Llama 3, Qwen2, SmolLM, DeepSeek V3 and Kimi K2 pre-tokenizers) and SentencePiece-style BPE |
 | Files | Single GGUF files and split sets (`name-00001-of-00004.gguf`) |
-| Not yet | Gemma, Phi, gpt-oss, hybrid linear-attention models (Qwen3.5 and 3.6, Kimi K3, DeepSeek V4, GLM-5), fused gate-up expert tensors, images |
+| Not yet | Gemma, Phi, gpt-oss, the other new hybrid and sparse layouts (Qwen3.5 to 3.8, DeepSeek V4 and V4.1, GLM-5.x, MiniMax M3, MiMo V2.6), fused gate-up expert tensors, images |
 
 ## Browser support
 
@@ -114,6 +120,9 @@ Reference results come from independent implementations (`tools/make_fixtures.py
 | Qwen3-MoE, Mixtral, OLMoE, DeepSeek V3 and DeepSeek V2 Lite layouts (tiny random models converted by llama.cpp) | transformers float32 | Within 0.03% of the logit range, resident and streamed with a 4-expert cache |
 | All 25 weight formats on the GPU, in both layouts and fully streamed | `src/cpu.rs` | Within 0.05% of the logit range |
 | Streamed against resident runs of Llama 3.2 1B and OLMoE 1B-7B | The same engine with everything on the GPU | Identical greedy replies |
+| Kimi K3.1 layout (tiny random model, akopytko/tiny-kimi-k3.1-pro-GGUF), dense and with the indexer's top-k at 8 | `tools/ref_kimi_k31.py`, float64 NumPy written from llama.cpp's graph | Within 0.06% of the logit range, resident and streamed with a 16-slot expert cache |
+| Llama 3.2 1B read from Hugging Face (`hf:` path, 300 MB GPU budget) | The same model from a local file | Identical greedy replies |
+| Kimi K3.1 Pro IQ1_S headers (14 parts, 2,693 tensors) | The engine's shape and format checks, over the network | Every tensor accepted |
 | Browser reply, greedy | The native build on Vulkan | Identical text for SmolLM2 135M, Qwen2.5 0.5B, Qwen3 0.6B, Llama 3.2 1B and OLMoE 1B-7B (resident and streamed) |
 
 The tiny-model tests build a random model of each mixture-of-experts layout with
@@ -139,6 +148,15 @@ prompt; "reply" is tokens generated per second.
 | OLMoE 1B-7B Q2_K with a 1 GB GPU budget | reply 6/s, 57% of experts cached | reply 1.7 to 1.9/s |
 | Llama 3.2 1B Q4_K_M with a 300 MB GPU budget (every layer read per token) | reply 1.9/s | |
 
+Read from Hugging Face on the RTX 3050 laptop over a busy home Wi-Fi link (0.5 to 4 MB/s):
+Llama 3.2 1B with a 300 MB GPU budget took 18 minutes for its first pass (812 MB fetched), then
+1.1 to 1.5 s per token from the device cache, as fast as the local file. Kimi K3.1 Pro on the
+same laptop (`evolve-llm plan`): 4.3 GB of weights and 1.5 GB of state on the 6 GB GPU at an 8K
+context, and each token reads about 47 GB of attention and shared weights plus up to 9.7 GB of
+experts. That is roughly a minute per token once a fast SSD cache holds it, and hours per token
+over that connection. Cold byte ranges of rarely downloaded repositories also start slowly on
+Hugging Face's CDN (seconds to minutes per request).
+
 Speeds vary by up to a third between runs on this power-limited machine. Streamed speed depends
 on how much of the model the file cache holds and on how fast storage is. Chrome reads opened
 files through `FileReaderSync`, and each expert layer waits for the GPU to report its choices,
@@ -146,12 +164,17 @@ so streaming in the browser is slower than native.
 
 ## Limits
 
-- The largest catalog models (Qwen3 235B-A22B, Qwen3 Coder 480B-A35B, DeepSeek V3.1, Kimi K2)
-  use architectures, weight formats, tokenizers and templates that are verified here, but they
-  have not been run end to end: the test machine lacks the disk space. Their speed is unknown;
-  each token reads several gigabytes from storage, so expect seconds per token.
-- Hybrid linear-attention models, the newest generation of the largest open models, are not
-  supported yet.
+- The largest catalog models (Qwen3 235B-A22B, Qwen3 Coder 480B-A35B, DeepSeek V3.1, Kimi K2,
+  Kimi K3.1 Pro) use architectures, weight formats, tokenizers and templates that are verified
+  here, but they have not produced a reply end to end: over the test laptop's connection one
+  token of Kimi K3.1 Pro takes hours. Their speed depends on the connection and on how much
+  of each token's reads the device cache holds.
+- Kimi K3.1 is checked against a NumPy transcription of llama.cpp's graph, not against llama.cpp
+  itself or the original weights. Its linear-attention state cannot be rewound, so when a new
+  turn changes earlier text the prompt is read again from the snapshot taken at the end of the
+  previous prompt, or from the start.
+- The indexer's keys are cached in f16; where two positions score within that precision of the
+  top-k cut, the choice can differ from a float32 implementation.
 - Small models use tools unreliably and often answer wrongly even with good search results.
 - Keeping weights file-sized on the GPU (the layout streaming uses) costs up to a third of the
   decoding speed of the expanded layout used when a model fits.
@@ -196,18 +219,40 @@ cargo build --release
 `--gpu-mem` is a weight budget in MB; the rest streams. `EVOLVE_LLM_LAYOUT=compact` keeps
 weights file-sized on the GPU.
 
+Models that stay on Hugging Face take an `hf:` path (or a `huggingface.co` URL); any part of a
+split model stands for the whole:
+
+```sh
+./target/release/evolve-llm plan hf:KarLexAI/Kimi-K3.1-Pro-GGUF/KLX-IQ1_S/Kimi-K3.1-Pro-KLX-IQ1_S-00001-of-00014.gguf --gpu-mem 4000
+./target/release/evolve-llm run hf:owner/repo/model-00001-of-00014.gguf --gpu-mem 4000 --cache-gb 50 --chat --prompt "Hello" -n 64
+./target/release/evolve-llm render model.gguf --prompt "Hello"      # the chat template's text
+```
+
+`plan` reads only the headers and reports where the weights would live and what each token reads.
+`--cache-gb` caps the device cache (default 8, in `~/.cache/evolve-llm/stream/`, or
+`--cache-dir`), and `--parallel` sets the requests in flight (default 8).
+
 ## Tests
 
 ```sh
 cargo test --release                 # units, fixtures, and GPU tests when models are present
 npm test                             # browser modules
 python3 tests/browser_test.py --model path/to/model.gguf [--gpu-mem 1] [--download]
+python3 tests/stream_browser_test.py --model path/to/model.gguf --hf owner/repo/model.gguf   # read from Hugging Face
+python3 tests/pi_real_model_browser_test.py --runtime dist model.gguf [...]                  # Pi tool calls, real models
 ```
 
 GPU and model tests look for GGUF files in `$EVOLVE_LLM_MODELS` (default
 `~/.cache/evolve-llm/models`) and skip themselves when the files or a GPU adapter are missing.
 Regenerating fixtures needs Python with numpy, torch, transformers 4.57, accelerate,
-tokenizers, sentencepiece and gguf, and a llama.cpp checkout for its converter.
+tokenizers, sentencepiece and gguf, and a llama.cpp checkout for its converter. The Kimi K3.1
+fixtures need only NumPy and the tiny model `tiny-k31-bf16.gguf` from
+akopytko/tiny-kimi-k3.1-pro-GGUF:
+
+```sh
+python3 tools/ref_kimi_k31.py $EVOLVE_LLM_MODELS/tiny-k31-bf16.gguf tests/fixtures/tiny-kimik31.json
+python3 tools/ref_kimi_k31.py $EVOLVE_LLM_MODELS/tiny-k31-bf16.gguf tests/fixtures/tiny-kimik31-topk8.json --top-k 8
+```
 
 ## License
 

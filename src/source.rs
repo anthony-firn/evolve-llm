@@ -1,10 +1,43 @@
 //! Where weights are read from while a model runs: weights that do not fit in GPU memory are
 //! read again on demand, so the operating system's file cache acts as a RAM tier in front of
-//! the disk.
+//! the disk, and a model that does not fit on the disk either can be read from the network
+//! (`remote`), with the disk as a cache.
+
+use std::future::Future;
+use std::pin::Pin;
+
+/// A byte range of one model file that the engine is about to read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Span {
+    pub file: usize,
+    pub offset: u64,
+    pub len: usize,
+    /// Read for every token (attention and shared weights), rather than only when a token
+    /// chooses it (an expert). A cache too small for everything should keep these first.
+    pub every_token: bool,
+}
+
+/// Completes when prefetched spans are ready to read.
+pub type Ready<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + 'a>>;
 
 /// Random-access reads from the files of a model (one file, or the parts of a split model).
 pub trait WeightSource {
     fn read(&self, file: usize, offset: u64, len: usize) -> Result<Vec<u8>, String>;
+
+    /// The spans the next reads will ask for, exactly as they will ask. A slow source (the
+    /// network) fetches them together, in parallel, before they are read; files need nothing.
+    fn prefetch<'a>(&'a self, _spans: &'a [Span]) -> Ready<'a> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl<T: WeightSource + ?Sized> WeightSource for std::sync::Arc<T> {
+    fn read(&self, file: usize, offset: u64, len: usize) -> Result<Vec<u8>, String> {
+        (**self).read(file, offset, len)
+    }
+    fn prefetch<'a>(&'a self, spans: &'a [Span]) -> Ready<'a> {
+        (**self).prefetch(spans)
+    }
 }
 
 /// Whole files held in memory (tests and small models).
