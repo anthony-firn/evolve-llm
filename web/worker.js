@@ -4,6 +4,7 @@ import { formatBytes } from './models.js';
 import { assistantWithCalls, nativeToolFormat, toolResult, toolTransport } from './tool-transport.mjs';
 import { openModelReaders, storageError } from './model-readers.mjs';
 import { RangeCache, RemoteModel } from './remote-reader.mjs';
+import { CHUNK as SWARM_CHUNK } from './swarm-protocol.mjs';
 import { TOOL_SCHEMAS, displayText, parseToolCalls, rawPiece, runTool, schemaTypes, webSearch } from './tools.js';
 
 const CHUNK = 16 << 20; // bytes read from the file per upload call
@@ -215,8 +216,25 @@ async function download(entry) {
 
 // ---- Reading models that stay on Hugging Face ----
 
+// The weight swarm runs on the page (WebRTC is not available in workers). With sharing on, the
+// network reader asks the page for chunks before going to Hugging Face, and tells it what it
+// cached, so the page can serve those chunks to other visitors.
+let swarmOn = false;
+let swarmSeq = 0;
+const swarmCalls = new Map();
+function swarmGet(sha, s, e) {
+  if (!swarmOn) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const id = ++swarmSeq;
+    swarmCalls.set(id, resolve);
+    post('swarm-get', { id, sha, s, e });
+    setTimeout(() => { if (swarmCalls.delete(id)) resolve(null); }, 30000);
+  });
+}
+
 // A model larger than this browser can store is read from Hugging Face as it runs. The cache
-// directory keeps up to `cacheGb` of it on this device between runs.
+// directory keeps up to `cacheGb` of it on this device between runs, in whole 256 KiB chunks, so
+// what it holds can be shared.
 async function openRemote(source, cacheGb) {
   const parts = source.parts?.length ? source.parts : [{ file: source.file, url: source.url, bytes: source.bytes }];
   let cache = null;
@@ -225,19 +243,26 @@ async function openRemote(source, cacheGb) {
       try { await navigator.storage.persist?.(); } catch { /* best effort */ }
       const root = await navigator.storage.getDirectory();
       const dir = await (await root.getDirectoryHandle('stream', { create: true })).getDirectoryHandle(source.key, { create: true });
-      cache = await RangeCache.open(dir, cacheGb * 1e9);
+      cache = await RangeCache.open(dir, cacheGb * 1e9, { align: SWARM_CHUNK });
     } catch {
       cache = null; // another tab holds it, or storage is unavailable: run without a cache
     }
   }
-  const r = new RemoteModel(parts.map((p) => p.url), { cache });
+  const shas = parts.map((p) => p.sha256 || null);
+  const r = new RemoteModel(parts.map((p) => p.url), {
+    cache,
+    align: SWARM_CHUNK,
+    shas,
+    peers: swarmGet,
+    onCached: (file, offset, len) => post('swarm-have', { file, offset, len, every: Boolean(cache?.entries.get(`${file}-${offset}-${len}`)?.every) }),
+  });
   let last = 0;
   const t0 = performance.now();
   r.onPiece = () => {
     const now = performance.now();
     if (now - last < 500) return;
     last = now;
-    post('stream-progress', { fetched: r.stats.fetched, cacheHit: r.stats.cacheHit, rate: r.stats.fetched / Math.max(0.001, (now - t0) / 1000) });
+    post('stream-progress', { fetched: r.stats.fetched, cacheHit: r.stats.cacheHit, fromPeers: r.stats.fromPeers, rate: (r.stats.fetched + r.stats.fromPeers) / Math.max(0.001, (now - t0) / 1000) });
   };
   post('progress', { phase: 'connect', loaded: 0, total: 1 });
   await r.open();
@@ -544,6 +569,13 @@ const handlers = {
     await generate(msg);
   },
   network_policy({ enabled }) { webAbort.abort(); },
+  swarm({ on }) { swarmOn = Boolean(on); },
+  'swarm-data'({ id, bytes }) {
+    const resolve = swarmCalls.get(id);
+    if (!resolve) return;
+    swarmCalls.delete(id);
+    resolve(bytes ? new Uint8Array(bytes) : null);
+  },
   async agent_turn(msg) {
     if (!chat) throw new Error('Load a model before running Pi.');
     stopRequested = false;

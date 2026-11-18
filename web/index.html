@@ -182,6 +182,16 @@
         </select>
         <small>The largest models are read from Hugging Face while they run. What fits here is kept for the next token and the next visit; the weights every token reads are kept first.</small>
       </label>
+      <label class="check"><input type="checkbox" name="share"> Share model pieces with other visitors (peer-to-peer)</label>
+      <label class="block">Upload limit for sharing
+        <select name="shareUpload">
+          <option value="0.5">0.5 MB/s</option>
+          <option value="2">2 MB/s</option>
+          <option value="10">10 MB/s</option>
+          <option value="0">No limit</option>
+        </select>
+        <small>For models read from Hugging Face: pieces come from other visitors who have them, and pieces stored here go to visitors who need them, browser to browser. Every piece is checked against published hashes before use. Peers see your IP address and which model files you read; your conversations never leave this device. Off unless you turn it on.</small>
+      </label>
       <label class="check"><input type="checkbox" name="thinking"> Let reasoning models think before answering</label>
       <fieldset class="block web">
         <legend>Internet access</legend>

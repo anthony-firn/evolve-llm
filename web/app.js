@@ -7,7 +7,7 @@ const $ = (id) => document.getElementById(id);
 const app = $('app');
 let worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 
-const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', cacheGb: 10, internet: false, jinaKey: '' };
+const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', cacheGb: 10, share: false, shareUpload: 2, internet: false, jinaKey: '' };
 const SUGGESTIONS = [
   'Make me a Snake game I can play.',
   'Write a haiku about running AI on my own laptop.',
@@ -136,7 +136,8 @@ function catalogEntry(m) {
   const split = Boolean(splitParts(m.file));
   // Models marked `stream` are read from Hugging Face as they run instead of downloaded.
   const stream = Boolean(m.stream) && !cachedEntry(key)?.complete;
-  return { kind: 'hf', id: m.id, key, repo: m.repo, file: m.file, revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, name: m.name, resolve: split, stream };
+  // Streamed models always list their parts: each part's SHA-256 names its swarm.
+  return { kind: 'hf', id: m.id, key, repo: m.repo, file: m.file, revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, name: m.name, resolve: split || stream, stream };
 }
 
 const ALL = [...MODELS, ...LARGE];
@@ -249,13 +250,60 @@ async function startLoad(source) {
     // Split models and pasted files: ask Hugging Face for every part and its size first.
     try {
       const r = await resolveParts(source.repo, source.file, source.revision);
-      source = { ...source, bytes: r.bytes, parts: r.parts.length > 1 ? r.parts : null, url: r.parts[0].url };
+      source = { ...source, bytes: r.bytes, parts: r.parts.length > 1 || source.stream ? r.parts : null, url: r.parts[0].url };
     } catch (e) {
       onError({ during: 'load', message: e.message });
       return;
     }
   }
+  stopSharing();
+  if (source.stream && state.settings.share && source.parts?.length) startSharing(source);
   worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx), gpu: state.settings.gpu, gpuMemory: state.settings.gpuMemory, cacheGb: Number(state.settings.cacheGb) });
+}
+
+// ---- Sharing model pieces with other visitors (opt-in) ----
+
+let swarmSession = null;
+let swarmToken = 0;
+async function startSharing(source) {
+  const token = ++swarmToken;
+  try {
+    const { startSwarm } = await import('./swarm-client.mjs');
+    // Advanced: other Nostr relays, manifests or ICE servers (self-hosting, tests), as JSON in
+    // localStorage['evolve-llm-swarm'] = {"relays": [...], "manifests": "https://...", "iceServers": [...]}.
+    let custom = {};
+    try { custom = JSON.parse(localStorage.getItem('evolve-llm-swarm') || '{}') || {}; } catch { /* default */ }
+    const swarmOptions = {};
+    if (custom.manifests) swarmOptions.manifests = new (await import('./swarm-protocol.mjs')).Manifests(custom.manifests);
+    if (Array.isArray(custom.relays)) swarmOptions.signal = new (await import('./swarm-signal.mjs')).Signal({ relays: custom.relays });
+    if (Array.isArray(custom.iceServers)) swarmOptions.iceServers = custom.iceServers;
+    const session = await startSwarm({
+      swarmOptions,
+      parts: source.parts.map((p) => ({ sha256: p.sha256, bytes: p.bytes })),
+      cacheKey: source.key,
+      worker,
+      uploadBytesPerSec: Number(state.settings.shareUpload) * 1e6,
+      onStats: (s) => { state.swarmStats = s; renderSwarm(); },
+    });
+    if (token !== swarmToken) { session?.stop(); return; }
+    swarmSession = session;
+    state.swarmStats = session ? { peers: 0, fromPeers: 0, toPeers: 0 } : null;
+    if (!session) $('status-line').textContent = 'No piece manifest is published for this model yet, so it is read from Hugging Face only.';
+    renderSwarm();
+  } catch (e) {
+    if (token === swarmToken) $('status-line').textContent = `Sharing could not start: ${e.message || e}`;
+  }
+}
+function stopSharing() {
+  swarmToken++;
+  swarmSession?.stop();
+  swarmSession = null;
+  state.swarmStats = null;
+}
+function renderSwarm() {
+  const s = state.swarmStats;
+  if (!s || state.phase === 'generating') return;
+  $('status-line').textContent = `Sharing pieces with ${s.peers} ${s.peers === 1 ? 'visitor' : 'visitors'} · ${formatBytes(s.fromPeers)} received, ${formatBytes(s.toPeers)} sent`;
 }
 
 function setStep(step, skipDownload = false) {
@@ -298,8 +346,8 @@ function onProgress({ phase, loaded, total, rate, part, parts }) {
 }
 
 // A model read from Hugging Face can take minutes per token: show that it is working.
-function onStreamProgress({ fetched, cacheHit, rate }) {
-  const text = `Reading weights: ${formatBytes(fetched)} from Hugging Face at ${formatBytes(rate)}/s${cacheHit ? `, ${formatBytes(cacheHit)} from this device` : ''}`;
+function onStreamProgress({ fetched, cacheHit, fromPeers, rate }) {
+  const text = `Reading weights: ${formatBytes(fetched)} from Hugging Face${fromPeers ? `, ${formatBytes(fromPeers)} from other visitors` : ''} at ${formatBytes(rate)}/s${cacheHit ? `, ${formatBytes(cacheHit)} from this device` : ''}`;
   if (state.phase === 'loading') setProgress(0, 1, text);
   else $('status-line').textContent = text;
 }
@@ -553,7 +601,7 @@ function onDone(d) {
   const st = d.stream || {};
   const stream = st.bytes_read ? ` · read ${formatBytes(st.bytes_read)} from storage${st.expert_requests ? `, ${Math.round((100 * st.expert_hits) / st.expert_requests)}% of experts already on the GPU` : ''}` : '';
   const n = d.net;
-  const net = n && (n.fetched || n.cacheHit) ? ` · ${formatBytes(n.fetched)} from Hugging Face${n.cacheHit ? `, ${formatBytes(n.cacheHit)} from this device's cache` : ''}` : '';
+  const net = n && (n.fetched || n.cacheHit || n.fromPeers) ? ` · ${formatBytes(n.fetched)} from Hugging Face${n.fromPeers ? `, ${formatBytes(n.fromPeers)} from other visitors` : ''}${n.cacheHit ? `, ${formatBytes(n.cacheHit)} from this device's cache` : ''}` : '';
   const slow = d.tokens > 0 && d.ms / d.tokens > 10000 ? `${d.tokens} tokens · ${formatDuration(d.ms / 1000 / d.tokens)} per token` : `${d.tokens} tokens · ${rate} tokens/s`;
   m.stats = `${slow}${prompt}${why}${stream}${net}`;
   if (!m.content.trim()) m.content = d.reason === 'stopped' ? '' : '(no reply)';
@@ -748,6 +796,8 @@ function fillSettings() {
   form.elements.gpu.value = s.gpu;
   form.elements.gpuMemory.value = String(s.gpuMemory);
   form.elements.cacheGb.value = String(s.cacheGb ?? 10);
+  form.elements.share.checked = Boolean(s.share);
+  form.elements.shareUpload.value = String(s.shareUpload ?? 2);
   form.elements.thinking.checked = Boolean(s.thinking);
   form.elements.internet.checked = Boolean(s.internet);
   form.elements.jinaKey.value = s.jinaKey || '';
@@ -771,7 +821,7 @@ form.addEventListener('input', (e) => {
   saveSettings();
 });
 form.addEventListener('change', (e) => {
-  if (['ctx', 'gpu', 'gpuMemory', 'cacheGb'].includes(e.target.name) && state.loaded) $('status-line').textContent = 'This setting applies the next time a model loads.';
+  if (['ctx', 'gpu', 'gpuMemory', 'cacheGb', 'share', 'shareUpload'].includes(e.target.name) && state.loaded) $('status-line').textContent = 'This setting applies the next time a model loads.';
 });
 $('open-settings').addEventListener('click', () => { fillSettings(); dialog.showModal(); });
 $('reset-settings').addEventListener('click', () => {
@@ -796,6 +846,7 @@ function finishAgent(error,value) {
   error?request.reject(error):request.resolve(value);
 }
 function restartEngine(reason) {
+  stopSharing();
   worker.terminate();finishAgent(new Error(reason));state.loaded=null;state.loading=null;
   worker=new Worker(new URL('./worker.js',import.meta.url),{type:'module'});worker.onmessage=onWorkerMessage;worker.onerror=onWorkerError;
   setPhase('starting');worker.postMessage({type:'hello',gpu:state.settings.gpu});$('status-line').textContent=reason+' Choose a saved model to reload it.';

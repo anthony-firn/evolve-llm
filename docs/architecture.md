@@ -156,6 +156,30 @@ a cache in front of the network:
 
 `web/remote-reader.mjs` is the browser side, `src/remote.rs` the native one.
 
+### Sharing pieces between visitors
+
+With sharing on, visitors running the same model file form a swarm and pass pieces browser to
+browser (`web/swarm*.mjs`):
+
+- **Pieces and trust.** Files are cut into 256 KiB chunks. The browser reads and caches whole
+  chunks, so what it stores can be served. Every chunk a peer sends is checked against a manifest
+  of chunk hashes (`tools/chunk_manifest.py`), published in
+  [evolve-llm-manifests](https://github.com/anthony-firn/evolve-llm-manifests) by a GitHub Actions
+  workflow that streams each file from Hugging Face once and requires it to hash to the SHA-256
+  Hugging Face lists. The page trusts `index.json` (TLS from GitHub), checks each 128 KB page of
+  hashes against it, and each chunk against its page; a peer that sends a wrong chunk is dropped
+  for the visit. Files are named by their SHA-256, so every copy of a file shares one swarm.
+- **Finding peers.** Each page makes a fresh Nostr key per visit and announces the files it shares
+  as ephemeral events (kind 25075) on public relays; relays forward them without keeping them.
+  The page with the smaller key makes the WebRTC offer; offers and answers are encrypted to their
+  recipient (ECDH, AES-GCM), so relays never see addresses. STUN finds public addresses; there is
+  no TURN relay, so some network pairs cannot connect and simply use Hugging Face.
+- **Moving pieces.** Peers exchange which chunk ranges they hold, then request up to 4 MiB at a
+  time in 64 KiB frames, from the least busy peer that has them. Serving reads the device cache
+  and is capped by the upload limit. WebRTC is not available in workers, so the swarm runs on the
+  page; the engine's worker asks it for each piece and falls back to Hugging Face for what no peer
+  delivers.
+
 ## Kimi K3.1
 
 Kimi K3.1 Pro (`kimi-k31`, 93 layers) differs from DeepSeek V3 in five ways, each with its own

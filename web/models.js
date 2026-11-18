@@ -80,7 +80,8 @@ export async function listRepo(repo, revision = 'main', fetchFn = fetch) {
     const parts = splitParts(f.path);
     const key = parts ? parts[0] : f.path;
     const g = groups.get(key) || { file: key, parts: [], bytes: 0 };
-    g.parts.push({ file: f.path, bytes: f.lfs?.size ?? f.size ?? 0 });
+    // The SHA-256 Hugging Face lists for LFS files names the file's swarm and manifest.
+    g.parts.push({ file: f.path, bytes: f.lfs?.size ?? f.size ?? 0, sha256: f.lfs?.oid ?? null });
     g.bytes += f.lfs?.size ?? f.size ?? 0;
     groups.set(key, g);
   }

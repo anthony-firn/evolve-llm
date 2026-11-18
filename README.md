@@ -52,6 +52,14 @@ announced on Nostr. See [docs/browser.md](docs/browser.md).
   prompt is read layer by layer, so each weight is read once per 1,024 prompt tokens rather than
   once per 128, and each reply step also checks a continuation drafted from earlier text, so text
   the model copies from the conversation (code, paths) comes several tokens per pass.
+- **Shares model pieces between visitors when you let them.** With sharing on (Settings, off by
+  default), a model read from Hugging Face comes from other visitors' browsers when they have the
+  pieces, over WebRTC, found through public Nostr relays; whatever no visitor has comes from
+  Hugging Face. Every 256 KiB piece is checked against hashes published in
+  [evolve-llm-manifests](https://github.com/anthony-firn/evolve-llm-manifests) before use, and a
+  visitor that sends a wrong piece is dropped. Pieces your device stores go to visitors who need
+  them, within an upload limit. Peers see your IP address and which model files you read; your
+  conversations never leave the device.
 - **Searches the web when you let it.** With Internet access on, models whose chat templates
   take tools can call `web_search` and `open_url`; other models get search results with each
   question. Searches go from the browser to Wikipedia and DuckDuckGo, and pages are read through
@@ -126,6 +134,7 @@ Reference results come from independent implementations (`tools/make_fixtures.py
 | Kimi K3.1 layout (tiny random model, akopytko/tiny-kimi-k3.1-pro-GGUF), dense and with the indexer's top-k at 8 | `tools/ref_kimi_k31.py`, float64 NumPy written from llama.cpp's graph | Within 0.06% of the logit range, resident and streamed with a 16-slot expert cache |
 | Llama 3.2 1B read from Hugging Face (`hf:` path, 300 MB GPU budget) | The same model from a local file | Identical greedy replies |
 | Kimi K3.1 Pro IQ1_S headers (14 parts, 2,693 tensors) | The engine's shape and format checks, over the network | Every tensor accepted |
+| Two visitors sharing pieces (`tests/swarm_browser_test.py`), SmolLM2 135M read from Hugging Face | The first visitor's reply | Identical; the second received 210 MB from the first over WebRTC and 8 MB from Hugging Face, loading and replying in 12 s instead of 142 s |
 | Browser reply, greedy | The native build on Vulkan | Identical text for SmolLM2 135M, Qwen2.5 0.5B, Qwen3 0.6B, Llama 3.2 1B and OLMoE 1B-7B (resident and streamed) |
 
 The tiny-model tests build a random model of each mixture-of-experts layout with
@@ -246,6 +255,7 @@ npm test                             # browser modules
 python3 tests/browser_test.py --model path/to/model.gguf [--gpu-mem 1] [--download]
 python3 tests/stream_browser_test.py --model path/to/model.gguf --hf owner/repo/model.gguf   # read from Hugging Face
 python3 tests/pi_real_model_browser_test.py --runtime dist model.gguf [...]                  # Pi tool calls, real models
+python3 tests/swarm_browser_test.py                                                         # two visitors sharing pieces
 ```
 
 GPU and model tests look for GGUF files in `$EVOLVE_LLM_MODELS` (default
