@@ -48,7 +48,10 @@ announced on Nostr. See [docs/browser.md](docs/browser.md).
   its smallest) do not fit on most laptops' disks. These run straight from Hugging Face: each
   forward pass fetches the byte ranges it needs, many requests at once, and a capped cache in
   browser storage keeps what it can for the next token and the next visit. Weights that every
-  token reads are kept first. Nothing is downloaded up front; it is slow, but it runs.
+  token reads are kept first. Nothing is downloaded up front; it is slow, but it runs. A long
+  prompt is read layer by layer, so each weight is read once per 1,024 prompt tokens rather than
+  once per 128, and each reply step also checks a continuation drafted from earlier text, so text
+  the model copies from the conversation (code, paths) comes several tokens per pass.
 - **Searches the web when you let it.** With Internet access on, models whose chat templates
   take tools can call `web_search` and `open_url`; other models get search results with each
   question. Searches go from the browser to Wikipedia and DuckDuckGo, and pages are read through
@@ -147,6 +150,9 @@ prompt; "reply" is tokens generated per second.
 | OLMoE 1B-7B Q2_K (7B parameters, 2.6 GB on the GPU) | prompt 67 to 92/s, reply 15/s | reply 16/s |
 | OLMoE 1B-7B Q2_K with a 1 GB GPU budget | reply 6/s, 57% of experts cached | reply 1.7 to 1.9/s |
 | Llama 3.2 1B Q4_K_M with a 300 MB GPU budget (every layer read per token) | reply 1.9/s | |
+
+Llama 3.2 1B with a 300 MB GPU budget repeating a sentence went from 0.6 to 1.4 tokens/s with
+drafts from earlier text (13 passes over the weights for 30 tokens).
 
 Read from Hugging Face on the RTX 3050 laptop over a busy home Wi-Fi link (0.5 to 4 MB/s):
 Llama 3.2 1B with a 300 MB GPU budget took 18 minutes for its first pass (812 MB fetched), then

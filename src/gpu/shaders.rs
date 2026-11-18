@@ -6,7 +6,8 @@ use crate::quant::GpuFormat;
 
 /// Bindings shared by every kernel: per-step values and per-dispatch parameters.
 const COMMON: &str = r#"
-struct Step { n_tokens: u32, pos0: u32, kv_len: u32, last: u32 }
+// chunk0: the chunk's first token within a longer prompt read layer by layer (streaming).
+struct Step { n_tokens: u32, pos0: u32, kv_len: u32, last: u32, chunk0: u32, pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(0) var<uniform> step: Step;
 "#;
 
@@ -1195,7 +1196,7 @@ var<workgroup> score: array<f32, 17>;
 
 fn src(s: u32, t: u32, i: u32) -> f32 {
     if (s == p.n_ckpt) { return x[t * p.len + i]; }
-    return ck[(s * p.tstride + t) * p.len + i];
+    return ck[(s * p.tstride + step.chunk0 + t) * p.len + i];
 }
 
 @compute @workgroup_size(256)
@@ -1227,7 +1228,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             for (var s = 0u; s < n; s++) { acc += exp(score[s] - m) / z * src(s, t, i); }
         }
         o[t * p.len + i] = acc;
-        if (p.bank == 1u) { ck[(p.n_ckpt * p.tstride + t) * p.len + i] = x[t * p.len + i]; }
+        if (p.bank == 1u) { ck[(p.n_ckpt * p.tstride + step.chunk0 + t) * p.len + i] = x[t * p.len + i]; }
     }
 }
 "#;

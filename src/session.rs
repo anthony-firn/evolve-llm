@@ -3,7 +3,47 @@
 
 use crate::chat::{ChatTemplate, Message, Options};
 use crate::gguf::Gguf;
-use crate::gpu::engine::Engine;
+use crate::gpu::engine::{Engine, SPEC_MAX};
+use std::collections::VecDeque;
+
+/// Speculative decoding for models that stream their weights, where a pass costs about the same
+/// for a few tokens as for one: the continuation of the latest earlier occurrence of the last
+/// few tokens is drafted (prompt lookup) and verified in one pass. Drafting pauses when recent
+/// drafts were mostly rejected.
+#[derive(Default)]
+struct Speculation {
+    on: bool,
+    /// (drafted, accepted) of recent verification passes.
+    recent: VecDeque<(usize, usize)>,
+    /// Tokens to decode one at a time before drafting again.
+    pause: usize,
+}
+
+impl Speculation {
+    fn draft_len(&mut self) -> usize {
+        if !self.on {
+            return 0;
+        }
+        if self.pause > 0 {
+            self.pause -= 1;
+            return 0;
+        }
+        let (d, a) = self.recent.iter().fold((0, 0), |(d, a), &(x, y)| (d + x, a + y));
+        if self.recent.len() >= 4 && a * 10 < d * 3 {
+            self.pause = 16;
+            self.recent.clear();
+            return 0;
+        }
+        SPEC_MAX - 2
+    }
+
+    fn record(&mut self, drafted: usize, accepted: usize) {
+        self.recent.push_back((drafted, accepted));
+        if self.recent.len() > 8 {
+            self.recent.pop_front();
+        }
+    }
+}
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 
@@ -17,6 +57,9 @@ pub struct Session {
     logits: Vec<f32>,
     /// Tokens the engine's recurrent-state snapshot has read (recurrent models only).
     snapshot: Option<usize>,
+    /// A token already chosen (a draft's first mismatch) that the next step emits.
+    pending: Option<u32>,
+    spec: Speculation,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -31,7 +74,7 @@ impl Session {
     pub fn new(engine: Engine, g: &Gguf) -> Result<Session, String> {
         let tok = Tokenizer::from_gguf(g)?;
         let template = ChatTemplate::from_gguf(g, &tok);
-        Ok(Session {
+        let mut s = Session {
             engine,
             tok,
             template,
@@ -39,7 +82,15 @@ impl Session {
             cached: Vec::new(),
             logits: Vec::new(),
             snapshot: None,
-        })
+            pending: None,
+            spec: Speculation::default(),
+        };
+        s.spec.on = s.engine.streaming();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(v) = std::env::var("EVOLVE_LLM_SPECULATE") {
+            s.spec.on = v == "1";
+        }
+        Ok(s)
     }
 
     pub fn render(&self, messages: &[Message], opts: &Options) -> Result<String, String> {
@@ -73,6 +124,12 @@ impl Session {
         self.cached.clear();
         self.logits.clear();
         self.snapshot = None;
+        self.pending = None;
+    }
+
+    /// Turn speculative decoding on or off (on by default when the model streams).
+    pub fn set_speculation(&mut self, on: bool) {
+        self.spec.on = on;
     }
 
     /// Bring the cache to exactly `tokens`, computing only the part that differs.
@@ -80,6 +137,7 @@ impl Session {
         if tokens.is_empty() {
             return Err("empty prompt".into());
         }
+        self.pending = None;
         let ctx = self.engine.context_length();
         if tokens.len() >= ctx {
             return Err(format!(
@@ -121,10 +179,13 @@ impl Session {
 
     /// Sample the next token and, unless it ends the turn, advance the model past it.
     pub async fn next(&mut self) -> Result<u32, String> {
-        if self.logits.is_empty() {
+        if self.logits.is_empty() && self.pending.is_none() {
             return Err("prefill a prompt first".into());
         }
-        let id = self.sampler.sample(&self.logits, &self.cached);
+        let id = match self.pending.take() {
+            Some(p) => p,
+            None => self.sampler.sample(&self.logits, &self.cached),
+        };
         if self.tok.is_end_of_generation(id) {
             self.logits.clear();
             return Ok(id);
@@ -136,6 +197,90 @@ impl Session {
         self.logits = self.engine.forward(&[id], pos).await?;
         self.cached.push(id);
         Ok(id)
+    }
+
+    /// The continuation of the latest earlier occurrence of the context's last few tokens.
+    fn draft(&self, last: u32, k: usize) -> Vec<u32> {
+        let mut h = self.cached.clone();
+        h.push(last);
+        let from = h.len().saturating_sub(8192);
+        for n in [4, 3, 2] {
+            if h.len() < from + n + 1 {
+                continue;
+            }
+            let tail = &h[h.len() - n..];
+            if let Some(j) = (from..h.len() - n).rev().find(|&j| &h[j..j + n] == tail) {
+                let end = (j + n + k).min(h.len());
+                return h[j + n..end].to_vec();
+            }
+        }
+        Vec::new()
+    }
+
+    /// Like `next`, but when speculation is on, verify a drafted continuation in the same pass:
+    /// returns the tokens the model has now read (the next token, then the accepted part of the
+    /// draft). Each position samples from the model's own logits and a draft token is accepted
+    /// only when it is what was sampled, so the text is what one-at-a-time decoding gives
+    /// (identical when greedy). The first mismatch becomes the next token.
+    pub async fn next_many(&mut self) -> Result<Vec<u32>, String> {
+        let k = self.spec.draft_len();
+        if k == 0 {
+            return Ok(vec![self.next().await?]);
+        }
+        if self.logits.is_empty() && self.pending.is_none() {
+            return Err("prefill a prompt first".into());
+        }
+        let id = match self.pending.take() {
+            Some(p) => p,
+            None => self.sampler.sample(&self.logits, &self.cached),
+        };
+        if self.tok.is_end_of_generation(id) {
+            self.logits.clear();
+            return Ok(vec![id]);
+        }
+        let pos = self.cached.len();
+        let ctx = self.engine.context_length();
+        if pos + 1 >= ctx {
+            return Err("the context is full".into());
+        }
+        let room = ctx - pos - 2;
+        let draft = self.draft(id, k.min(room));
+        if draft.is_empty() {
+            self.logits = self.engine.forward(&[id], pos).await?;
+            self.cached.push(id);
+            return Ok(vec![id]);
+        }
+        let recurrent = self.engine.is_recurrent();
+        if recurrent {
+            self.engine.spec_save();
+        }
+        let mut batch = vec![id];
+        batch.extend_from_slice(&draft);
+        let rows = self.engine.forward_all(&batch, pos).await?;
+        let mut history = self.cached.clone();
+        history.push(id);
+        let mut accepted = 0;
+        let mut next = None;
+        for (i, row) in rows.iter().enumerate() {
+            let s = self.sampler.sample(row, &history);
+            if i < draft.len() && s == draft[i] && !self.tok.is_end_of_generation(s) {
+                history.push(s);
+                accepted += 1;
+            } else {
+                next = Some(s);
+                break;
+            }
+        }
+        if recurrent && accepted < draft.len() {
+            // The recurrent state read the whole draft: go back and read only what was kept.
+            self.engine.spec_restore();
+            self.engine.forward(&batch[..accepted + 1], pos).await?;
+        }
+        self.cached.extend_from_slice(&batch[..accepted + 1]);
+        self.logits = rows[accepted].clone();
+        self.pending = next;
+        self.spec.record(draft.len(), accepted);
+        Ok(batch[..accepted + 1].to_vec())
     }
 
     pub fn last_logits(&self) -> &[f32] {

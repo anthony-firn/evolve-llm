@@ -428,16 +428,18 @@ async function turn(messages, opts, maxTokens, ctx, emit = post, preserveTask = 
       shown = d;
     }
   };
-  while (n < limit) {
+  // A model that streams its weights may read several tokens per pass (a draft from earlier
+  // text, verified at once).
+  outer: while (n < limit) {
     if (stopRequested) { reason = 'stopped'; break; }
-    const id = await chat.next();
-    n++;
-    if (chat.is_end(id)) { reason = 'end'; break; }
-    const piece = rawPiece(chat.control_text(id), chat.piece(id));
-    if (piece) {
-      raw += piece;
-      show();
+    for (const id of await chat.next_many()) {
+      n++;
+      if (chat.is_end(id)) { reason = 'end'; break outer; }
+      const piece = rawPiece(chat.control_text(id), chat.piece(id));
+      if (piece) raw += piece;
+      if (n >= limit) break;
     }
+    show();
   }
   raw += chat.flush();
   show();

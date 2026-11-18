@@ -401,6 +401,19 @@ impl Chat {
         })
     }
 
+    /// Resolves to the token ids the model read this step (a Uint32Array): one, or more when it
+    /// streams its weights and a draft from earlier text was verified in the same pass.
+    pub fn next_many(&self) -> js_sys::Promise {
+        let inner = self.inner.clone();
+        wasm_bindgen_futures::future_to_promise(async move {
+            let mut s = inner
+                .try_borrow_mut()
+                .map_err(|_| err("the model is busy"))?;
+            let ids = s.next_many().await.map_err(err)?;
+            Ok(js_sys::Uint32Array::from(&ids[..]).into())
+        })
+    }
+
     /// Text for a generated token; incomplete UTF-8 is held until it completes.
     pub fn piece(&self, id: u32) -> String {
         let s = self.inner.borrow();

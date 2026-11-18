@@ -149,3 +149,110 @@ fn kimi_k31_matches_reference() {
 fn kimi_k31_sparse_attention_matches_reference() {
     run("kimik31-topk8", "", 5e-3);
 }
+
+/// A prompt longer than one chunk read by a model that streams goes layer by layer across its
+/// chunks (each streamed weight read once for all of them). Its logits must match the same model
+/// with every weight on the GPU, which reads the prompt chunk by chunk.
+fn long_prompt_matches_resident(file: &str, budget: u64, want: u64) {
+    let path = models_dir().join(file);
+    let Ok(bytes) = std::fs::read(&path) else {
+        eprintln!("skipping {file}: not found");
+        return;
+    };
+    let g = gguf::parse(&bytes).unwrap();
+    let cfg = evolve_llm::model::config(&g).unwrap();
+    let vocab = cfg.n_vocab as u64;
+    // Several chunks (two whole ones and part of a third for 300), within the model's context.
+    let n = want.min(cfg.ctx_train as u64 - 1);
+    let tokens: Vec<u32> = (0..n).map(|i| ((i * 2654435761 + 12345) % vocab.min(32000)) as u32).collect();
+    let mut logits = Vec::new();
+    for budget in [None, Some(budget)] {
+        let Ok(gpu) = pollster::block_on(gpu::init()) else {
+            eprintln!("skipping {file}: no GPU adapter");
+            return;
+        };
+        let mut e = Engine::with_options(gpu, &g, Options { binding_limit: None, layout: Layout::Fast, budget }).unwrap();
+        for p in e.plan().to_vec().iter().filter(|p| p.resident) {
+            e.upload(&p.name, 0, &bytes[p.offset as usize..(p.offset + p.bytes) as usize]).unwrap();
+        }
+        e.set_source(Box::new(MemorySource(vec![bytes.clone()])));
+        e.finish(n as usize + 64).unwrap();
+        assert_eq!(e.placement.streaming, budget.is_some());
+        logits.push(pollster::block_on(e.forward(&tokens, 0)).unwrap());
+        let st = e.take_stream_stats();
+        if budget.is_some() {
+            eprintln!("{file}: streamed prompt read {:.1} MB in {} expert passes", st.bytes_read as f64 / 1e6, st.passes);
+        }
+    }
+    let range = logits[0].iter().cloned().fold(f32::MIN, f32::max) - logits[0].iter().cloned().fold(f32::MAX, f32::min);
+    let err = worst(&logits[1], &logits[0]) / range;
+    eprintln!("{file}: layer-by-layer streamed prompt vs resident: {err:.2e} of a {range:.2} logit range");
+    assert!(err < 5e-3, "{file}: streamed long prompt differs from resident");
+}
+
+#[test]
+fn long_streamed_prompts_match_resident() {
+    long_prompt_matches_resident("tiny-k31-bf16.gguf", 1, 300);
+    long_prompt_matches_resident("tiny-k31-bf16-topk8.gguf", 1, 300);
+    long_prompt_matches_resident("tiny-deepseek3.gguf", 1, 300);
+    long_prompt_matches_resident("tiny-qwen3moe.gguf", 1, 300);
+    long_prompt_matches_resident("Llama-3.2-1B-Instruct-Q4_K_M.gguf", 300 << 20, 300);
+    // Longer than one layer-by-layer pass (SUPER_BATCH tokens): two passes.
+    long_prompt_matches_resident("Llama-3.2-1B-Instruct-Q4_K_M.gguf", 300 << 20, 1100);
+}
+
+/// Speculative decoding (drafts from the context, verified in one pass) must give exactly the
+/// tokens one-at-a-time greedy decoding gives, with the model streaming its weights.
+fn speculation_matches(file: &str, budget: u64) {
+    use evolve_llm::sampler::SamplerConfig;
+    use evolve_llm::session::Session;
+    let path = models_dir().join(file);
+    let Ok(bytes) = std::fs::read(&path) else {
+        eprintln!("skipping {file}: not found");
+        return;
+    };
+    let g = gguf::parse(&bytes).unwrap();
+    let Ok(gpu) = pollster::block_on(gpu::init()) else {
+        eprintln!("skipping {file}: no GPU adapter");
+        return;
+    };
+    let mut e = Engine::with_options(gpu, &g, Options { binding_limit: None, layout: Layout::Fast, budget: Some(budget) }).unwrap();
+    for p in e.plan().to_vec().iter().filter(|p| p.resident) {
+        e.upload(&p.name, 0, &bytes[p.offset as usize..(p.offset + p.bytes) as usize]).unwrap();
+    }
+    e.set_source(Box::new(MemorySource(vec![bytes.clone()])));
+    e.finish(256).unwrap();
+    let mut s = Session::new(e, &g).unwrap();
+    s.set_sampler(SamplerConfig { temperature: 0.0, repeat_penalty: 1.0, ..Default::default() });
+    // A repetitive prompt, so earlier text predicts what comes next.
+    let prompt: Vec<u32> = (0..48u32).map(|i| [11, 220, 1000, 4096, 77, 31][(i % 6) as usize]).collect();
+    let n = 40;
+    let mut runs = Vec::new();
+    for speculate in [false, true] {
+        s.reset();
+        s.set_speculation(speculate);
+        pollster::block_on(s.prefill(&prompt)).unwrap();
+        let mut out: Vec<u32> = Vec::new();
+        let mut steps = 0;
+        while out.len() < n {
+            let ids = pollster::block_on(s.next_many()).unwrap();
+            steps += 1;
+            let end = ids.iter().any(|&id| s.tok.is_end_of_generation(id));
+            out.extend(ids.into_iter().filter(|&id| !s.tok.is_end_of_generation(id)));
+            if end {
+                break;
+            }
+        }
+        out.truncate(n);
+        eprintln!("{file}: speculation {speculate}: {} tokens in {steps} steps", out.len());
+        runs.push(out);
+    }
+    assert_eq!(runs[0], runs[1], "{file}: speculative decoding changed the greedy text");
+}
+
+#[test]
+fn speculative_decoding_matches_greedy() {
+    speculation_matches("tiny-k31-bf16.gguf", 1);
+    speculation_matches("tiny-deepseek3.gguf", 1);
+    speculation_matches("Llama-3.2-1B-Instruct-Q4_K_M.gguf", 300 << 20);
+}

@@ -16,6 +16,24 @@ pub const MAX_BATCH: usize = 128;
 /// Marks an expert that is not resident in the expert-to-slot map.
 pub const ABSENT: u32 = u32::MAX;
 
+/// Most tokens one pass can return logits for (a speculative draft and the token before it).
+pub const SPEC_MAX: usize = 8;
+
+/// Prompt tokens a model that streams reads layer by layer at once: each streamed weight is
+/// read once per this many tokens instead of once per `MAX_BATCH`.
+pub const SUPER_BATCH: usize = 1024;
+
+/// Activations of every chunk of a prompt read layer by layer, parked between phases.
+struct Super {
+    tokens: usize,
+    x: wgpu::Buffer,
+    xn: wgpu::Buffer,
+    xl: wgpu::Buffer,
+    ml: wgpu::Buffer,
+    route: wgpu::Buffer,
+    route_staging: wgpu::Buffer,
+}
+
 struct Shard {
     row0: usize,
     rows: usize,
@@ -259,6 +277,15 @@ struct State {
     /// both taken at the end of the last prompt (a recurrent state cannot be rewound).
     kda: Vec<(wgpu::Buffer, wgpu::Buffer)>,
     kda_snap: Vec<(wgpu::Buffer, wgpu::Buffer)>,
+    /// Ops after `head_end` produce logits for every token (up to SPEC_MAX) into `logits_all`.
+    head_end: usize,
+    logits_all: wgpu::Buffer,
+    staging_all: wgpu::Buffer,
+    // Working buffers the layer-by-layer prompt copies chunks in and out of.
+    xn: wgpu::Buffer,
+    xl: wgpu::Buffer,
+    ml: wgpu::Buffer,
+    sup: Option<Super>,
 }
 
 pub struct Engine {
@@ -288,6 +315,11 @@ pub struct Engine {
     /// Tokens the recurrent state has read, and the position of its snapshot.
     recurrent_pos: Cell<usize>,
     snapshot_pos: Cell<Option<usize>>,
+    /// The next pass returns logits for every token (speculative verification).
+    all_logits: Cell<bool>,
+    /// A second copy of the recurrent state, taken before verifying a draft (made on first use).
+    spec_state: RefCell<Vec<(wgpu::Buffer, wgpu::Buffer)>>,
+    spec_pos: Cell<usize>,
 }
 
 fn storage(ro: bool, binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -779,6 +811,9 @@ impl Engine {
             placement,
             recurrent_pos: Cell::new(0),
             snapshot_pos: Cell::new(None),
+            all_logits: Cell::new(false),
+            spec_state: RefCell::new(Vec::new()),
+            spec_pos: Cell::new(0),
         };
         e.compile()?;
         Ok(e)
@@ -1021,6 +1056,9 @@ impl Engine {
         let latent = c.expert_latent;
         let bs = c.attn_res_block;
         let n_ckpt = if bs > 0 { c.n_layer.div_ceil(bs) } else { 0 };
+        // A model that streams reads long prompts layer by layer, up to SUPER_BATCH tokens at once.
+        let super_tokens = if self.placement.streaming { SUPER_BATCH.min(ctx.next_multiple_of(t)) } else { 0 };
+        let ck_tokens = super_tokens.max(t);
         let act_mode = if c.situ.is_some() { 4 } else { 2 };
         let x = buf("x", t * c.n_embd);
         let xn = buf("xn", t * c.n_embd);
@@ -1030,7 +1068,9 @@ impl Engine {
         let att = buf("att", t * c.q_dim().max(v_width).max(kd));
         // Residuals across blocks: the mixed sub-layer input and the banked checkpoints.
         let xm = buf("x-mix", if bs > 0 { t * c.n_embd } else { 1 });
-        let ck = buf("checkpoints", t * n_ckpt.max(1) * c.n_embd);
+        // Indexed by the token's offset in a layer-by-layer prompt (step.chunk0), so every chunk
+        // of it keeps its own checkpoints.
+        let ck = buf("checkpoints", ck_tokens * n_ckpt.max(1) * c.n_embd);
         // Linear attention: q, k, v per token, the decay gate and its low-rank input, beta.
         let kqv = buf("kda-qkv", t * 3 * kd);
         let gk = buf("kda-gate", t * kd);
@@ -1127,7 +1167,7 @@ impl Engine {
         });
         let step = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("step"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1448,7 +1488,7 @@ impl Engine {
         let res_mix = |ops: &mut Vec<Op>, w: &wgpu::Buffer, n_ckpt: usize, bank: bool, dst: &wgpu::Buffer| {
             let mut d = words(&[c.n_embd as u32, n_ckpt as u32, bank as u32]);
             d.extend(c.rms_eps.to_le_bytes());
-            d.extend(words(&[t as u32, 0, 0, 0]));
+            d.extend(words(&[ck_tokens as u32, 0, 0, 0]));
             ops.push(Op {
                 when: When::Always,
                 kernel: Kernel::ResMix,
@@ -1737,8 +1777,47 @@ impl Engine {
             "output.weight"
         };
         matmul(&mut ops, head, &xf, &logits, 0, None, true, Input::rows(c.n_embd));
+        // The same head for every token of a short batch: verifying a speculative draft needs
+        // the logits after each of its tokens.
+        let head_end = ops.len();
+        let xfa = buf("xf-all", t * c.n_embd);
+        let logits_all = buf("logits-all", SPEC_MAX * c.n_vocab);
+        let staging_all = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging-all"),
+            size: (SPEC_MAX * c.n_vocab * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if bs > 0 {
+            res_mix(&mut ops, &self.vecs["output_res_score.weight"], n_ckpt, false, &xm);
+            norm(&mut ops, &xm, &self.vecs["output_norm.weight"], &xfa, c.n_embd, false);
+        } else {
+            norm(&mut ops, &x, &self.vecs["output_norm.weight"], &xfa, c.n_embd, false);
+        }
+        matmul(&mut ops, head, &xfa, &logits_all, 0, None, false, Input::rows(c.n_embd));
 
-        let bytes = Self::state_bytes(&c, ctx);
+        let route_bytes = route.size();
+        let sup = (super_tokens > 0).then(|| {
+            let chunks = super_tokens / t;
+            Super {
+                tokens: super_tokens,
+                x: buf("prompt x", super_tokens * c.n_embd),
+                xn: buf("prompt xn", super_tokens * c.n_embd),
+                xl: buf("prompt expert-in", super_tokens * latent.max(1)),
+                ml: buf("prompt expert-out", super_tokens * latent.max(1)),
+                route: buf("prompt routes", chunks * route_bytes as usize / 4),
+                route_staging: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("prompt routes staging"),
+                    size: chunks as u64 * route_bytes,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+            }
+        });
+        let mut bytes = Self::state_bytes(&c, ctx);
+        if let Some(s) = &sup {
+            bytes += s.x.size() + s.xn.size() + s.xl.size() + s.ml.size() + s.route.size() + (ck_tokens - t) as u64 * (n_ckpt * c.n_embd * 4) as u64;
+        }
         let route_staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("route staging"),
             size: route.size(),
@@ -1762,6 +1841,13 @@ impl Engine {
             bytes,
             kda: kda_state,
             kda_snap,
+            head_end,
+            logits_all,
+            staging_all,
+            xn,
+            xl,
+            ml,
+            sup,
         });
         match self.gpu.take_error() {
             Some(e) => Err(format!("could not prepare the model on the GPU: {e}")),
@@ -1843,8 +1929,109 @@ impl Engine {
 
     fn encode_chunk(&self, n_tokens: usize, with_head: bool) -> wgpu::CommandBuffer {
         let st = self.state.as_ref().unwrap();
-        let end = if with_head { st.ops.len() } else { st.head_start };
-        self.encode_range(0..end, n_tokens, with_head)
+        if !with_head {
+            return self.encode_range(0..st.head_start, n_tokens, false);
+        }
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        self.record(&mut enc, 0..st.head_start, n_tokens);
+        self.record_head(&mut enc, n_tokens);
+        enc.finish()
+    }
+
+    /// The output head after the last layer, and the copy of its logits for reading back: the
+    /// last token's, or every token's while verifying a draft.
+    fn record_head(&self, enc: &mut wgpu::CommandEncoder, n_tokens: usize) {
+        let st = self.state.as_ref().unwrap();
+        if self.all_logits.get() {
+            self.record(enc, st.head_end..st.ops.len(), n_tokens);
+            enc.copy_buffer_to_buffer(&st.logits_all, 0, &st.staging_all, 0, (n_tokens * self.cfg.n_vocab * 4) as u64);
+        } else {
+            self.record(enc, st.head_start..st.head_end, n_tokens);
+            enc.copy_buffer_to_buffer(&st.logits, 0, &st.staging, 0, st.staging.size());
+        }
+    }
+
+    /// Logits after each of `tokens` (at most SPEC_MAX), for verifying a speculative draft.
+    pub async fn forward_all(&self, tokens: &[u32], pos0: usize) -> Result<Vec<Vec<f32>>, String> {
+        if tokens.is_empty() || tokens.len() > SPEC_MAX {
+            return Err(format!("a verification batch holds 1 to {SPEC_MAX} tokens"));
+        }
+        self.all_logits.set(true);
+        let out = self.forward(tokens, pos0).await;
+        self.all_logits.set(false);
+        out?;
+        let st = self.state.as_ref().unwrap();
+        let v = self.cfg.n_vocab;
+        let bytes = read_back(&self.gpu, &st.staging_all, (tokens.len() * v * 4) as u64).await?;
+        let all: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        Ok(all.chunks(v).map(|r| r.to_vec()).collect())
+    }
+
+    /// Keep a copy of the recurrent state before verifying a draft.
+    pub fn spec_save(&self) {
+        let Some(st) = self.state.as_ref() else { return };
+        let mut spare = self.spec_state.borrow_mut();
+        if spare.is_empty() {
+            let make = |b: &wgpu::Buffer| {
+                self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("kda-spec"),
+                    size: b.size(),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })
+            };
+            *spare = st.kda.iter().map(|(a, b)| (make(a), make(b))).collect();
+        }
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        for (live, copy) in st.kda.iter().zip(spare.iter()) {
+            enc.copy_buffer_to_buffer(&live.0, 0, &copy.0, 0, live.0.size());
+            enc.copy_buffer_to_buffer(&live.1, 0, &copy.1, 0, live.1.size());
+        }
+        self.gpu.queue.submit([enc.finish()]);
+        self.spec_pos.set(self.recurrent_pos.get());
+    }
+
+    /// Go back to the state `spec_save` kept (a draft was only partly accepted).
+    pub fn spec_restore(&self) {
+        let Some(st) = self.state.as_ref() else { return };
+        let spare = self.spec_state.borrow();
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        for (live, copy) in st.kda.iter().zip(spare.iter()) {
+            enc.copy_buffer_to_buffer(&copy.0, 0, &live.0, 0, live.0.size());
+            enc.copy_buffer_to_buffer(&copy.1, 0, &live.1, 0, live.1.size());
+        }
+        self.gpu.queue.submit([enc.finish()]);
+        self.recurrent_pos.set(self.spec_pos.get());
+    }
+
+    /// True when weights are read from storage (or the network) while the model runs.
+    pub fn streaming(&self) -> bool {
+        self.placement.streaming
+    }
+
+    /// The per-step uniform: tokens in this chunk, their first position, and the chunk's first
+    /// token within a prompt read layer by layer.
+    fn write_step(&self, n: usize, pos: usize, chunk0: usize) {
+        let st = self.state.as_ref().unwrap();
+        let n = n as u32;
+        let pos = pos as u32;
+        self.gpu.queue.write_buffer(&st.step, 0, &words(&[n, pos, pos + n, n - 1, chunk0 as u32, 0, 0, 0]));
+    }
+
+    /// Record ops into an encoder (with copies around them, for the layer-by-layer prompt).
+    fn record(&self, enc: &mut wgpu::CommandEncoder, range: std::ops::Range<usize>, n_tokens: usize) {
+        let st = self.state.as_ref().unwrap();
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("forward"),
+            timestamp_writes: None,
+        });
+        let t = n_tokens as u32;
+        for op in st.ops[range].iter().filter(|op| Self::runs(op, t)) {
+            let (key, (gx, gy, gz)) = Self::dispatch_of(op, t);
+            pass.set_pipeline(&self.pipelines[&key]);
+            pass.set_bind_group(0, &op.bind, &[]);
+            pass.dispatch_workgroups(gx, gy, gz);
+        }
     }
 
     fn encode_range(&self, range: std::ops::Range<usize>, n_tokens: usize, copy_logits: bool) -> wgpu::CommandBuffer {
@@ -1856,19 +2043,7 @@ impl Engine {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("step"),
             });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("forward"),
-                timestamp_writes: None,
-            });
-            let t = n_tokens as u32;
-            for op in st.ops[range].iter().filter(|op| Self::runs(op, t)) {
-                let (key, (gx, gy, gz)) = Self::dispatch_of(op, t);
-                pass.set_pipeline(&self.pipelines[&key]);
-                pass.set_bind_group(0, &op.bind, &[]);
-                pass.dispatch_workgroups(gx, gy, gz);
-            }
-        }
+        self.record(&mut enc, range, n_tokens);
         if with_head {
             enc.copy_buffer_to_buffer(&st.logits, 0, &st.staging, 0, st.staging.size());
         }
@@ -1880,11 +2055,7 @@ impl Engine {
     pub fn profile(&self, n_tokens: usize, pos0: usize, reps: usize) -> Vec<(String, usize, f64)> {
         let st = self.state.as_ref().unwrap();
         let t = n_tokens as u32;
-        self.gpu.queue.write_buffer(
-            &st.step,
-            0,
-            &words(&[t, pos0 as u32, pos0 as u32 + t, t - 1]),
-        );
+        self.write_step(n_tokens, pos0, 0);
         let mut totals: Vec<(String, usize, f64)> = Vec::new();
         for op in st.ops.iter().filter(|op| Self::runs(op, t)) {
             let (key, (gx, gy, gz)) = Self::dispatch_of(op, t);
@@ -2002,15 +2173,14 @@ impl Engine {
         for (i, chunk) in chunks.iter().enumerate() {
             let n = chunk.len() as u32;
             let last = i + 1 == chunks.len();
-            self.gpu.queue.write_buffer(
-                &st.step,
-                0,
-                &words(&[n, pos as u32, pos as u32 + n, n - 1]),
-            );
+            self.write_step(n as usize, pos, 0);
             self.gpu.queue.write_buffer(&st.tokens, 0, &words(chunk));
             let cmd = self.encode_chunk(chunk.len(), last);
             self.gpu.queue.submit([cmd]);
             pos += chunk.len();
+        }
+        if self.all_logits.get() {
+            return Ok(Vec::new()); // forward_all reads every token's logits
         }
         let bytes = read_back(&self.gpu, &st.staging, st.staging.size()).await?;
         Ok(bytes
@@ -2244,6 +2414,160 @@ impl Engine {
         Ok(passes)
     }
 
+    /// A prompt of several chunks for a model that streams, read layer by layer: each streamed
+    /// weight is read once for all of its chunks rather than once per chunk. In expert layers,
+    /// every chunk's attention and routing run first; then each expert-cache pass loads its
+    /// experts once and runs every chunk that chose them; then the rest of the layer. Chunk
+    /// activations wait in `Super` buffers between phases, and block checkpoints are indexed by
+    /// the chunk's offset (`step.chunk0`). With `head`, the last token's logits go to staging.
+    async fn forward_layers(&self, tokens: &[u32], pos0: usize, head: bool) -> Result<(), String> {
+        let st = self.state.as_ref().unwrap();
+        let sup = st.sup.as_ref().unwrap();
+        let q = &self.gpu.queue;
+        let c = &self.cfg;
+        let n_expert = c.moe.as_ref().map_or(0, |e| e.n_expert);
+        let n_used = c.moe.as_ref().map_or(0, |e| e.n_used);
+        let latent = c.expert_latent;
+        let chunks: Vec<(usize, usize)> = (0..tokens.len()).step_by(MAX_BATCH).map(|s| (s, MAX_BATCH.min(tokens.len() - s))).collect();
+        let route_bytes = st.route.size();
+        let enc = || self.gpu.device.create_command_encoder(&Default::default());
+        // Byte ranges of `n` tokens from token `s`, `w` values wide.
+        let at = |s: usize, w: usize| (s * w * 4) as u64;
+        let len = |n: usize, w: usize| (n * w * 4) as u64;
+        // Park or restore a chunk's activations.
+        let park = |e: &mut wgpu::CommandEncoder, s: usize, n: usize, out: bool, which: &[(&wgpu::Buffer, &wgpu::Buffer, usize)]| {
+            for &(work, all, w) in which {
+                if out {
+                    e.copy_buffer_to_buffer(work, 0, all, at(s, w), len(n, w));
+                } else {
+                    e.copy_buffer_to_buffer(all, at(s, w), work, 0, len(n, w));
+                }
+            }
+        };
+        let ne = c.n_embd;
+        for &(s, n) in &chunks {
+            self.write_step(n, pos0 + s, s);
+            let mut e = enc();
+            if self.placement.cpu_embeddings || st.embed_end == 0 {
+                self.prefetch(&self.embed_spans(&tokens[s..s + n])).await?;
+                q.write_buffer(&st.x, 0, &floats(&self.embed_cpu(&tokens[s..s + n])?));
+            } else {
+                q.write_buffer(&st.tokens, 0, &words(&tokens[s..s + n]));
+                self.record(&mut e, 0..st.embed_end, n);
+            }
+            park(&mut e, s, n, true, &[(&st.x, &sup.x, ne)]);
+            q.submit([e.finish()]);
+        }
+        let mut queued = 0u64;
+        for (l, lo) in st.layers.iter().enumerate() {
+            self.prefetch(&self.ring_spans(&self.ring_layers[l])).await?;
+            queued += self.upload_rings(&self.ring_layers[l])?;
+            let Some(pool) = self.layer_pool[l] else {
+                for &(s, n) in &chunks {
+                    self.write_step(n, pos0 + s, s);
+                    let mut e = enc();
+                    park(&mut e, s, n, false, &[(&st.x, &sup.x, ne)]);
+                    self.record(&mut e, lo.start..lo.end, n);
+                    park(&mut e, s, n, true, &[(&st.x, &sup.x, ne)]);
+                    q.submit([e.finish()]);
+                }
+                if queued > 512 << 20 {
+                    super::wait_idle(&self.gpu).await?;
+                    queued = 0;
+                }
+                continue;
+            };
+            // What the experts read and add to, as (working buffer, parked copy, width).
+            let expert_io: Vec<(&wgpu::Buffer, &wgpu::Buffer, usize)> = if latent > 0 {
+                vec![(&st.xl, &sup.xl, latent), (&st.ml, &sup.ml, latent)]
+            } else {
+                vec![(&st.xn, &sup.xn, ne), (&st.x, &sup.x, ne)]
+            };
+            // 1. Attention and routing for every chunk.
+            for (ci, &(s, n)) in chunks.iter().enumerate() {
+                self.write_step(n, pos0 + s, s);
+                let mut e = enc();
+                park(&mut e, s, n, false, &[(&st.x, &sup.x, ne)]);
+                self.record(&mut e, lo.start..lo.route_end, n);
+                park(&mut e, s, n, true, &[(&st.x, &sup.x, ne), (&st.xn, &sup.xn, ne)]);
+                if latent > 0 {
+                    park(&mut e, s, n, true, &expert_io);
+                }
+                e.copy_buffer_to_buffer(&st.route, 0, &sup.route, ci as u64 * route_bytes, route_bytes);
+                q.submit([e.finish()]);
+            }
+            let mut e = enc();
+            e.copy_buffer_to_buffer(&sup.route, 0, &sup.route_staging, 0, chunks.len() as u64 * route_bytes);
+            q.submit([e.finish()]);
+            let raw = read_back(&self.gpu, &sup.route_staging, chunks.len() as u64 * route_bytes).await?;
+            let ids: Vec<Vec<u32>> = chunks
+                .iter()
+                .enumerate()
+                .map(|(ci, &(_, n))| {
+                    let b = &raw[ci * route_bytes as usize..];
+                    (0..n * n_used).map(|i| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap())).collect()
+                })
+                .collect();
+            if ids.iter().flatten().any(|&e| e as usize >= n_expert) {
+                return Err("expert routing produced an invalid expert".into());
+            }
+            let all: Vec<u32> = ids.iter().flatten().copied().collect();
+            // 2. Each pass loads its experts once and runs every chunk that chose one of them.
+            for (pass, loads) in self.plan_experts(l, &all)? {
+                let missing: Vec<u32> = loads.iter().map(|&(_, e)| e).collect();
+                self.prefetch(&self.expert_spans(pool, l, &missing)).await?;
+                for (slot, e) in loads {
+                    self.load_expert(pool, slot, l, e)?;
+                }
+                let mut map = vec![ABSENT; n_expert];
+                for &(e, slot) in &pass {
+                    map[e as usize] = slot as u32;
+                }
+                q.write_buffer(&st.emap, (l * n_expert * 4) as u64, &words(&map));
+                for (ci, &(s, n)) in chunks.iter().enumerate() {
+                    if !ids[ci].iter().any(|&e| map[e as usize] != ABSENT) {
+                        continue;
+                    }
+                    self.write_step(n, pos0 + s, s);
+                    let mut e = enc();
+                    park(&mut e, s, n, false, &expert_io);
+                    if latent == 0 {
+                        // Gate and up read xn; the down projection adds into x.
+                        park(&mut e, s, n, false, &[(&st.xn, &sup.xn, ne)]);
+                    }
+                    e.copy_buffer_to_buffer(&sup.route, ci as u64 * route_bytes, &st.route, 0, route_bytes);
+                    self.record(&mut e, lo.route_end..lo.experts_end, n);
+                    park(&mut e, s, n, true, &expert_io[1..]);
+                    q.submit([e.finish()]);
+                }
+            }
+            // 3. The rest of the layer: shared experts, and latent experts' way back.
+            for &(s, n) in &chunks {
+                self.write_step(n, pos0 + s, s);
+                let mut e = enc();
+                park(&mut e, s, n, false, &[(&st.x, &sup.x, ne), (&st.xn, &sup.xn, ne)]);
+                if latent > 0 {
+                    park(&mut e, s, n, false, &[(&st.ml, &sup.ml, latent)]);
+                }
+                self.record(&mut e, lo.experts_end..lo.end, n);
+                park(&mut e, s, n, true, &[(&st.x, &sup.x, ne)]);
+                q.submit([e.finish()]);
+            }
+            queued = 0;
+        }
+        if head {
+            let &(s, n) = chunks.last().unwrap();
+            self.prefetch(&self.ring_spans(&self.ring_head)).await?;
+            self.upload_rings(&self.ring_head)?;
+            self.write_step(n, pos0 + s, s);
+            let mut e = enc();
+            park(&mut e, s, n, false, &[(&st.x, &sup.x, ne)]);
+            self.record_head(&mut e, n);
+            q.submit([e.finish()]);
+        }
+        Ok(())
+    }
+
     /// Forward pass for models that do not fit: layer by layer, reading streamed weights and
     /// the experts each token chose.
     async fn forward_streamed(&self, tokens: &[u32], pos0: usize) -> Result<Vec<f32>, String> {
@@ -2254,6 +2578,19 @@ impl Engine {
         if pos0 + tokens.len() > st.ctx {
             return Err(format!("the conversation is longer than the {}-token context", st.ctx));
         }
+        if let Some(sup) = st.sup.as_ref().filter(|_| tokens.len() > MAX_BATCH) {
+            let parts: Vec<&[u32]> = tokens.chunks(sup.tokens).collect();
+            let mut pos = pos0;
+            for (i, part) in parts.iter().enumerate() {
+                self.forward_layers(part, pos, i + 1 == parts.len()).await?;
+                pos += part.len();
+            }
+            if self.all_logits.get() {
+                return Ok(Vec::new()); // forward_all reads every token's logits
+            }
+            let bytes = read_back(&self.gpu, &st.staging, st.staging.size()).await?;
+            return Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect());
+        }
         let q = &self.gpu.queue;
         let n_expert = self.cfg.moe.as_ref().map_or(0, |e| e.n_expert);
         let n_used = self.cfg.moe.as_ref().map_or(0, |e| e.n_used);
@@ -2262,7 +2599,7 @@ impl Engine {
         for (ci, chunk) in chunks.iter().enumerate() {
             let n = chunk.len();
             let last = ci + 1 == chunks.len();
-            q.write_buffer(&st.step, 0, &words(&[n as u32, pos as u32, (pos + n) as u32, n as u32 - 1]));
+            self.write_step(n, pos, 0);
             q.write_buffer(&st.tokens, 0, &words(chunk));
             if self.placement.cpu_embeddings || st.embed_end == 0 {
                 self.prefetch(&self.embed_spans(chunk)).await?;
@@ -2326,9 +2663,14 @@ impl Engine {
             if last {
                 self.prefetch(&self.ring_spans(&self.ring_head)).await?;
                 self.upload_rings(&self.ring_head)?;
-                q.submit([self.encode_range(st.head_start..st.ops.len(), n, true)]);
+                let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+                self.record_head(&mut enc, n);
+                q.submit([enc.finish()]);
             }
             pos += n;
+        }
+        if self.all_logits.get() {
+            return Ok(Vec::new()); // forward_all reads every token's logits
         }
         let bytes = read_back(&self.gpu, &st.staging, st.staging.size()).await?;
         Ok(bytes

@@ -387,18 +387,21 @@ fn main() {
             let t1 = Instant::now();
             let mut n = 0;
             let mut out = Vec::new();
-            for _ in 0..a.n {
+            // Several tokens per pass when speculation is on (the model streams).
+            'gen: while n < a.n {
                 let tt = Instant::now();
-                let id = pollster::block_on(s.next()).unwrap();
-                n += 1;
+                let ids = pollster::block_on(s.next_many()).unwrap();
                 if net.is_some() {
-                    eprintln!("\n[token {n}: {:.1}s{}]", tt.elapsed().as_secs_f64(), stats(&s, net));
+                    eprintln!("\n[{} token(s) in {:.1}s{}]", ids.len(), tt.elapsed().as_secs_f64(), stats(&s, net));
                 }
-                if s.tok.is_end_of_generation(id) {
-                    break;
+                for id in ids {
+                    n += 1;
+                    if s.tok.is_end_of_generation(id) || n > a.n {
+                        break 'gen;
+                    }
+                    out.push(id);
+                    print!("{}", dec.push(&s.tok, id));
                 }
-                out.push(id);
-                print!("{}", dec.push(&s.tok, id));
                 std::io::stdout().flush().unwrap();
             }
             println!("{}", dec.flush());

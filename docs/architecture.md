@@ -102,6 +102,25 @@ Given a GPU memory budget, `Engine::with_options` places each matrix:
    several passes; each pass's loads are queued after the previous pass's work, so reused slots
    are safe.
 
+A prompt longer than one 128-token chunk is read layer by layer when the model streams, up to
+1,024 tokens at once: each layer's streamed weights are read once for all of its chunks. In an
+expert layer, every chunk's attention and routing run first; each expert-cache pass then loads
+its experts once and runs every chunk that chose one of them; then the rest of the layer runs
+for each chunk. Chunk activations wait in buffers between these phases, and block checkpoints
+are indexed by the chunk's offset. Reading a chunk at a time instead would read almost every
+expert of a large model again for every 128 tokens. The results match the chunk-at-a-time
+resident pass (`tests/tiny.rs`).
+
+While a model that streams generates, a pass reading a few tokens costs about as much as one
+reading a single token, because the reads are the cost. So each step drafts up to six tokens: the
+continuation of the latest earlier occurrence of the last four, three or two tokens (prompt
+lookup; coding agents copy paths, code and JSON from their context). One pass returns logits after
+every drafted token; each position samples from the model's own logits, and a drafted token is kept
+only when it is what was sampled, so the text is what one-at-a-time decoding gives (identical when
+greedy, `tests/tiny.rs`). The first mismatch becomes the next token. A model with a recurrent state
+copies it before the pass and, when a draft is only partly kept, restores it and reads the kept
+tokens again. Drafting pauses for 16 tokens when fewer than 30% of recent drafted tokens were kept.
+
 Weights are read through `WeightSource`: positioned reads of the files natively, and OPFS access
 handles or `FileReaderSync` in the browser, filling WebAssembly memory directly. The operating
 system's file cache keeps recently read weights in RAM, which is the middle tier between the GPU
