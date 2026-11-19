@@ -2,11 +2,21 @@
 // Pi. One VM serves the whole page.
 
 let shared = null;
+let config = () => ({});
 
-/** The page's one VM (started on first use). */
+/** The page's one VM (started on first use), configured from the page's settings. */
 export function sharedVm() {
-  shared ??= new VmClient();
+  if (!shared) {
+    shared = new VmClient();
+    shared.configure(config());
+  }
   return shared;
+}
+
+/** Where the VM's settings come from (GitHub token, autonomy); applied now and on change. */
+export function provideConfig(fn) {
+  config = fn;
+  shared?.configure(fn());
 }
 
 export class VmClient {
@@ -16,6 +26,7 @@ export class VmClient {
     this.pending = new Map();
     this.outputs = new Map();
     this.exits = new Map();
+    this.agentAborts = new Map();
     this.ready = new Promise((resolve, reject) => {
       this.worker.onmessage = (e) => {
         const m = e.data;
@@ -23,12 +34,37 @@ export class VmClient {
         else if (m.type === 'error') reject(new Error(m.message));
         else if (m.type === 'output') this.outputs.get(m.tty)?.(m.data);
         else if (m.type === 'session-exit') this.exits.get(m.tty)?.(m.code);
+        else if (m.type === 'agent-cancel') this.agentAborts.get(m.id)?.abort();
+        else if (m.type === 'agent') {
+          const write = (text) => this.worker.postMessage({ type: 'agent-output', id: m.id, text });
+          const abort = new AbortController();
+          this.agentAborts.set(m.id, abort);
+          Promise.resolve(this.onAgent(m.task, m.cwd, write, abort.signal)).finally(() => this.agentAborts.delete(m.id)).then((code) => this.worker.postMessage({ type: 'agent-done', id: m.id, code: code | 0 }), (e) => {
+            write(`pi: ${e?.message || e}\n`);
+            this.worker.postMessage({ type: 'agent-done', id: m.id, code: 1 });
+          });
+        } else if (m.type === 'ask') Promise.resolve(this.onAsk(m.question)).then((yes) => this.worker.postMessage({ type: 'answer', id: m.id, yes }), () => this.worker.postMessage({ type: 'answer', id: m.id, yes: false }));
         else if (m.type === 'session' || m.type === 'result') {
           this.pending.get(m.id)?.(m);
           this.pending.delete(m.id);
         }
       };
     });
+  }
+
+  /** `pi TASK` in a terminal: run Pi in `cwd`, writing progress with `write`; resolves the status. */
+  onAgent(task, cwd, write) {
+    write('pi: open Terminal & Pi with a tool-capable model loaded, then run pi again.\n');
+    return 1;
+  }
+
+  /** A program asks to do something that leaves this device (push, open a pull request). */
+  onAsk(question) {
+    return window.confirm(`Pi's Linux terminal asks:\n\n${question}`);
+  }
+
+  configure({ github } = {}) {
+    if (github) this.worker.postMessage({ type: 'config', github });
   }
 
   call(msg) {

@@ -29,6 +29,38 @@ export class Host {
     this.ttys = new Set();
     this.pending = false;
     this.running = new Map();
+    this.http = new Map();
+    // GitHub access for programs (gh, git): the token stays here; programs never see it.
+    this.github = { token: '', autonomy: 1, api: 'https://api.github.com', raw: 'https://raw.githubusercontent.com' };
+    this.ask = async () => false;
+    // Pi on the page runs `pi` tasks: (task, cwd, write(text)) -> exit status.
+    this.agent = async (task, cwd, write) => {
+      write('pi: the agent is not available here\n');
+      return 1;
+    };
+  }
+
+  /** One request from a program: only GitHub's API and raw files, with the token for the API. */
+  async fetch(r) {
+    try {
+      let url = new URL(r.url);
+      const api = url.origin === 'https://api.github.com';
+      if (!api && url.origin !== 'https://raw.githubusercontent.com') return { error: `${url.origin} is not reachable from the VM` };
+      // Tests point GitHub at a local fake.
+      const base = api ? this.github.api : this.github.raw;
+      url = new URL(base.replace(/\/$/, '') + url.pathname + url.search);
+      const headers = {};
+      for (const [k, v] of Object.entries(r.headers || {})) if (/^(accept|content-type|x-github-api-version)$/i.test(k)) headers[k] = v;
+      if (api && this.github.token) headers.Authorization = `Bearer ${this.github.token}`;
+      const body = r.body ? Uint8Array.from(atob(r.body), (c) => c.charCodeAt(0)) : undefined;
+      const res = await fetch(url, { method: r.method || 'GET', headers, body, redirect: 'follow' });
+      const data = new Uint8Array(await res.arrayBuffer());
+      let bin = '';
+      for (let i = 0; i < data.length; i += 0x8000) bin += String.fromCharCode(...data.subarray(i, i + 0x8000));
+      return { status: res.status, body: btoa(bin) };
+    } catch (e) {
+      return { error: `network request failed: ${e?.message || e}` };
+    }
   }
 
   tick() {
@@ -450,6 +482,45 @@ export class Host {
     };
 
     const evolve = {
+      http_fetch: new WebAssembly.Suspending(async (reqPtr, reqLen, outLenPtr) => {
+        check();
+        let reqs = JSON.parse(str(reqPtr, reqLen));
+        if (!Array.isArray(reqs)) reqs = [reqs];
+        const out = enc.encode(JSON.stringify(await Promise.all(reqs.map((r) => host.fetch(r)))));
+        check();
+        host.http.set(pid, out);
+        view().setUint32(outLenPtr, out.length, true);
+        return 0;
+      }),
+      http_read(bufPtr, len) {
+        const b = host.http.get(pid) || new Uint8Array();
+        bytes().set(b.subarray(0, len), bufPtr);
+        host.http.delete(pid);
+        return 0;
+      },
+      ask_user: new WebAssembly.Suspending(async (qPtr, qLen, answerPtr) => {
+        check();
+        const yes = await host.ask(str(qPtr, qLen), pid);
+        check();
+        view().setUint32(answerPtr, yes ? 1 : 0, true);
+        return 0;
+      }),
+      agent_run: new WebAssembly.Suspending(async (taskPtr, taskLen, cwdPtr, cwdLen, statusPtr) => {
+        check();
+        // Pi's progress goes to this program's standard output, wherever that leads.
+        const write = (text) => {
+          if (!vm.running(pid)) return;
+          vm.fd_write(pid, 1, enc.encode(text));
+          host.changed();
+        };
+        const code = await host.agent(str(taskPtr, taskLen), str(cwdPtr, cwdLen), write, pid);
+        view().setInt32(statusPtr, code, true);
+        return 0;
+      }),
+      policy(levelPtr) {
+        view().setUint32(levelPtr, host.github.autonomy, true);
+        return 0;
+      },
       proc_spawn(argvPtr, argvLen, envPtr, envLen, cwdPtr, cwdLen, mapPtr, mapLen, pgid, pidOut) {
         const argv = str(argvPtr, argvLen).split('\0');
         const env = envLen ? str(envPtr, envLen).split('\0') : [];

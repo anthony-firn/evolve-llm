@@ -19,6 +19,9 @@ const ENV = ['HOME=/home/user', 'USER=user', 'PATH=/bin:/usr/bin', 'TERM=xterm-2
 
 let vm;
 let host;
+let askSeq = 0;
+const asks = new Map();
+const agents = new Map();
 let init_pid;
 let dirty = false;
 const sessions = new Map(); // tty -> shell pid
@@ -40,16 +43,37 @@ async function boot() {
     },
     onChange: () => { dirty = true; },
   });
+  // `pi` tasks run on the page (where the model is); its progress comes back as output.
+  host.agent = (task, cwd, write, pid) => new Promise((resolve) => {
+    const id = ++askSeq;
+    // Ctrl+C on `pi` stops Pi itself.
+    const watch = setInterval(() => {
+      if (vm.killed(pid) >= 0 || !vm.running(pid)) postMessage({ type: 'agent-cancel', id });
+    }, 250);
+    agents.set(id, { resolve: (code) => { clearInterval(watch); resolve(code); }, write, pid });
+    postMessage({ type: 'agent', id, task, cwd });
+  });
+  // Questions from programs (push, pull requests) go to the page and wait for the answer.
+  host.ask = (question) => new Promise((resolve) => {
+    const id = ++askSeq;
+    asks.set(id, resolve);
+    postMessage({ type: 'ask', id, question });
+  });
   // Programs: the shell, and the utilities under each of their names.
-  const [sh, utils, list] = await Promise.all([
+  const [sh, utils, gh, pi, list] = await Promise.all([
     fetch(new URL('./bin/sh.wasm', import.meta.url)).then((r) => r.arrayBuffer()),
     fetch(new URL('./bin/utils.wasm', import.meta.url)).then((r) => r.arrayBuffer()),
+    fetch(new URL('./bin/gh.wasm', import.meta.url)).then((r) => r.arrayBuffer()),
+    fetch(new URL('./bin/pi.wasm', import.meta.url)).then((r) => r.arrayBuffer()),
     fetch(new URL('./programs.json', import.meta.url)).then((r) => r.json()),
   ]);
   vm.mkdir_p('/usr/lib/evolve');
   vm.write_file('/bin/sh', new Uint8Array(sh));
   vm.write_file('/usr/lib/evolve/utils', new Uint8Array(utils));
+  vm.write_file('/usr/lib/evolve/gh', new Uint8Array(gh));
   for (const name of list.utils) vm.symlink('/usr/lib/evolve/utils', `/bin/${name}`);
+  for (const name of ['gh', 'git']) vm.symlink('/usr/lib/evolve/gh', `/bin/${name}`);
+  vm.write_file('/bin/pi', new Uint8Array(pi));
   await restore();
   // A process that owns the pipes of commands run for the page.
   const t = vm.create_tty();
@@ -145,6 +169,19 @@ async function exec({ command, cwd = '/home/user', timeoutMs = 120000, stdin = '
 }
 
 const handlers = {
+  /** {github: {token, autonomy (0 local only, 1 ask before push, 2 push freely), api?, raw?}} */
+  config: ({ github }) => {
+    if (github) host.github = { ...host.github, ...github };
+  },
+  'agent-output': ({ id, text }) => agents.get(id)?.write(text),
+  'agent-done': ({ id, code }) => {
+    agents.get(id)?.resolve(code);
+    agents.delete(id);
+  },
+  answer: ({ id, yes }) => {
+    asks.get(id)?.(Boolean(yes));
+    asks.delete(id);
+  },
   session: ({ id }) => postMessage({ type: 'session', id, tty: newSession() }),
   input: ({ tty, data }) => {
     vm.tty_input(tty, typeof data === 'string' ? enc.encode(data) : new Uint8Array(data));

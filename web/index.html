@@ -215,6 +215,21 @@
           <button type="button" class="ghost" id="host-stop">Stop letting my phone use this computer</button>
         </div>
       </fieldset>
+      <fieldset class="block web">
+        <legend>Pi and your GitHub</legend>
+        <small>In Terminal &amp; Pi, the Linux terminal runs <code>pi TASK</code>: Pi works on your repositories there with git and gh, through GitHub's API. Builds and tests run in your repositories' GitHub Actions.</small>
+        <label class="block">What Pi may do on GitHub
+          <select name="autonomy">
+            <option value="0">Commit locally only; never push</option>
+            <option value="1">Ask me before pushing or opening a pull request</option>
+            <option value="2">Push branches and open pull requests freely (asks before the default branch)</option>
+          </select>
+        </label>
+        <label class="block">GitHub token (optional)
+          <input type="password" name="githubToken" autocomplete="off" spellcheck="false" placeholder="github_pat_…">
+          <small>A fine-grained token with Contents and Pull requests (read and write), and Actions (read), on the repositories Pi may change. Kept only in this browser and sent only to api.github.com; programs in the terminal never see it. Without one, Pi can clone public repositories.</small>
+        </label>
+      </fieldset>
       <label class="check"><input type="checkbox" name="thinking"> Let reasoning models think before answering</label>
       <fieldset class="block web">
         <legend>Internet access</legend>

@@ -2,7 +2,8 @@
 
 In the full-page terminal (web/vm/terminal.html): a pipeline's output, the tab title the shell
 sets, Ctrl+C ending a running command without ending the shell, Ctrl+Shift+T and `exit`
-opening and closing tabs, and Find. Then in the app: Terminal, Linux terminal, a command.
+opening and closing tabs, and Find. Then in the app: Terminal, Linux terminal, a command, the
+autonomy setting reaching `gh`, and `pi` reaching Pi.
 
     python3 tools/build_web.py && python3 tests/vm_terminal_browser_test.py [--runtime dist]
 
@@ -87,6 +88,17 @@ def main():
         time.sleep(1)
         shown = app.evaluate("[...document.querySelectorAll('.vm-console canvas')].length")
         expect(shown >= 1, "the app's terminal draws")
+        # Settings reach the VM, and `pi` reaches Pi (which needs a model first).
+        app.evaluate("""() => {
+          const f = document.getElementById('settings-form');
+          f.elements.autonomy.value = '0';
+          f.elements.autonomy.dispatchEvent(new Event('input', { bubbles: true }));
+        }""")
+        app.keyboard.type("gh auth status > /tmp/auth.txt; pi add a README > /tmp/pi.txt; echo done")
+        app.keyboard.press("Enter")
+        read = lambda path: app.evaluate("(p) => import('./vm/client.mjs').then(({ sharedVm }) => sharedVm().read(p)).then((r) => r.ok ? r.data : '')", path)
+        expect(wait_for(lambda: "local commits only" in read("/tmp/auth.txt"), 15), f"the autonomy setting reaches gh ({read('/tmp/auth.txt')!r})")
+        expect(wait_for(lambda: "load a tool-capable model first" in read("/tmp/pi.txt"), 15), f"pi in the app reaches Pi ({read('/tmp/pi.txt')!r})")
         browser.close()
     if problems:
         print("\n".join(problems))

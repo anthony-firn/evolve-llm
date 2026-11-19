@@ -17,7 +17,7 @@ let worker = newWorker();
 if (REMOTE_CODE) app.dataset.remote = '';
 const IS_MOBILE = navigator.userAgentData?.mobile ?? /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
 
-const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', cacheGb: 10, share: false, shareUpload: 2, internet: false, jinaKey: '' };
+const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', cacheGb: 10, share: false, shareUpload: 2, internet: false, jinaKey: '', githubToken: '', autonomy: 1 };
 const SUGGESTIONS = [
   'Make me a Snake game I can play.',
   'Write a haiku about running AI on my own laptop.',
@@ -36,6 +36,12 @@ const state = {
   live: null, // the assistant message being written
   settings: loadSettings(),
 };
+
+// The Linux terminal's VM takes the GitHub token and autonomy from Settings (when it starts,
+// and on every change); the VM is created only when the terminal opens.
+function configureVm() {
+  import('./vm/client.mjs').then(({ provideConfig }) => provideConfig(() => ({ github: { token: state.settings.githubToken || '', autonomy: Number(state.settings.autonomy ?? 1) } }))).catch(() => {});
+}
 
 function loadSettings() {
   try {
@@ -1092,6 +1098,8 @@ function fillSettings() {
   form.elements.thinking.checked = Boolean(s.thinking);
   form.elements.internet.checked = Boolean(s.internet);
   form.elements.jinaKey.value = s.jinaKey || '';
+  form.elements.githubToken.value = s.githubToken || '';
+  form.elements.autonomy.value = String(s.autonomy ?? 1);
 }
 form.addEventListener('input', (e) => {
   const t = e.target;
@@ -1110,6 +1118,7 @@ form.addEventListener('input', (e) => {
   }
   else state.settings[t.name] = t.value;
   saveSettings();
+  if (t.name === 'githubToken' || t.name === 'autonomy') configureVm();
 });
 form.addEventListener('change', (e) => {
   if (['ctx', 'gpu', 'gpuMemory', 'cacheGb', 'share', 'shareUpload'].includes(e.target.name) && state.loaded) $('status-line').textContent = 'This setting applies the next time a model loads.';
@@ -1194,6 +1203,7 @@ if(!$('chat-mode').value)$('chat-mode').value='auto';
 $('chat-mode').addEventListener('change',()=>remember('evolve-llm-chat-mode',$('chat-mode').value));
 
 worker.postMessage({ type: 'hello', gpu: state.settings.gpu });
+configureVm();
 {
   const code = new URLSearchParams(location.hash.slice(1)).get('pair');
   if (REMOTE_CODE) {

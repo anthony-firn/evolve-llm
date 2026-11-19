@@ -90,6 +90,48 @@ parts of a task or finish without executing tools. Inspect the displayed results
 a confident answer alone does not establish that a task succeeded. This is the browser agent
 integration, not the complete Node-based Pi coding-agent CLI.
 
+## Linux terminal: Pi on your repositories
+
+**Linux terminal** in Terminal & Pi opens the Evolve VM: a Rust kernel compiled to WebAssembly that
+runs WASI programs as processes, with files, pipes, terminals and a POSIX-style shell, in a
+GNOME-style terminal (tabs, Ctrl+Shift+T, Find, themes) drawn by ghostty-web. Files under
+`/home/user` are saved in this browser.
+
+`git` and `gh` work on GitHub repositories through GitHub's API (the VM has no sockets, so this
+is not Git's own protocol):
+
+```text
+gh repo clone anthony-firn/evolve-llm      # every file is checked against GitHub's blob hash
+cd evolve-llm && git checkout -b fix-typo
+git status; git diff; git commit -m "Fix a typo"   # every change is included; no staging area
+git push                                    # creates the branch on GitHub
+gh pr create --title "Fix a typo" --body "…"
+gh run list --branch fix-typo; gh run view RUN_ID  # CI results: failed steps and annotations
+```
+
+`pi TASK` in the Linux terminal gives the task to Pi with the loaded model. Pi works in the
+current directory with the VM's shell, files, `git` and `gh`, writes its progress to the
+terminal, and stops on Ctrl+C. A task allows 40 model turns and 80 tool calls. The VM has no
+compiler, Node or Python yet, so builds and tests run in the repository's GitHub Actions: Pi pushes
+a branch and reads its CI run.
+
+Settings → **Pi and your GitHub** sets what Pi may do:
+
+- **Commit locally only**: `git push`, `gh pr create` and write calls through `gh api` are refused.
+- **Ask me before pushing or opening a pull request** (default): the page asks each time.
+- **Push branches and open pull requests freely**: no question, except for a repository's
+  default branch, which always asks.
+
+A GitHub token is optional; without one, Pi can clone public repositories (GitHub allows 60 API
+requests an hour without a token). Use a fine-grained token limited to the repositories Pi may
+change, with Contents and Pull requests (read and write) and Actions (read). The token stays in this
+browser and in the page's VM host: programs in the VM ask the host to make a request, the host
+adds the token only for `api.github.com`, and only `api.github.com` and
+`raw.githubusercontent.com` are reachable. `tests/vm_github_browser_test.py` checks clone, status,
+diff, commit, push (the pushed tree, its parent, the question), pull requests, CI, the three
+autonomy levels and the token's destination against a fake GitHub; `tests/vm_pi_browser_test.py`
+runs Pi's agent core with a scripted model through a clone, an edit, a push and a pull request.
+
 ## Explicit public internet reads
 
 Enable **Web access** to allow:

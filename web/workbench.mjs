@@ -46,7 +46,8 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
     if(on&&!vmWindow){
       if(!document.querySelector('link[href$="vm/terminal.css"]')){const l=document.createElement('link');l.rel='stylesheet';l.href=new URL('./vm/terminal.css',import.meta.url).href;document.head.append(l)}
       const [{sharedVm},{TerminalWindow}]=await Promise.all([import('./vm/client.mjs'),import('./vm/terminal.mjs')]);
-      vmWindow=new TerminalWindow({vm:sharedVm(),container:vmHost});await vmWindow.open();
+      const vm=sharedVm();vm.onAgent=runLinuxTask;
+      vmWindow=new TerminalWindow({vm,container:vmHost});await vmWindow.open();
     }
     if(on)vmWindow?.active?.term.focus();
   }
@@ -103,6 +104,39 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
       const result=await workspace.request('exec',{command:line,network:network.options()},{signal:task.signal});
       record('exit '+result.code,(result.stdout||'')+(result.stderr||''),result.code?'error':'');
     }
+  }
+  // `pi TASK` typed in the Linux terminal: Pi works in that directory with the VM's shell, files,
+  // git and gh, and writes its progress to the terminal.
+  async function runLinuxTask(question,cwd,write,signal){
+    if(!ready()){write('\x1b[33mpi: load a tool-capable model first (Models), then run pi again.\x1b[0m\n');return 1}
+    if(busy||agent){write('pi: Pi is already working on a task.\n');return 1}
+    busy=true;const release=lease();const controller=new AbortController();
+    const cancel=()=>{controller.abort();agent?.abort()};signal?.addEventListener('abort',cancel,{once:true});
+    const limit=taskTimeLimit();const timer=limit?setTimeout(cancel,Math.max(limit*5,15*60000)):null;
+    const dim=s=>`\x1b[2m${s}\x1b[0m`;
+    let calls=0,errors=0,turns=0;
+    const show=r=>{const t=(r?.content||[]).map(c=>c.text||'').join('\n')||JSON.stringify(r);const lines=t.split('\n');return lines.slice(0,12).join('\n')+(lines.length>12?`\n… ${lines.length-12} more lines`:'')};
+    const onEvent=e=>{
+      if(e.type==='token')write(dim(e.text));
+      else if(e.type==='tool'){calls++;const a=e.args||{};write(`\n\x1b[1;36m● ${e.name}\x1b[0m ${e.name==='bash'?'$ '+a.command:a.path||a.query||a.url||''}\n`)}
+      else if(e.type==='tool-result'){if(e.isError)errors++;write((e.isError?'\x1b[31m':'\x1b[2m')+show(e.result)+'\x1b[0m\n')}
+      else if(e.type==='retry')write('\x1b[33m(the model\'s tool call was invalid; asking again)\x1b[0m\n');
+      else if(e.type==='answer')turns++;
+    };
+    try{
+      const [{createPiTask},{VmWorkspace},{sharedVm}]=await Promise.all([import('./pi-agent.bundle.mjs'),import('./vm/workspace.mjs'),import('./vm/client.mjs')]);
+      write(dim(`Pi · ${modelName()} · ${cwd}\n`));
+      agent=createPiTask({turn,workspace:new VmWorkspace(sharedVm(),{cwd}),network,maxTokens:Number(tokenLimit.value),modelName:modelName(),onEvent,linux:{cwd}});
+      if(controller.signal.aborted)throw new Error('cancelled');
+      const result=await agent.run(question);
+      const last=result?.messages?.filter(m=>m.role==='assistant').at(-1);
+      const answer=stripToolCalls((last?.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('\n')).trim();
+      if(answer)write(`\n${answer}\n`);
+      write(dim(`\n${turns} model turns · ${calls} tool calls · ${errors} tool errors\n`));
+      return errors&&!answer?1:0;
+    }catch(error){
+      write(`\n\x1b[31mpi: ${controller.signal.aborted?'stopped':error.message||error}\x1b[0m\n`);return 1;
+    }finally{clearTimeout(timer);signal?.removeEventListener('abort',cancel);agent=null;busy=false;release();}
   }
   async function performTask(question,options={}){
     if(!ready())throw new Error('Load a model and wait until it is ready before running Pi.');

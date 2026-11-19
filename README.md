@@ -19,8 +19,11 @@ Ask the main chat to build an app or game, or open **Terminal** for a persistent
 Enter `demo snake` to play the included example, or `preview game.html` to run your own
 single-file HTML app in an isolated frame. Pi can test apps, inspect runtime errors and edit them. Load a
 tool-capable model, then enter `pi <task>` to run Pi agent core with sandbox file and research
-tools. Web access is explicit; there is no host shell or server inference. See
-[commands, limits, permissions and self-hosting](docs/workbench.md).
+tools. Web access is explicit; there is no host shell or server inference. **Linux terminal**
+opens the Evolve VM, a Rust kernel in WebAssembly with a POSIX-style shell, utilities, and `git`
+and `gh` that work on your GitHub repositories through GitHub's API; `pi <task>` there lets Pi
+clone, edit, commit, push branches, open pull requests and read CI results, within the autonomy
+you choose in Settings. See [commands, limits, permissions and self-hosting](docs/workbench.md).
 
 ## Web browser
 
@@ -276,6 +279,9 @@ python3 tests/pi_real_model_browser_test.py --runtime dist model.gguf [...]     
 python3 tests/swarm_browser_test.py                                                         # two visitors sharing pieces
 python3 tests/devices_browser_test.py [--memory 0.05]                                       # one model on two devices
 python3 tests/remote_browser_test.py [--pi-hf owner/repo/file.gguf]                         # a phone using a computer
+python3 tools/build_vm.py && python3 tests/vm_browser_test.py                               # the Evolve VM
+python3 tests/vm_terminal_browser_test.py                                                   # its terminal, typed into
+python3 tests/vm_github_browser_test.py && python3 tests/vm_pi_browser_test.py               # git, gh and Pi, fake GitHub
 ```
 
 GPU and model tests look for GGUF files in `$EVOLVE_LLM_MODELS` (default
