@@ -296,7 +296,7 @@ mod mux {
             inner.slots.insert(id, Slot { credit, ..Default::default() });
             let packet = encode(&Packet::Connect { id, kind: STREAM_TCP, port, host: host.to_string() });
             inner.ws.as_ref().ok_or("The relay is not connected")?.send_with_u8_array(&packet).map_err(|e| format!("{e:?}"))?;
-            Ok(WispStream { mux: self.0.clone(), id, closed: false })
+            Ok(WispStream { mux: self.0.clone(), id, closed: false, read_buf: Vec::new(), read_pos: 0 })
         }
     }
 
@@ -313,6 +313,8 @@ mod mux {
         mux: Rc<RefCell<Inner>>,
         id: u32,
         closed: bool,
+        read_buf: Vec<u8>,
+        read_pos: usize,
     }
 
     impl WispStream {
@@ -377,6 +379,46 @@ mod mux {
                 }
             }
         }
+    }
+
+
+    impl futures::io::AsyncRead for WispStream {
+        fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+            if buf.is_empty() { return Poll::Ready(Ok(0)); }
+            if self.read_pos == self.read_buf.len() {
+                let next = {
+                    let mut inner = self.mux.borrow_mut();
+                    let Some(slot) = inner.slots.get_mut(&self.id) else { return Poll::Ready(Ok(0)); };
+                    if let Some(chunk) = slot.rx.pop_front() { chunk }
+                    else if let Some(reason) = slot.closed {
+                        return Poll::Ready(if matches!(reason, 1 | 2) { Ok(0) } else { Err(std::io::Error::other(close_reason(reason))) });
+                    } else { slot.read_waker = Some(cx.waker().clone()); return Poll::Pending; }
+                };
+                self.read_buf = next;
+                self.read_pos = 0;
+            }
+            let n = buf.len().min(self.read_buf.len() - self.read_pos);
+            buf[..n].copy_from_slice(&self.read_buf[self.read_pos..self.read_pos + n]);
+            self.read_pos += n;
+            Poll::Ready(Ok(n))
+        }
+    }
+    impl futures::io::AsyncWrite for WispStream {
+        fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            if buf.is_empty() { return Poll::Ready(Ok(0)); }
+            let mut inner = self.mux.borrow_mut();
+            let Some(slot) = inner.slots.get_mut(&self.id) else { return Poll::Ready(Err(std::io::Error::other("Stream closed"))); };
+            if let Some(reason) = slot.closed { return Poll::Ready(Err(std::io::Error::other(close_reason(reason)))); }
+            if slot.credit == 0 { slot.write_waker = Some(cx.waker().clone()); return Poll::Pending; }
+            let n = buf.len().min(MAX_PAYLOAD);
+            slot.credit -= 1;
+            let packet = encode(&Packet::Data { id: self.id, payload: buf[..n].to_vec() });
+            let result = inner.ws.as_ref().ok_or_else(|| std::io::Error::other("Relay connection closed"))
+                .and_then(|ws| ws.send_with_u8_array(&packet).map_err(|_| std::io::Error::other("Relay write failed")));
+            Poll::Ready(result.map(|_| n))
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> { Poll::Ready(Ok(())) }
+        fn poll_close(mut self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> { self.close(); Poll::Ready(Ok(())) }
     }
 
     impl Drop for WispStream {

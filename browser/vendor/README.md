@@ -1,5 +1,24 @@
 # Vendored crates
 
+## h2
+
+[h2](https://github.com/hyperium/h2) 0.4.20 from crates.io, MIT licence (see `h2/LICENSE`), used
+through `[patch.crates-io]` in `../Cargo.toml` for the engine's HTTP/2 client (`src/net/http2.rs`).
+
+Changes for Evolve Browser:
+
+- **WebAssembly time.** `proto/streams/recv.rs` and `stream.rs` use `web_time::Instant`
+  (`std::time::Instant` panics on `wasm32-unknown-unknown`).
+- **Request framing** (`ext::RequestFraming`, read in `Streams::send_request`): an opt-in
+  per-request extension for framing browsers differ in, all of it valid HTTP/2: encoding the
+  pseudo-headers as `:method :path :authority :scheme`; a priority block in HEADERS (RFC 9113
+  §5.3, `frame::StreamDependency::encode`); and a stream WINDOW_UPDATE queued on the stream itself,
+  so it is written right after the stream's HEADERS (h2 otherwise writes window updates before
+  queued HEADERS, which would be a WINDOW_UPDATE on an idle stream). Without the extension h2
+  frames requests as upstream does.
+- `client::Builder::initial_stream_id` is available without the `unstable` feature.
+- Manifest without benches and examples.
+
 ## webtor and subtle-tls
 
 From [webtor-rs](https://github.com/ethereum/webtor-rs) at commit

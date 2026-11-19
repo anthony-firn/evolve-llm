@@ -34,17 +34,18 @@ of ordinary public header values remain.
 | TLS negotiation | TLS 1.3, `TLS_AES_128_GCM_SHA256`, group `0x11ec` (`X25519MLKEM768`) | rustls/ring, no hybrid ML-KEM group |
 | Offered key shares | X25519MLKEM768: 1216 bytes; X25519: 32; P-256: 65 | ring's supported groups and rustls-generated shares |
 | Cipher list | 16 offered suites, exact order in JSON | 9 supported suites plus SCSV; NSS-order experiment reorders the supported subset |
-| ALPN | `h2`, `http/1.1`; Google selected `h2` | `http/1.1` only |
+| ALPN | `h2`, `http/1.1`; Google selected `h2` | `h2`, `http/1.1`; HTTP/2 when the server selects it |
 | Cold ClientHello | 1893-byte handshake body; 32-byte compatibility session ID | Different rustls structure and extension layout |
 | TLS extensions | Ordered SNI, EMS, renegotiation, groups, point formats, ticket, ALPN, status, delegated credentials, SCT, key shares, versions, signatures, PSK modes, record limit, certificate compression, ECH extension | A smaller rustls extension set, with randomized ordering |
 | Certificate compression offer | Algorithm IDs `1,2,3` | No corresponding complete NSS profile |
 | Record size limit offer | `16385` | Different configuration |
 | Warm reconnect | 2460-byte ClientHello body, PSK extension last; Google accepted identity 0 | Resumption behavior has not been compared on the same route |
-| HTTP/2 settings, in order | `1=65536`, `2=0`, `4=131072`, `5=16384` | No HTTP/2 framing/HPACK transport |
-| Connection flow control | Initial WINDOW_UPDATE increment `12517377`, raising 65535 to 12582912 bytes | HTTP/1.1 only |
-| Pseudo-header order | `:method`, `:path`, `:authority`, `:scheme` | HTTP/1.1 request serialization |
-| Request headers | Order in JSON; includes `priority: u=0, i`, `te: trailers`; multiple cookie fields as cookies accumulate | Different HTTP/1.1 serialization and header set |
-| Content coding offer | `gzip, deflate, br, zstd` | gzip, deflate and Brotli; zstd decoder absent |
+| HTTP/2 settings, in order | `1=65536`, `2=0`, `4=131072`, `5=16384` | Same with a Firefox identity (other identities add `6`) |
+| Connection flow control | Initial WINDOW_UPDATE increment `12517377`, raising 65535 to 12582912 bytes | Same |
+| Client streams | First stream 3; HEADERS carry priority (non-exclusive, on 0, weight 42 documents, 32 fonts, 22 scripts/fetch/frames, 12 images), then a stream WINDOW_UPDATE of `12451840` | Same with a Firefox identity; others start at 1 without priority |
+| Pseudo-header order | `:method`, `:path`, `:authority`, `:scheme` | Same with a Firefox identity |
+| Request headers | Order in JSON; includes `priority: u=0, i`, `te: trailers`; multiple cookie fields as cookies accumulate | Same order and values with a Firefox identity (test `firefox_field_order_matches_reference`), cookies split into one field each over HTTP/2; `sec-fetch-storage-access` not sent |
+| Content coding offer | `gzip, deflate, br, zstd` | Same (zstd decoded by `ruzstd`) |
 
 The cold Google ClientHello extension IDs were:
 
@@ -116,14 +117,14 @@ of both original TLS directions. The normalization tests verify byte preservatio
 
 ## Implementation gates
 
-1. Add a real HTTP/2 transport: ALPN selection, HPACK, continuation handling, multiplexing,
-   flow control, cancellation, SETTINGS and PING acknowledgments, graceful GOAWAY and h1
-   fallback. Then measure its emitted settings, windows and header structure against this
-   reference. Advertising h2 before implementing it is insufficient.
+1. **Done:** an HTTP/2 transport (h2: ALPN selection, HPACK, continuation, multiplexing, flow
+   control, SETTINGS/PING acknowledgments, GOAWAY; h1 fallback). Its emitted settings, windows,
+   stream ids, priority and pseudo-header order are checked against this reference in
+   `browser/src/net/http2.rs` tests, and request fields in `browser/src/net/headers.rs` tests.
 2. Evaluate a TLS backend/provider that actually supports the hybrid key exchange, relevant
    extensions and certificate compression. Cipher reordering alone leaves major differences.
    Preserve certificate and hostname verification and test rejected certificates as before.
-3. Add zstd decoding before advertising it, and compare request policy/cookie behavior.
+3. **Done:** zstd decoding, advertised as Firefox does. Cookie policy behavior is still to compare.
 4. Implement independent iframe JS contexts and origin-checked cross-frame messaging, then
    verify that the actual page generates its identifier RPC.
 5. Repeat cold/warm captures of both clients on a controlled route. The native Tor exit here

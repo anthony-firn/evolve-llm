@@ -1,6 +1,9 @@
-//! Networking: HTTP/1.1 over TLS over Tor or Wisp streams, with browser cookie and CORS rules.
+//! Networking: HTTP/2 or HTTP/1.1 over TLS over Tor or Wisp streams, with browser cookie and
+//! CORS rules.
 
+pub mod headers;
 pub mod http;
+pub mod http2;
 pub mod policy;
 pub mod tls;
 pub mod wisp;
