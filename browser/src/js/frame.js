@@ -14,7 +14,9 @@
   const topWindow = G.__topWindow || parentWindow;
   const origin = String(G.__frameOrigin || '');
   const href = String(G.__frameUrl || '');
-  const frameId = G.__frameId_value | 0;
+  // The node id can exceed 2^31 (Blitz packs a generation into the high bits), so keep it as a
+  // full Number rather than a bitwise-truncated int32.
+  const frameId = Number(G.__frameId_value) || 0;
   for (const k of ['__parentWindow', '__topWindow', '__frameOrigin', '__frameUrl', '__frameId_value']) { try { delete G[k]; } catch (e) {} }
 
   const listeners = new Map();
@@ -72,6 +74,9 @@
   G.atob = (s) => { s = String(s).replace(/[^A-Za-z0-9+/]/g, ''); let o = ''; for (let i = 0; i < s.length;) { const n = (B64.indexOf(s[i++]) << 18) | (B64.indexOf(s[i++]) << 12) | (B64.indexOf(s[i++]) << 6) | B64.indexOf(s[i++]); o += String.fromCharCode((n >> 16) & 255); if (s[i - 2] !== undefined) o += String.fromCharCode((n >> 8) & 255); if (s[i - 1] !== undefined) o += String.fromCharCode(n & 255); } return o; };
 
   // Delivery entry point called by the host when a message is posted to this frame.
-  Object.defineProperty(G, '__deliverMessage', { value: (data, origin, source) => { G.setTimeout(() => dispatch(new MessageEvent('message', { data, origin, source })), 0); }, enumerable: false });
+  // Delivered synchronously by the host (which marks this frame as the incumbent for the
+  // duration), so a reply posted from a handler carries this frame as its source. The engine's
+  // job queue does not pump frame microtasks between turns, so we must not defer here.
+  Object.defineProperty(G, '__deliverMessage', { value: (data, origin, source) => { dispatch(new MessageEvent('message', { data, origin, source })); }, enumerable: false });
   Object.defineProperty(G, '__frameId', { value: frameId, enumerable: false });
 })();

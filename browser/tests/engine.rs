@@ -447,6 +447,33 @@ fn cross_origin_iframe_posts_message_to_parent() {
     assert_eq!(t.eval("frame.contentWindow === window"), "false");
 }
 
+// Both directions: the parent posts into the child frame, the child's listener receives it with
+// the parent as source, and replies; the parent then sees the reply from the child.
+#[test]
+fn iframe_postmessage_is_bidirectional() {
+    let mut t = h();
+    t.site.add("https://host.test/", "text/html", r#"<!doctype html><body><script>
+        window.__reply = null;
+        window.addEventListener('message', (e) => { if (e.data && e.data.pong) window.__reply = { data: e.data.pong, origin: e.origin, fromChild: e.source === frame.contentWindow }; });
+        var frame = document.createElement('iframe');
+        document.body.appendChild(frame);
+        frame.src = 'https://widget.test/w';
+    </script></body>"#);
+    t.site.add("https://widget.test/w", "text/html", r#"<!doctype html><script>
+        window.addEventListener('message', (e) => {
+            // Reply to the sender using its origin, proving parent->child delivery and source.
+            if (e.source && e.source.postMessage) e.source.postMessage({ pong: e.data, parentOrigin: e.origin, parentIsTop: e.source === window.top }, e.origin);
+        });
+    </script>"#);
+    t.open("https://host.test/");
+    // Give the child time to attach and register its listener, then post into it.
+    t.settle();
+    t.eval("frame.contentWindow.postMessage('ping', 'https://widget.test')");
+    assert_eq!(t.eval("window.__reply && window.__reply.data"), "\"ping\"", "{:?}", t.console());
+    assert_eq!(t.eval("window.__reply.origin"), "\"https://widget.test\"");
+    assert_eq!(t.eval("window.__reply.fromChild"), "true");
+}
+
 // targetOrigin must match the receiver's origin (or be "*"): a mismatched origin is dropped.
 #[test]
 fn iframe_postmessage_respects_target_origin() {
