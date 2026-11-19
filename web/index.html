@@ -31,7 +31,7 @@
     <aside class="sidebar" id="sidebar" aria-labelledby="models-title">
       <div class="side-head">
         <h2 id="models-title">Models</h2>
-        <p>Each model downloads once from Hugging Face, then runs from this browser. The largest run from Hugging Face directly, without a download.</p>
+        <p id="models-intro">Each model downloads once from Hugging Face, then runs from this browser. The largest run from Hugging Face directly, without a download.</p>
       </div>
       <ul class="model-list" id="model-list"></ul>
       <h3 class="list-title" id="large-title">Large models</h3>
@@ -197,11 +197,22 @@
         <small>Run a model too large for this device across your other computers. Open the pairing link on each of them: this device keeps the conversation, the first layers and the output, and the others run the remaining layers, passing the model's working state back over a direct, encrypted connection. Each reads only its share of the model from Hugging Face. Applies to models from Hugging Face, from the next load.</small>
         <button type="button" class="ghost" id="pair-start">Pair another device</button>
         <div id="pair-info" hidden>
-          <label class="block">Open this link on the other device
+          <div class="qr" id="pair-qr"></div>
+          <label class="block">Open this link on the other device, or scan the code with its camera
             <span class="pair-row"><input type="text" id="pair-link" readonly><button type="button" class="ghost" id="pair-copy">Copy</button></span>
           </label>
           <ul class="pair-list" id="pair-list"></ul>
           <button type="button" class="ghost" id="pair-stop">Stop pairing</button>
+        </div>
+        <small>Or chat and code from your phone with models running on this computer: the phone shows the conversation and Pi's work, and this computer's GPU runs the model. Best on the same Wi-Fi.</small>
+        <button type="button" class="ghost" id="host-start">Use this computer from your phone</button>
+        <div id="host-info" hidden>
+          <div class="qr" id="host-qr"></div>
+          <label class="block">Scan with your phone's camera, or open this link on it
+            <span class="pair-row"><input type="text" id="host-link" readonly><button type="button" class="ghost" id="host-copy">Copy</button></span>
+          </label>
+          <small>Keep this tab open. The link stays the same, so a bookmark on your phone reconnects later.</small>
+          <button type="button" class="ghost" id="host-stop">Stop letting my phone use this computer</button>
         </div>
       </fieldset>
       <label class="check"><input type="checkbox" name="thinking"> Let reasoning models think before answering</label>
@@ -215,6 +226,15 @@
         </label>
       </fieldset>
       <footer><button class="ghost" type="button" id="reset-settings">Restore defaults</button><button class="primary" value="close">Done</button></footer>
+    </form>
+  </dialog>
+
+  <dialog class="settings helping" id="hosting" aria-labelledby="hosting-title">
+    <form method="dialog">
+      <header><h2 id="hosting-title">Your phone is using this computer</h2></header>
+      <p id="hosting-status" aria-live="polite">Connected to your phone.</p>
+      <p><small>The conversation is on your phone; this computer runs the model for it. Keep this tab open. Stopping ends the connection and frees the GPU here.</small></p>
+      <footer><button class="primary" type="button" id="hosting-stop">Stop</button></footer>
     </form>
   </dialog>
 

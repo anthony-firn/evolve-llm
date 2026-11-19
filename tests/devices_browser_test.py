@@ -28,6 +28,7 @@ def main():
     ap.add_argument("--url", help="a deployed page instead of dist/")
     ap.add_argument("--public-relays", action="store_true")
     ap.add_argument("--headed", action="store_true")
+    ap.add_argument("--helper-device", help="emulate this Playwright device for the helper, e.g. 'Pixel 7'")
     a = ap.parse_args()
     relay = subprocess.Popen(["node", str(ROOT / "tests/fixtures/mini-nostr-relay.mjs")], stdout=subprocess.PIPE, text=True)
     port = int(relay.stdout.readline())
@@ -43,15 +44,15 @@ def main():
             browser = p.chromium.launch(executable_path="/usr/bin/google-chrome", headless=not a.headed,
                                         args=FLAGS + ["--disable-features=WebRtcHideLocalIpsWithMdns"])
 
-            def visitor(name, extra=None, suffix=""):
-                ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+            def visitor(name, extra=None, suffix="", device=None):
+                ctx = browser.new_context(**(p.devices[device] if device else {"viewport": {"width": 1280, "height": 900}}))
                 store = {"evolve-llm-settings": json.dumps(settings), "evolve-llm-swarm": json.dumps(network), **(extra or {})}
                 ctx.add_init_script("if(window===window.top){" + "".join(
                     f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)});" for k, v in store.items()) + "}")
                 page = ctx.new_page()
                 page.on("pageerror", lambda e: problems.append(f"{name}: page error: {e}"))
                 page.goto(url + suffix)
-                page.wait_for_selector("#gpu-chip[data-state=ok]", timeout=30000)
+                page.wait_for_selector("#gpu-chip[data-state=ok]", state="attached", timeout=30000)
                 return page
 
             def run(page, name, stream):
@@ -76,7 +77,7 @@ def main():
             ref.context.close()
 
             main_page = visitor("chat device", {"evolve-llm-pairing": "1", "evolve-llm-pair-code": code})
-            helper = visitor("helper", suffix=f"#pair={code}")
+            helper = visitor("helper", suffix=f"#pair={code}", device=a.helper_device)
             helper.wait_for_selector("#helping[open]", timeout=10000)
             # The page's CSP forbids evaluated strings, so wait by reading the list.
             for _ in range(120):

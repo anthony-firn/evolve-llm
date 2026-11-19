@@ -184,6 +184,21 @@ A model too large for one device can run across several of the same person's
   channel in 64 KiB frames. A helper receives the model's internal state for each step (derived from the conversation),
   not the conversation's text; pair only devices you trust.
 
+### A phone using a computer
+
+The page talks to its engine only through worker messages, so a phone can use a computer's
+engine by relaying them (`RemoteWorker` and `Hosting` in `web/devices.mjs`). The computer shows a
+QR code (`web/qr.mjs`, checked against python-qrcode) for a `#remote=CODE` link; pairing works as
+for helpers, with the roles `host` and `remote`. On the phone the page's worker is a
+`RemoteWorker`: messages wait until the computer connects, then go over the data channel as
+JSON; the computer's worker messages come back. Everything else runs on the phone, including Pi
+and its workspace, so files Pi writes are on the phone. The computer refuses messages that only
+its own page may send (swarm and helper requests), keeps its swarm bookkeeping to itself, and
+refuses files from the phone. It remembers the model the phone last loaded and says so when the
+phone reconnects, so reopening the bookmark continues where it was. Both ends hold a screen wake
+lock while working, because a phone that locks its screen suspends the page and drops the
+connection.
+
 ### Sharing pieces between visitors
 
 With sharing on, visitors running the same model file form a swarm and pass pieces browser to

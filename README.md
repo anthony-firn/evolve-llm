@@ -52,6 +52,12 @@ announced on Nostr. See [docs/browser.md](docs/browser.md).
   prompt is read layer by layer, so each weight is read once per 1,024 prompt tokens rather than
   once per 128, and each reply step also checks a continuation drafted from earlier text, so text
   the model copies from the conversation (code, paths) comes several tokens per pass.
+- **Works from your phone.** In Settings on a computer, "Use this computer from your phone" shows
+  a QR code; scan it and the phone becomes the screen for that computer: chat and Pi on the phone,
+  the model on the computer's GPU (the phone needs no GPU of its own). The link stays the same,
+  so a bookmark reconnects, to the model still loaded. A phone can also run small models itself
+  with WebGPU (Chrome on Android, Safari 26 on iOS), or open a pairing link to lend its GPU to a
+  computer; it keeps its screen on while it works, and asks for less memory than a computer.
 - **Runs one model across your devices.** Pair your other computers in Settings ("Pair another
   device", then open the link on each): the device you chat on keeps the embedding, the first
   layers and the output; each paired device runs a later run of layers, sized to its GPU memory,
@@ -141,6 +147,8 @@ Reference results come from independent implementations (`tools/make_fixtures.py
 | Llama 3.2 1B read from Hugging Face (`hf:` path, 300 MB GPU budget) | The same model from a local file | Identical greedy replies |
 | Kimi K3.1 Pro IQ1_S headers (14 parts, 2,693 tensors) | The engine's shape and format checks, over the network | Every tensor accepted |
 | Kimi K3.1, DeepSeek V3, Qwen3 MoE (tiny) and Llama 3.2 1B split across three engines (`split_across_devices_matches_one_device`) | The model on one engine | Bit-identical logits, resident and streamed (layer-by-layer prompts included; 1e-5 where a stage's share fits its budget and uses the faster layout); the same greedy text over two turns |
+| A phone using a computer (`tests/remote_browser_test.py`): a Pixel 7 profile in a browser with no GPU adapter, SmolLM2 135M loaded onto the computer from the phone | The model run directly on the computer | Identical replies, also after the phone reloads and reconnects to the model still loaded; with `--pi-hf` Qwen2.5 0.5B, Pi on the phone wrote a file with a tool call |
+| A phone as the helper (`tests/devices_browser_test.py --helper-device "Pixel 7"`) | The model alone | Identical reply; the phone offered 1.6 GB (its default) and ran layers 23–30 |
 | A chat device and a helper (`tests/devices_browser_test.py`), SmolLM2 135M from Hugging Face | The model alone in a third browser | Identical reply, with layers 1–15 on the chat device and 16–30 on the helper, each reading only its share (127 MB instead of 214 MB); the same with both streaming their layers |
 | Two visitors sharing pieces (`tests/swarm_browser_test.py`), SmolLM2 135M read from Hugging Face | The first visitor's reply | Identical; the second received 219 MB from the first over WebRTC and 4 KB from Hugging Face, loading and replying in 11 s instead of 71 s; the same on evolvetech.dev through public Nostr relays |
 | Browser reply, greedy | The native build on Vulkan | Identical text for SmolLM2 135M, Qwen2.5 0.5B, Qwen3 0.6B, Llama 3.2 1B and OLMoE 1B-7B (resident and streamed) |
@@ -265,6 +273,7 @@ python3 tests/stream_browser_test.py --model path/to/model.gguf --hf owner/repo/
 python3 tests/pi_real_model_browser_test.py --runtime dist model.gguf [...]                  # Pi tool calls, real models
 python3 tests/swarm_browser_test.py                                                         # two visitors sharing pieces
 python3 tests/devices_browser_test.py [--memory 0.05]                                       # one model on two devices
+python3 tests/remote_browser_test.py [--pi-hf owner/repo/file.gguf]                         # a phone using a computer
 ```
 
 GPU and model tests look for GGUF files in `$EVOLVE_LLM_MODELS` (default

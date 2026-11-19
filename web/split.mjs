@@ -26,9 +26,12 @@ export function planSplit(lb, caps) {
   return stages;
 }
 
-/** Bytes of weights a device can hold, from its memory setting ('auto', 'all' or GB). */
-export function capacityOf(pref) {
+/**
+ * Bytes of weights a device can hold, from its memory setting ('auto', 'all' or GB). Auto is
+ * 4 GB, or 1.5 GB on a phone (browsers there give a page much less of the shared memory).
+ */
+export function capacityOf(pref, mobile = false) {
   if (pref === 'all') return 16 * 2 ** 30;
   if (pref && pref !== 'auto' && Number(pref) > 0) return Number(pref) * 2 ** 30;
-  return 4 * 2 ** 30;
+  return (mobile ? 1.5 : 4) * 2 ** 30;
 }

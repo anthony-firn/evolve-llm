@@ -224,6 +224,8 @@ button:disabled{cursor:not-allowed;opacity:.5}
 @media (max-width:560px){
   .top{gap:10px;padding:9px 12px}
   .brand small,.gpu-chip{display:none}
+  /* On a phone using a computer, the chip is the sign the computer is there. */
+  .app[data-remote] .gpu-chip{display:inline-flex;margin:0 0 0 2px;padding:5px 9px;max-width:32vw}
   .top-actions{margin-left:auto}
   #new-chat{display:none}
   .scroll{padding:20px 16px 14px}
@@ -282,3 +284,8 @@ button:disabled{cursor:not-allowed;opacity:.5}
 .settings #pair-info[hidden]{display:none}
 .helping{max-width:440px}
 .helping p{font-size:.9rem;line-height:1.5}
+.settings fieldset.devices>small{margin-top:4px}
+.settings #host-info{display:flex;flex-direction:column;gap:10px}
+.settings #host-info[hidden]{display:none}
+.settings .qr{width:min(200px,60vw);align-self:center;border-radius:8px;overflow:hidden;line-height:0}
+.settings .qr svg{width:100%;height:auto;display:block}

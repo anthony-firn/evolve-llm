@@ -117,13 +117,15 @@ function gathered(pc, ms) {
 /** Finds the other devices with the same code and opens a Link to each. */
 export class Pairing {
   /**
-   * `role`: 'main' (the chat device) or 'helper'. `onLink(link, peer)` for each device of the
-   * other role that connects; `onClose(peer)` when one goes.
+   * `role`: 'main' (the chat device) and 'helper' (runs layers for it), or 'host' (a computer
+   * running models) and 'remote' (a phone using it). `onLink(link, peer)` for each device of the
+   * matching role that connects; `onClose(peer)` when one goes.
    */
   constructor({ code, role, onLink, onClose = () => {}, relays, iceServers = ICE_SERVERS, RTC = globalThis.RTCPeerConnection, signal = null }) {
     this.code = normalizeCode(code);
     this.role = role;
-    this.other = role === 'main' ? 'helper' : 'main';
+    this.other = { main: 'helper', helper: 'main', host: 'remote', remote: 'host' }[role];
+    if (!this.other) throw new Error(`unknown pairing role ${role}`);
     this.onLink = onLink;
     this.onClose = onClose;
     this.relays = relays;
@@ -412,4 +414,135 @@ export class Helping {
   stop() {
     this.worker.removeEventListener('message', this.onWorker);
   }
+}
+
+// ---- A phone using a computer's GPU ----
+
+// What the computer's worker tells its own page, not the phone: requests for the page's swarm
+// and paired devices, and the swarm's bookkeeping.
+const HOST_ONLY = new Set(['swarm-get', 'swarm-have', 'remote-forward', 'remote-control', 'split-plan']);
+// And what the phone's page may not ask of it: the page services above, and helper stages.
+const PHONE_BLOCKED = new Set(['swarm', 'swarm-data', 'remote-result', 'stage-forward', 'stage-control']);
+
+/**
+ * The computer's side: messages from the phone go to this page's worker, and the worker's
+ * replies go back. Local files and this page's swarm and paired devices stay out of it. The
+ * model the phone last loaded is kept, and described again when the phone reconnects.
+ */
+export class Hosting {
+  constructor({ worker, onState = () => {} }) {
+    this.worker = worker;
+    this.onState = onState;
+    this.link = null;
+    this.loaded = null;
+    this.tokens = 0;
+    this.onWorker = (e) => this.fromWorker(e.data || {});
+    worker.addEventListener('message', this.onWorker);
+  }
+
+  /** The phone connected (again). */
+  attach(link) {
+    this.link?.close();
+    this.link = link;
+    link.onMessage = (m) => this.message(m);
+    link.send({ t: 'host', v: PAIR_PROTOCOL, loaded: this.loaded }).catch(() => {});
+    this.onState({ state: 'connected', loaded: this.loaded });
+  }
+
+  detach(link) {
+    if (this.link !== link) return;
+    this.link = null;
+    this.onState({ state: 'waiting', loaded: this.loaded });
+  }
+
+  message(m) {
+    if (m.t !== 'w' || !m.m || typeof m.m.type !== 'string' || PHONE_BLOCKED.has(m.m.type)) return;
+    const msg = { ...m.m };
+    if (msg.type === 'load') {
+      if (msg.source?.kind !== 'hf') {
+        this.reply({ type: 'error', during: 'load', message: 'Files on your phone cannot be opened by your computer. Choose a model from Hugging Face or one saved on the computer.' });
+        return;
+      }
+      msg.share = false;
+      msg.split = null;
+      this.loaded = null;
+    }
+    this.worker.postMessage(msg);
+  }
+
+  reply(msg) {
+    this.link?.send({ t: 'w', m: msg }).catch(() => {});
+  }
+
+  fromWorker(d) {
+    if (HOST_ONLY.has(d.type)) return;
+    if (d.type === 'loaded') this.loaded = d;
+    if (d.type === 'unloaded' || (d.type === 'error' && d.during === 'load')) this.loaded = null;
+    if (d.type === 'token') this.tokens++;
+    if (d.type === 'loaded' || d.type === 'unloaded' || d.type === 'done') this.onState({ state: this.link ? 'connected' : 'waiting', loaded: this.loaded, tokens: this.tokens });
+    this.reply(d);
+  }
+
+  stop() {
+    this.worker.removeEventListener('message', this.onWorker);
+    this.link?.close();
+  }
+}
+
+/**
+ * The phone's side: an object the page uses as its worker, whose messages go to the computer's
+ * worker. Messages wait while the computer is not connected; `onConnection(state, info)` says
+ * when it connects ('connected', with the model it has loaded) and goes ('disconnected').
+ */
+export class RemoteWorker {
+  constructor({ onConnection = () => {} } = {}) {
+    this.onConnection = onConnection;
+    this.listeners = new Set();
+    this.onmessage = null;
+    this.onerror = null;
+    this.queue = [];
+    this.link = null;
+  }
+
+  attach(link) {
+    this.link = link;
+    link.onMessage = (m) => {
+      if (m.t === 'w' && m.m) this.emit(m.m);
+      else if (m.t === 'host') this.onConnection('connected', { loaded: m.loaded || null });
+    };
+    for (const msg of this.queue.splice(0)) link.send({ t: 'w', m: msg }).catch(() => {});
+  }
+
+  detach(link) {
+    if (this.link !== link) return;
+    this.link = null;
+    this.onConnection('disconnected', {});
+  }
+
+  emit(data) {
+    const event = { data };
+    this.onmessage?.(event);
+    for (const l of this.listeners) l(event);
+  }
+
+  postMessage(msg) {
+    if (msg?.type === 'load' && msg.source?.kind === 'file') {
+      queueMicrotask(() => this.emit({ type: 'error', during: 'load', message: 'Files on this phone cannot be opened by your computer. Choose a model from Hugging Face or one saved on the computer.' }));
+      return;
+    }
+    // Only plain data crosses (transfers and files do not).
+    const plain = JSON.parse(JSON.stringify(msg));
+    if (this.link?.open) this.link.send({ t: 'w', m: plain }).catch(() => this.queue.push(plain));
+    else this.queue.push(plain);
+  }
+
+  addEventListener(type, l) {
+    if (type === 'message') this.listeners.add(l);
+  }
+
+  removeEventListener(type, l) {
+    if (type === 'message') this.listeners.delete(l);
+  }
+
+  terminate() {}
 }

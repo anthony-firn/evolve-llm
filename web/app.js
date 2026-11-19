@@ -5,7 +5,17 @@ import { wantsDevelopment, wantsSnakeStarter, wantsBrowser, developmentSummary, 
 
 const $ = (id) => document.getElementById(id);
 const app = $('app');
-let worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+// A page opened from a "use this computer" link (#remote=CODE) runs nothing itself: its worker
+// is the computer's, reached over the paired connection (see devices.mjs).
+const REMOTE_CODE = (() => {
+  const c = new URLSearchParams(location.hash.slice(1)).get('remote');
+  return c ? c.toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 24) : null;
+})();
+const remoteWorker = REMOTE_CODE ? new (await import('./devices.mjs')).RemoteWorker({ onConnection: (s, info) => onRemoteConnection(s, info) }) : null;
+const newWorker = () => remoteWorker || new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+let worker = newWorker();
+if (REMOTE_CODE) app.dataset.remote = '';
+const IS_MOBILE = navigator.userAgentData?.mobile ?? /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
 
 const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', cacheGb: 10, share: false, shareUpload: 2, internet: false, jinaKey: '' };
 const SUGGESTIONS = [
@@ -63,6 +73,9 @@ function el(tag, attrs = {}, ...children) {
 function setPhase(phase) {
   state.phase = phase;
   app.dataset.phase = phase;
+  // A phone using its computer keeps its screen on while the computer works for it: a locked
+  // phone drops the connection.
+  if (REMOTE_CODE) keepAwake(['loading', 'generating', 'agent', 'preparing'].includes(phase));
   const ready = phase === 'ready';
   const agentBusy = phase === 'agent' || phase === 'preparing';
   const generating = phase === 'generating' || (agentBusy && Boolean(state.live?.development));
@@ -112,7 +125,7 @@ function showGpu(adapter) {
     return;
   }
   chip.dataset.state = adapter.fallback ? 'warn' : 'ok';
-  $('gpu-name').textContent = describeGpu(adapter);
+  $('gpu-name').textContent = REMOTE_CODE ? `Your computer · ${describeGpu(adapter)}` : describeGpu(adapter);
   chip.title = `Largest GPU buffer ${formatBytes(adapter.maxBufferSize)}`;
   if (adapter.fallback) {
     notice.className = 'notice';
@@ -261,7 +274,7 @@ async function startLoad(source) {
     }
   }
   stopSharing();
-  const share = Boolean(source.stream && state.settings.share && source.parts?.length);
+  const share = Boolean(!REMOTE_CODE && source.stream && state.settings.share && source.parts?.length);
   if (share) await startSharing(source);
   state.split = helpers.length ? { source, helpers, pending: null, plan: null } : null;
   worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx), gpu: state.settings.gpu, gpuMemory: state.settings.gpuMemory, cacheGb: Number(state.settings.cacheGb), share, split: helpers.length ? helpers.map((h) => h.capacity) : null });
@@ -294,6 +307,7 @@ async function startPairing() {
   await pairing.start();
   remember('evolve-llm-pairing', '1');
   $('pair-link').value = `${location.origin}${location.pathname}#pair=${code}`;
+  $('pair-qr').innerHTML = (await import('./qr.mjs')).qrSvg($('pair-link').value, { title: 'Pairing link' });
   renderDevices();
 }
 
@@ -369,7 +383,8 @@ async function startHelping(code) {
   const { Helping, Pairing } = await import('./devices.mjs');
   const { capacityOf } = await import('./split.mjs');
   const o = networkOverrides();
-  const about = { name: deviceName(), capacity: capacityOf(state.settings.gpuMemory), gpu: state.adapter.description || '' };
+  const about = { name: deviceName(), capacity: capacityOf(state.settings.gpuMemory, IS_MOBILE), gpu: state.adapter.description || '' };
+  keepAwake(true);
   const show = (s) => { $('helping-status').textContent = s; };
   pairing = new Pairing({
     code,
@@ -393,6 +408,125 @@ async function startHelping(code) {
   });
   await pairing.start();
 }
+
+// ---- A phone using this computer, and this phone using a computer ----
+
+let hostPairing = null;
+let hosting = null;
+async function startHosting() {
+  if (hostPairing) return;
+  const { Hosting, Pairing, newCode } = await import('./devices.mjs');
+  const code = recall('evolve-llm-host-code') || newCode();
+  remember('evolve-llm-host-code', code);
+  const o = networkOverrides();
+  const links = new Map();
+  hostPairing = new Pairing({
+    code,
+    role: 'host',
+    ...(Array.isArray(o.relays) && { relays: o.relays }),
+    ...(Array.isArray(o.iceServers) && { iceServers: o.iceServers }),
+    onLink: (link, id) => {
+      links.set(id, link);
+      // The phone drives this page's worker from now on, starting with the model loaded here.
+      if (!hosting) {
+        if (['generating', 'agent', 'preparing'].includes(state.phase)) worker.postMessage({ type: 'stop' });
+        stopSharing();
+        hosting = new Hosting({ worker, onState: renderHosting });
+        hosting.loaded = state.loaded ? state.lastLoaded : null;
+        state.hosting = true;
+        const dlg = $('hosting');
+        dlg.addEventListener('cancel', (e) => e.preventDefault());
+        dlg.showModal();
+        keepAwake(true);
+      }
+      hosting.attach(link);
+    },
+    onClose: (id) => { hosting?.detach(links.get(id)); links.delete(id); },
+  });
+  await hostPairing.start();
+  remember('evolve-llm-hosting', '1');
+  const link = `${location.origin}${location.pathname}#remote=${code}`;
+  $('host-link').value = link;
+  $('host-qr').innerHTML = (await import('./qr.mjs')).qrSvg(link, { title: 'Link for your phone' });
+  $('host-info').hidden = false;
+  $('host-start').hidden = true;
+}
+
+function stopHosting() {
+  hostPairing?.stop();
+  hostPairing = null;
+  try { localStorage.removeItem('evolve-llm-hosting'); } catch { /* storage unavailable */ }
+  $('host-info').hidden = true;
+  $('host-start').hidden = false;
+  if (hosting) {
+    hosting.stop();
+    hosting = null;
+    state.hosting = false;
+    $('hosting').close();
+    keepAwake(false);
+    restartEngine('Your phone no longer uses this computer.');
+  }
+}
+
+function renderHosting({ state: s, loaded, tokens }) {
+  const what = loaded ? `${loaded.chat?.name || 'A model'} is loaded` : 'No model is loaded yet';
+  $('hosting-status').textContent = s === 'connected'
+    ? `Connected to your phone. ${what}${tokens ? ` · ${tokens.toLocaleString()} tokens written` : ''}.`
+    : `Waiting for your phone to reconnect. ${what}.`;
+}
+
+// The phone's side of the connection.
+let remoteNotice = null;
+async function startRemote() {
+  const { Pairing } = await import('./devices.mjs');
+  const o = networkOverrides();
+  const links = new Map();
+  pairing = new Pairing({
+    code: REMOTE_CODE,
+    role: 'remote',
+    ...(Array.isArray(o.relays) && { relays: o.relays }),
+    ...(Array.isArray(o.iceServers) && { iceServers: o.iceServers }),
+    onLink: (link, id) => { links.set(id, link); remoteWorker.attach(link); },
+    onClose: (id) => { remoteWorker.detach(links.get(id)); links.delete(id); },
+  });
+  await pairing.start();
+  remember('evolve-llm-remote-code', REMOTE_CODE);
+  $('gpu-name').textContent = 'Connecting to your computer…';
+}
+
+async function onRemoteConnection(s, info) {
+  if (s === 'connected') {
+    remoteNotice = null;
+    $('status-line').textContent = 'Connected to your computer: models run on its GPU, and this phone shows the conversation.';
+    // Show the model the computer already has loaded, once its GPU is described.
+    for (let i = 0; i < 50 && !state.adapter; i++) await new Promise((r) => setTimeout(r, 100));
+    if (info.loaded && !state.loaded && ['idle', 'starting'].includes(state.phase)) onLoaded(info.loaded);
+  } else {
+    remoteNotice = 'Lost the connection to your computer. Reconnecting…';
+    if (['generating', 'agent', 'preparing', 'loading'].includes(state.phase)) {
+      finishAgent(new Error('The connection to your computer was lost.'));
+      onError({ during: state.phase === 'loading' ? 'load' : 'generate', message: 'The connection to your computer was lost. Keep this page open and the screen on while it works.' });
+    }
+    $('status-line').textContent = remoteNotice;
+  }
+}
+
+// Screen wake lock while this device works for another (or a phone waits on its computer).
+let wakeLock = null;
+let wantAwake = false;
+async function keepAwake(on) {
+  wantAwake = on;
+  try {
+    if (on && !wakeLock && navigator.wakeLock && document.visibilityState === 'visible') {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } else if (!on && wakeLock) {
+      await wakeLock.release();
+      wakeLock = null;
+    }
+  } catch { /* not allowed now (battery saver, or the page is hidden) */ }
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && wantAwake) keepAwake(true); });
 
 function deviceName() {
   const ua = navigator.userAgent;
@@ -501,7 +635,9 @@ function formatDuration(s) {
   return `${(s / 3600).toFixed(1)} h`;
 }
 
-function onLoaded({ model, chat, source }) {
+function onLoaded(msg) {
+  const { model, chat, source } = msg;
+  state.lastLoaded = msg;
   const label = state.loading?.label || chat.name;
   state.loaded = { ...source, key: state.loading?.key ?? source.key, label, info: model, chat, stream: Boolean(state.loading?.stream) };
   state.loading = null;
@@ -783,8 +919,9 @@ function onError({ during, message }) {
 
 function onWorkerMessage(event) {
   const msg = event.data;
-  // While lending this device to another, its worker answers that device (see devices.mjs).
-  if (state.helping && msg.type !== 'adapter') return;
+  // While lending this device to another, or letting a phone use it, its worker answers that
+  // device (see devices.mjs).
+  if ((state.helping || state.hosting) && msg.type !== 'adapter') return;
   if (msg.requestId) {
     if (!agentRequest || msg.requestId !== agentRequest.id) return;
     if (msg.type === 'agent_event' && msg.event.type === 'token') agentRequest.onToken?.(msg.event.text);
@@ -1003,7 +1140,7 @@ function restartEngine(reason) {
   stopSharing();
   state.helpers?.unloadAll();
   worker.terminate();finishAgent(new Error(reason));state.loaded=null;state.loading=null;
-  worker=new Worker(new URL('./worker.js',import.meta.url),{type:'module'});worker.onmessage=onWorkerMessage;worker.onerror=onWorkerError;
+  worker=newWorker();worker.onmessage=onWorkerMessage;worker.onerror=onWorkerError;
   setPhase('starting');worker.postMessage({type:'hello',gpu:state.settings.gpu});$('status-line').textContent=reason+' Choose a saved model to reload it.';
 }
 // Time limits for Pi, in ms (0: none). A model read from Hugging Face can take minutes to hours
@@ -1059,8 +1196,20 @@ $('chat-mode').addEventListener('change',()=>remember('evolve-llm-chat-mode',$('
 worker.postMessage({ type: 'hello', gpu: state.settings.gpu });
 {
   const code = new URLSearchParams(location.hash.slice(1)).get('pair');
-  if (code) startHelping(code.toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 24));
-  else if (recall('evolve-llm-pairing') === '1') startPairing().catch(() => {});
+  if (REMOTE_CODE) {
+    // This page is a screen for the computer: pairing and sharing are the computer's business.
+    document.querySelector('.settings fieldset.devices').hidden = true;
+    $('models-intro').textContent = 'These run on your computer: each downloads once from Hugging Face to it, and the list shows what it has saved. This phone shows the conversation.';
+    startRemote().catch((e) => { $('status-line').textContent = `Could not reach your computer: ${e.message || e}`; });
+  } else if (code) startHelping(code.toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 24));
+  else {
+    if (recall('evolve-llm-pairing') === '1') startPairing().catch(() => {});
+    if (recall('evolve-llm-hosting') === '1') startHosting().catch(() => {});
+  }
+  $('host-start').addEventListener('click', () => startHosting().catch((e) => { $('status-line').textContent = `Could not start: ${e.message || e}`; }));
+  $('host-stop').addEventListener('click', stopHosting);
+  $('hosting-stop').addEventListener('click', stopHosting);
+  $('host-copy').addEventListener('click', () => navigator.clipboard?.writeText($('host-link').value).catch(() => {}));
   $('pair-start').addEventListener('click', () => startPairing().catch((e) => { $('status-line').textContent = `Pairing could not start: ${e.message || e}`; }));
   $('pair-stop').addEventListener('click', stopPairing);
   $('pair-copy').addEventListener('click', () => navigator.clipboard?.writeText($('pair-link').value).catch(() => {}));

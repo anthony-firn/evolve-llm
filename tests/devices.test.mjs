@@ -157,3 +157,49 @@ test('pairing: devices with the code connect (never two helpers), and a pass goe
   assert.deepEqual([...out], [3, 4, 5]);
   for (const p of pages) p.stop();
 });
+
+test('a phone drives the computer\'s worker: messages relay both ways, files and page services stay local', async () => {
+  const { Hosting, RemoteWorker } = await import('../web/devices.mjs');
+  const [a, b, open] = channelPair();
+  // The computer's worker: answers hello and generate; tells its page about cached pieces.
+  const listeners = new Set();
+  const emit = (data) => queueMicrotask(() => listeners.forEach((l) => l({ data })));
+  const posted = [];
+  const worker = {
+    addEventListener: (_, l) => listeners.add(l),
+    removeEventListener: (_, l) => listeners.delete(l),
+    postMessage(m) {
+      posted.push(m);
+      if (m.type === 'hello') emit({ type: 'adapter', adapter: { ok: true, description: 'Test GPU' } });
+      if (m.type === 'load') { emit({ type: 'swarm-have', file: 0, offset: 0, len: 1 }); emit({ type: 'loaded', model: {}, chat: { name: 'Tiny' }, source: { kind: 'hf', key: 'k' } }); }
+      if (m.type === 'generate') { emit({ type: 'token', text: 'Hi' }); emit({ type: 'done' }); }
+    },
+  };
+  const hosting = new Hosting({ worker });
+  const states = [];
+  const phone = new RemoteWorker({ onConnection: (s, info) => states.push([s, info.loaded?.chat?.name ?? null]) });
+  const seen = [];
+  phone.onmessage = (e) => seen.push(e.data.type);
+  phone.postMessage({ type: 'hello', gpu: 'high-performance' }); // before connecting: queued
+  phone.postMessage({ type: 'load', source: { kind: 'file', files: [] } });
+  open();
+  hosting.attach(new Link(a));
+  phone.attach(new Link(b));
+  await settle();
+  phone.postMessage({ type: 'swarm', on: true });
+  phone.postMessage({ type: 'load', source: { kind: 'hf', key: 'k' }, share: true, split: [1e9] });
+  phone.postMessage({ type: 'generate', messages: [] });
+  await settle();
+  assert.deepEqual(posted.map((m) => m.type), ['hello', 'load', 'generate'], 'page services are not the phone\'s to switch on');
+  assert.equal(posted[1].share, false);
+  assert.equal(posted[1].split, null);
+  assert.deepEqual(seen, ['error', 'adapter', 'loaded', 'token', 'done'], 'phone files are refused; the swarm bookkeeping stays on the computer');
+  assert.deepEqual(states, [['connected', null]]);
+  // A phone that reconnects learns which model the computer has loaded.
+  const [c, d, open2] = channelPair();
+  open2();
+  hosting.attach(new Link(c));
+  phone.attach(new Link(d));
+  await settle();
+  assert.deepEqual(states.at(-1), ['connected', 'Tiny']);
+});

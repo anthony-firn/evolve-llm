@@ -11,6 +11,8 @@ import { TOOL_SCHEMAS, displayText, parseToolCalls, rawPiece, runTool, schemaTyp
 const CHUNK = 16 << 20; // bytes read from the file per upload call
 const post = (type, data = {}) => self.postMessage({ type, ...data });
 
+const MOBILE = navigator.userAgentData?.mobile ?? /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+
 let wasm = null;
 let chat = null;
 // Layers this device runs for the chat on another of the person's devices.
@@ -140,6 +142,8 @@ function httpError(status) {
 }
 
 // Download every part of a model into storage, resuming partial parts. Returns the part names.
+const FULL = 'This browser ran out of storage for the model. Remove a downloaded model in the list, or allow this site more storage, then choose the model again.';
+
 async function download(entry) {
   if (!navigator.storage?.getDirectory) throw new Error('This browser cannot store downloaded models. Open a GGUF file from your device instead.');
   const dir = await modelsDir();
@@ -197,7 +201,15 @@ async function download(entry) {
           throw new Error('The connection dropped. Choose the model again to resume the download.');
         }
         if (chunk.done) break;
-        access.write(chunk.value, { at: pos });
+        // A write that stops short (or throws) means this browser's storage is full: the file
+        // would otherwise be marked complete with a hole at the end.
+        let wrote;
+        try {
+          wrote = access.write(chunk.value, { at: pos });
+        } catch (e) {
+          throw new Error(e?.name === 'QuotaExceededError' ? FULL : `Could not store the model: ${e?.message || e}`);
+        }
+        if (wrote !== chunk.value.byteLength) throw new Error(FULL);
         pos += chunk.value.byteLength;
         done += chunk.value.byteLength;
         const now = performance.now();
@@ -208,6 +220,7 @@ async function download(entry) {
         }
       }
       access.flush();
+      if (access.getSize() !== pos) throw new Error(FULL);
     } finally {
       access.close();
       downloadAbort = null;
@@ -354,8 +367,9 @@ async function loadModel(source, wantCtx, lowPower, budgetPref, { stage = null, 
   }
   post('inspected', { model });
   const ctx = Math.max(256, Math.min(wantCtx, model.config.ctx_train));
-  // Auto keeps models up to 4 GB fully on the GPU and streams the rest of larger ones.
-  const AUTO = 4 * 2 ** 30;
+  // Auto keeps models up to 4 GB (1.5 GB on a phone) fully on the GPU and streams the rest of
+  // larger ones.
+  const AUTO = capacityOf('auto', MOBILE);
   const budget = budgetPref === 'all' ? null
     : budgetPref && budgetPref !== 'auto' ? Number(budgetPref) * 2 ** 30
     : (model.fast_bytes > AUTO ? AUTO : null);
@@ -363,7 +377,7 @@ async function loadModel(source, wantCtx, lowPower, budgetPref, { stage = null, 
   // embedding, the head and the first layers, and the page has the others load the rest.
   if (split?.length) {
     const lb = JSON.parse(layer_bytes(headers));
-    const stages = planSplit(lb, [capacityOf(budgetPref), ...split]);
+    const stages = planSplit(lb, [capacityOf(budgetPref, MOBILE), ...split]);
     const helpers = stages.slice(1).map((s, helper) => ({ helper, stage: { first: s.first, end: s.end, embed: false, head: false } })).filter((h) => h.stage.end > h.stage.first);
     if (helpers.length) stage = { first: 0, end: stages[0].end, embed: true, head: true };
     post('split-plan', { helpers, ctx, n_layer: lb.n_layer, mine: stage });
