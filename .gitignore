@@ -13,3 +13,8 @@ node_modules
 /web/browser-pkg/
 /web/browser-fonts/
 /web/browser-tor/
+/vm/target/
+/vm/programs/target/
+/web/vm/kernel/
+/web/vm/bin/
+/web/vm/programs.json
