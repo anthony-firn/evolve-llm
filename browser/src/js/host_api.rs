@@ -16,6 +16,7 @@ type HostFn = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
 
 pub fn install(ctx: &mut Context) -> JsResult<()> {
     let fns: &[(&str, HostFn, usize)] = &[
+        ("identity", identity, 0),
         ("info", info, 1),
         ("parent", parent, 1),
         ("children", children, 1),
@@ -98,6 +99,10 @@ pub fn install(ctx: &mut Context) -> JsResult<()> {
 }
 
 // ---- argument helpers ----
+
+fn identity(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    Ok(js_str(&with_host(|_, s| s.identity.navigator_json()).unwrap_or_default()))
+}
 
 fn arg_num(args: &[JsValue], i: usize) -> f64 {
     args.get(i).and_then(|v| v.as_number()).unwrap_or(f64::NAN)

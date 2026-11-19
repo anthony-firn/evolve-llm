@@ -187,7 +187,7 @@ enum ExchangeError {
 
 pub struct Client {
     route: RefCell<Route>,
-    tls: Arc<rustls::ClientConfig>,
+    tls: std::cell::RefCell<Arc<rustls::ClientConfig>>,
     pub jar: RefCell<cookie_store::CookieStore>,
     pool: RefCell<HashMap<String, Vec<Conn>>>,
     active: RefCell<HashMap<String, usize>>,
@@ -200,18 +200,14 @@ pub struct Client {
     pub log: RefCell<Vec<LogEntry>>,
 }
 
-pub fn tls_config() -> Arc<rustls::ClientConfig> {
-    let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("TLS versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Arc::new(config)
-}
 
 impl Client {
+    pub fn set_tls_profile(&self, profile: &str) -> Result<(), &'static str> {
+        *self.tls.borrow_mut() = super::tls::config(profile)?;
+        self.pool.borrow_mut().clear();
+        Ok(())
+    }
+
     pub fn new(relay_url: &str, cookies_json: Option<&str>) -> Self {
         let psl = Some(policy::suffix_list().clone());
         let jar = cookies_json
@@ -220,15 +216,13 @@ impl Client {
             .unwrap_or_else(|| cookie_store::CookieStore::new_with_public_suffix(psl));
         Client {
             route: RefCell::new(Route::new(relay_url)),
-            tls: tls_config(),
+            tls: RefCell::new(super::tls::config("default").expect("default TLS profile")),
             jar: RefCell::new(jar),
             pool: RefCell::default(),
             active: RefCell::default(),
             waiters: RefCell::default(),
             seq: Cell::new(0),
-            user_agent: RefCell::new(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 EvolveBrowser/0.1".into(),
-            ),
+            user_agent: RefCell::new(crate::identity::Identity::default().user_agent().into()),
             accept_language: RefCell::new("en-US,en;q=0.9".into()),
             cookies_changed: Cell::new(false),
             log: RefCell::default(),
@@ -560,7 +554,8 @@ impl Client {
             Route::Wisp(m) => Stream::Wisp(m.connect(host, port).await?),
         };
         let io = if tls {
-            match with_timeout(TlsConn::connect(stream, host, self.tls.clone()), 20_000).await {
+            let config = self.tls.borrow().clone();
+            match with_timeout(TlsConn::connect(stream, host, config), 20_000).await {
                 Some(r) => Io::Tls(Box::new(r?)),
                 None => return Err(format!("The TLS handshake with {host} timed out")),
             }

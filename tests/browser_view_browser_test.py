@@ -152,6 +152,29 @@ def check(runtime):
                 browser.close()
                 return
 
+            # Profile controls restart the actual WASM worker and reload the page.
+            client_call(page, "b.ready")
+            client_call(page, "b.navigate('about:blank')")
+            client_call(page, "b.waitForIdle()")
+            page.locator('.browser-relay').click()
+            page.get_by_label('User-agent profile', exact=True).select_option('firefox-esr')
+            page.get_by_label('TLS profile', exact=True).select_option('firefox-order')
+            page.get_by_role('button', name='Apply profiles and reload').click()
+            page.wait_for_selector('.browser-relay-settings', state='hidden', timeout=60000)
+            client_call(page, "b.waitForIdle()")
+            assert 'Firefox/153.0' in client_call(page, "b.evaluate('navigator.userAgent')")
+            assert client_call(page, "b.evaluate('typeof navigator.userAgentData')") == '\"undefined\"'
+            assert page.locator('.browser-canvas').count() == 1
+            page.set_viewport_size({'width': 390, 'height': 850})
+            page.locator('.browser-relay').click()
+            assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            page.get_by_label('User-agent profile', exact=True).select_option('legacy')
+            page.get_by_label('TLS profile', exact=True).select_option('default')
+            page.get_by_role('button', name='Apply profiles and reload').click()
+            page.wait_for_selector('.browser-relay-settings', state='hidden', timeout=60000)
+            page.set_viewport_size({'width': 1440, 'height': 850})
+            assert not errors, errors
+
             site = fixture_server()
             site_url = f"http://127.0.0.1:{site.server_address[1]}/"
             relay, relay_url = start_relay(f"http://127.0.0.1:{port}", site.server_address[1])

@@ -89,6 +89,7 @@ struct HistoryEntry {
 }
 
 pub struct Engine {
+    identity: crate::identity::Identity,
     pub css_width: u32,
     pub css_height: u32,
     pub dpr: f32,
@@ -117,6 +118,18 @@ pub struct Engine {
 }
 
 impl Engine {
+    pub fn can_configure(&self) -> bool { self.page.is_none() && self.pending.is_none() }
+
+    /// Select an identity before navigation so every realm uses the same profile.
+    pub fn set_identity(&mut self, profile: &str) -> Result<(), &'static str> {
+        let identity = crate::identity::Identity::parse(profile)?;
+        if !self.can_configure() {
+            return Err("Select the browser identity before navigating; restart the browser to change it");
+        }
+        self.identity = identity;
+        Ok(())
+    }
+
     pub fn new(fonts: parley::FontContext, storage_json: Option<&str>) -> Self {
         let mut local = HashMap::new();
         if let Some(json) = storage_json {
@@ -151,6 +164,7 @@ impl Engine {
             suppress_text: None,
             last_url_event: String::new(),
             last_title: String::new(),
+            identity: crate::identity::Identity::default(),
         }
     }
 
@@ -443,6 +457,7 @@ impl Engine {
         let local = self.local.entry(origin.clone()).or_default().clone();
         let session = self.session.entry(origin).or_default().clone();
         let mut state = PageState::new(id, url.clone(), referrer, local, session);
+        state.identity = self.identity;
         state.viewport = (self.css_width as f32, self.css_height as f32, self.dpr);
         state.now = crate::clock::now();
         let js = match JsRuntime::new(id, &url).and_then(|js| {

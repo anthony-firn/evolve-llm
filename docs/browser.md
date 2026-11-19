@@ -205,6 +205,63 @@ It starts a separate sign-in in the visitor's regular browser, retaining only th
 language and return destination. It does not copy panel session tokens or sign the panel in,
 and it does not rewrite OAuth grant URLs or account challenges.
 
+## User-agent and TLS experiments
+
+Open the route button (Tor/Relay) and use **Compatibility experiments**. The user-agent
+profiles are the existing Chrome 131 + Evolve identity (default), plain Chrome 131,
+Firefox ESR 153, Firefox 160 and EvolveBrowser only. Firefox version labels were checked
+against [Mozilla's release data](https://product-details.mozilla.org/1.0/firefox_versions.json)
+on 2026-11-19. The HTTP User-Agent and `navigator.userAgent` use the same profile;
+Firefox profiles also omit Chromium client hints, deviceMemory and navigator.connection.
+These are content-negotiation experiments, not implementations of those browsers.
+
+**Apply profiles and reload** restarts only this panel and reloads its current URL. Cookies
+and localStorage survive; page state, history and sessionStorage do not. Defaults remain
+unchanged. The same controls are available with `BrowserClient.setProfiles(identity, tls)`.
+
+The `firefox-order` TLS experiment orders only the AEAD suites our existing rustls/ring stack
+supports according to [NSS's preference list](https://github.com/nss-dev/nss/blob/master/lib/ssl/ssl3con.c).
+It retains certificate and hostname verification, TLS 1.2/1.3 and HTTP/1.1. It does **not**
+match Firefox's complete ClientHello: extension ordering, key shares, ECH, certificate
+compression and resumption differ, and HTTP/2 is not implemented. We do not advertise h2
+without an HTTP/2 implementation. rustls does not expose general browser fingerprint
+emulation through its standard configuration API.
+
+The opt-in comparison below records real TLS fingerprints and submits only a synthetic
+nonexistent identifier to Google's modern and basic forms. It never enters a real account,
+password or verification code. Real-account acceptance is a separate, unverified question.
+The diagnostic service receives the request's Tor exit address and user-agent; saved results
+omit IPs, cookies and Google session URLs.
+
+```sh
+python3 -B tests/browser_identity_live_test.py --runtime web --output /tmp/browser-identities.json
+```
+
+The 2026-11-19 run used fresh browser profiles over Tor and a synthetic `example.invalid`
+identifier. Every basic-form run returned account-not-found. Modern-form observations:
+
+| Identity | TLS | Modern form |
+| --- | --- | --- |
+| Existing Chrome + Evolve | Default | Stalled for 15 seconds after Next |
+| Firefox ESR 153 | Default | Stalled for 15 seconds after Next |
+| Firefox 160 | Default | Form-load timeout |
+| Plain Chrome 131 | Default | Stalled for 15 seconds after Next |
+| EvolveBrowser only | Default | Stalled for 15 seconds after Next |
+| Firefox ESR 153 | NSS cipher order | Stalled for 15 seconds after Next |
+
+The external TLS diagnostic confirmed the NSS cipher ordering on the wire and matching HTTP
+and JavaScript UA strings. All engine cases negotiated HTTP/1.1; installed Chrome negotiated
+HTTP/2 and had a different ClientHello. The native Chrome baseline used a direct connection,
+and Tor exit addresses were not held constant across engine cases, so this is exploratory
+evidence, not an isolated study of Google's checks. No profile demonstrated authentication.
+The live bad-certificate endpoint was unreachable through the test Tor exit; an in-memory
+client/server handshake test verifies that both TLS profiles reject an untrusted certificate.
+
+Google's [browser requirements](https://developers.googleblog.com/guidance-to-developers-affected-by-our-effort-to-block-less-secure-browsers-and-applications/)
+require a clear browser identity and prohibit using another browser's user-agent on its
+account host. Experimental UA results do not establish support or make this panel a supported
+Google authentication client.
+
 ## Limits
 
 - **JavaScript is interpreted.** Boa has no JIT, so script-heavy apps are slow and some large
@@ -225,7 +282,7 @@ and it does not rewrite OAuth grant URLs or account challenges.
   manager do not reach pages inside the engine.
 - **Rendering:** Blitz 0.3 is a beta. Some whitespace between inline elements collapses, icon
   spacing in flex layouts can differ, and there is no printing.
-- **Size:** the engine is 18.6 MB of WebAssembly after `wasm-opt`, plus 8.6 MB of fonts, both
+- **Size:** the engine is 21.0 MB of WebAssembly after `wasm-opt`, plus 8.6 MB of fonts, both
   downloaded once.
 
 ## Build and test

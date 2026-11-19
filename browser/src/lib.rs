@@ -13,6 +13,7 @@ pub mod clock;
 pub mod engine;
 pub mod fonts;
 pub mod host;
+pub mod identity;
 pub mod js;
 pub mod net;
 #[cfg(not(target_arch = "wasm32"))]

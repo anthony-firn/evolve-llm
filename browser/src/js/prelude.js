@@ -7,7 +7,8 @@
   delete globalThis.__h;
   const G = globalThis;
   const ID = Symbol('node');
-  const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 EvolveBrowser/0.1';
+  const identity = JSON.parse(H.identity());
+  const UA = identity.userAgent;
   const define = (obj, props) => { for (const k of Object.keys(props)) Object.defineProperty(obj, k, { value: props[k], writable: true, configurable: true, enumerable: false }); };
   const getters = (obj, props) => { for (const k of Object.keys(props)) { const d = props[k]; Object.defineProperty(obj, k, typeof d === 'function' ? { get: d, configurable: true, enumerable: true } : Object.assign({ configurable: true, enumerable: true }, d)); } };
   const fmt = (v, depth = 0) => {
@@ -1666,7 +1667,7 @@
     back() { H.history(2, '-1', ''); }, forward() { H.history(2, '1', ''); }, go(n = 0) { H.history(2, String(n | 0), ''); },
   };
   const navigator = {
-    userAgent: UA, appVersion: UA.slice(8), appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko', productSub: '20030107', vendor: 'Google Inc.', vendorSub: '',
+    userAgent: UA, appVersion: identity.appVersion, appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko', productSub: '20030107', vendor: identity.vendor, vendorSub: '',
     platform: 'Linux x86_64', language: 'en-US', languages: ['en-US', 'en'], onLine: true, cookieEnabled: true, doNotTrack: null, hardwareConcurrency: 4, deviceMemory: 8, maxTouchPoints: 0,
     webdriver: false, pdfViewerEnabled: false, plugins: Object.assign([], { item() { return null; }, namedItem() { return null; }, refresh() {} }), mimeTypes: Object.assign([], { item() { return null; }, namedItem() { return null; } }),
     javaEnabled: () => false, sendBeacon(url, data) { const h = new Headers(); const b = bodyToHost(data == null ? null : data, h); const l = []; h.forEach((v, k) => l.push([k, v])); H.fetch(fetchSeq++, 'POST', new URL(String(url), document.baseURI).href, l, b, 'include', 'follow'); return true; },
@@ -1681,6 +1682,11 @@
     getGamepads: () => [], requestMediaKeySystemAccess: () => Promise.reject(new DOMException('Not supported', 'NotSupportedError')),
     registerProtocolHandler() {}, getBattery: () => Promise.resolve({ charging: true, level: 1, chargingTime: 0, dischargingTime: Infinity, addEventListener() {} }),
   };
+  if (!identity.chromium) {
+    delete navigator.userAgentData;
+    delete navigator.deviceMemory;
+    delete navigator.connection;
+  }
   const screen = {
     get width() { return Math.max(H.viewport()[0], 1280); }, get height() { return Math.max(H.viewport()[1], 800); }, get availWidth() { return this.width; }, get availHeight() { return this.height; },
     availLeft: 0, availTop: 0, colorDepth: 24, pixelDepth: 24, isExtended: false,

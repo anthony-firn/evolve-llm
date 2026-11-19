@@ -8,6 +8,29 @@ fn h() -> Harness {
 }
 
 #[test]
+fn identities_are_selected_before_navigation_and_survive_later_navigations() {
+    use evolve_browser::identity::Identity;
+    for profile in ["legacy", "firefox-esr", "firefox", "chrome", "evolve"] {
+        let mut t = h();
+        t.engine.set_identity(profile).unwrap();
+        t.site.add("https://a.test/", "text/html", "<script>window.initialUA = navigator.userAgent</script>");
+        t.site.add("https://b.test/", "text/html", "<p>another origin</p>");
+        t.open("https://a.test/");
+        let expected = serde_json::to_string(Identity::parse(profile).unwrap().user_agent()).unwrap();
+        assert_eq!(t.eval("initialUA"), expected);
+        assert!(t.engine.set_identity("evolve").is_err());
+        if profile.starts_with("firefox") {
+            assert_eq!(t.eval("navigator.vendor"), "\"\"");
+            assert_eq!(t.eval("'userAgentData' in navigator || 'deviceMemory' in navigator || 'connection' in navigator"), "false");
+            assert_eq!(t.eval("navigator.appVersion"), "\"5.0 (X11)\"");
+        }
+        t.open("https://b.test/");
+        assert_eq!(t.eval("navigator.userAgent"), expected);
+    }
+    assert!(Identity::parse("invalid\r\nInjected: yes").is_err());
+}
+
+#[test]
 fn renders_a_styled_page() {
     let mut t = h();
     t.site.add("https://a.test/", "text/html", "<!doctype html><title>Hello</title><style>body{background:#204080;margin:0} h1{color:white}</style><h1>Hi there</h1>");

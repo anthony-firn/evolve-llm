@@ -14,6 +14,14 @@ export const TOR_ROUTE = 'tor:';
 export const AUTO_ROUTE = 'auto';
 export const RELAY_DOCS = 'https://github.com/anthony-firn/evolve-llm/blob/main/docs/browser.md#how-pages-reach-websites';
 const RELAY_KEY = 'evolve-browser-relay';
+export const IDENTITY_PROFILES = Object.freeze({ legacy: 'Evolve + Chrome 131 (default)', 'firefox-esr': 'Firefox ESR 153 (experiment)', firefox: 'Firefox 160 (experiment)', chrome: 'Chrome 131 (experiment)', evolve: 'EvolveBrowser only' });
+export const TLS_PROFILES = Object.freeze({ default: 'rustls (default)', 'firefox-order': 'NSS cipher order (partial experiment)' });
+const IDENTITY_KEY = 'evolve-browser-identity';
+const TLS_KEY = 'evolve-browser-tls';
+function validProfile(profiles, value) {
+  if (!Object.hasOwn(profiles, value)) throw new TypeError('Unknown browser profile: ' + value);
+  return value;
+}
 
 /** True when this page is served from this computer (no Local Network Access prompt for a local relay). */
 export function isLocalOrigin(loc = globalThis.location) {
@@ -216,8 +224,10 @@ export class SelectMenu {
 const defaultWorker = () => new Worker(new URL('./browser-worker.mjs', import.meta.url), { type: 'module' });
 
 export class BrowserClient extends EventTarget {
-  constructor({ relayUrl, workerFactory = defaultWorker, persistence = indexedDbPersistence(), probe = probeRelay, timeoutMs = 30000, agentTimeoutMs = 25000 } = {}) {
+  constructor({ relayUrl, identityProfile, tlsProfile, workerFactory = defaultWorker, persistence = indexedDbPersistence(), probe = probeRelay, timeoutMs = 30000, agentTimeoutMs = 25000 } = {}) {
     super();
+    this.identityProfile = validProfile(IDENTITY_PROFILES, identityProfile ?? readSetting(IDENTITY_KEY) ?? 'legacy');
+    this.tlsProfile = validProfile(TLS_PROFILES, tlsProfile ?? readSetting(TLS_KEY) ?? 'default');
     this._workerFactory = workerFactory;
     this._persist = persistence;
     this._probe = probe;
@@ -278,7 +288,7 @@ export class BrowserClient extends EventTarget {
       event?.preventDefault?.();
       if (this._worker === worker) this._recover({ error: event?.message || 'The browser worker failed.' });
     };
-    const message = { type: 'init', relayUrl: this._state.relayUrl, cookies: saved.cookies ?? null, storage: saved.storage ?? null, torLog: readSetting('evolve-browser-tor-log') === '1', ...this._size };
+    const message = { type: 'init', identityProfile: this.identityProfile, tlsProfile: this.tlsProfile, relayUrl: this._state.relayUrl, cookies: saved.cookies ?? null, storage: saved.storage ?? null, torLog: readSetting('evolve-browser-tor-log') === '1', ...this._size };
     const transfer = [];
     const offscreen = this._ui?.takeOffscreen();
     if (offscreen) { message.canvas = offscreen; transfer.push(offscreen); }
@@ -462,6 +472,44 @@ export class BrowserClient extends EventTarget {
     this._ui?.status(`The browser engine stopped (${error}). Restarting…`, 'error');
     await this._start();
     if (url) this.request('navigate', { url }).catch(() => {});
+  }
+
+  /** Restart the panel before changing identities; cookies and localStorage survive. */
+  async setProfiles(identityProfile, tlsProfile = this.tlsProfile) {
+    validProfile(IDENTITY_PROFILES, identityProfile);
+    validProfile(TLS_PROFILES, tlsProfile);
+    if (this._profilesChanging) throw new Error('A browser profile change is already in progress');
+    if (identityProfile === this.identityProfile && tlsProfile === this.tlsProfile) return;
+    this._profilesChanging = true;
+    try {
+      await this._start();
+      await this.ready;
+      await this.persist();
+      const url = this._state.url;
+      const worker = this._worker;
+      this._worker = null;
+      this._starting = null;
+      worker?.terminate();
+      for (const [id, p] of this._pending) { clearTimeout(p.timer); p.reject(new Error('Browser profile changed')); this._pending.delete(id); }
+      this._closeSelect();
+      this.identityProfile = identityProfile;
+      this.tlsProfile = tlsProfile;
+      writeSetting(IDENTITY_KEY, identityProfile);
+      writeSetting(TLS_KEY, tlsProfile);
+      this._halted = false;
+      this._crashes = [];
+      this._state.loading = false;
+      this._state.network = null;
+      this._state.relayOk = null;
+      this._ready = new Promise((resolve, reject) => { this._readyResolve = resolve; this._readyReject = reject; });
+      this._ready.catch(() => {});
+      this._ui?.replaceCanvas();
+      await this._start();
+      await this.ready;
+      if (url) await this.navigate(url);
+    } finally {
+      this._profilesChanging = false;
+    }
   }
 
   // ---- navigation ----
@@ -661,6 +709,16 @@ class BrowserView {
       el('span', {}, el('strong', { text: title }), el('small', { text: detail })), ...(extra ? [extra] : []));
     this.communityList = el('div', { class: 'browser-route-community' });
     this.communityButton = el('button', { type: 'button', class: 'browser-button browser-button-quiet', text: 'Find community relays', onclick: () => this.findCommunityRelays() });
+    this.identitySelect = el('select', { 'aria-label': 'User-agent profile' }, ...Object.entries(IDENTITY_PROFILES).map(([value, text]) => el('option', { value, text })));
+    this.tlsSelect = el('select', { 'aria-label': 'TLS profile' }, ...Object.entries(TLS_PROFILES).map(([value, text]) => el('option', { value, text })));
+    this.identitySelect.value = client.identityProfile;
+    this.tlsSelect.value = client.tlsProfile;
+    this.profileApply = el('button', { type: 'button', class: 'browser-button', text: 'Apply profiles and reload', onclick: async () => {
+      this.profileApply.disabled = true;
+      try { await client.setProfiles(this.identitySelect.value, this.tlsSelect.value); this.toggleRelaySettings(false); }
+      catch (e) { this.status(String(e.message || e), 'error'); }
+      finally { this.profileApply.disabled = false; }
+    } });
     this.relaySettings = el('form', { class: 'browser-relay-settings', hidden: true, onsubmit: (e) => { e.preventDefault(); this.applyRoute(); } },
       el('fieldset', {}, el('legend', { text: 'How pages reach websites' }),
         option(AUTO_ROUTE, 'Automatic', isLocalOrigin() ? 'The relay on this computer when it is running, otherwise the Tor network.' : 'The Tor network. Nothing to install.'),
@@ -669,6 +727,10 @@ class BrowserView {
         el('div', { class: 'browser-route-group' }, el('div', { class: 'browser-route-head' }, el('strong', { text: 'Community relays' }), this.communityButton), this.communityList),
         option('custom', 'Another relay', '', this.relayInput)),
       el('div', { class: 'browser-route-actions' }, el('button', { type: 'submit', class: 'browser-button', text: 'Use' })),
+      el('fieldset', {}, el('legend', { text: 'Compatibility experiments' }),
+        el('label', { text: 'User-agent profile' }, this.identitySelect),
+        el('label', { text: 'TLS profile' }, this.tlsSelect),
+        el('small', { text: 'Changes the identity sent to sites and restarts this panel. Features remain those of Evolve. NSS ordering changes supported ciphers only; it does not reproduce Firefox TLS.' }), this.profileApply),
       el('p', { text: 'TLS runs inside the engine, so no relay or Tor exit can read pages, passwords or cookies on https:// sites. They see which sites you connect to: a relay also sees your address; Tor separates the two.' }));
     this.relayHelp = el('div', { class: 'browser-help', role: 'note', hidden: true },
       el('strong', { text: '' }),

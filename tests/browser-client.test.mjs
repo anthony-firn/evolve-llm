@@ -34,6 +34,32 @@ function memoryPersistence(initial = {}) {
 
 const client = (opts = {}) => new BrowserClient({ probe: async () => true, persistence: memoryPersistence(opts.saved), ...opts });
 
+test('profile changes restart the worker and restore cookies and localStorage before navigation', async () => {
+  const { workers, factory } = fakeWorkers(m => m.type === 'cookiesJson' ? 'C' : m.type === 'storageJson' ? 'S' : null);
+  const persistence = memoryPersistence();
+  const c = client({ workerFactory: factory, persistence });
+  await c.ready;
+  workers[0].emit([{ type: 'url', url: 'https://example.com/', canBack: false, canForward: false }]);
+  await c.setProfiles('firefox-esr', 'firefox-order');
+  assert.equal(workers[0].terminated, true);
+  const init = workers[1].messages[0];
+  assert.equal(init.identityProfile, 'firefox-esr');
+  assert.equal(init.tlsProfile, 'firefox-order');
+  assert.deepEqual([init.cookies, init.storage], ['C', 'S']);
+  assert.equal(workers[1].messages.find(m => m.type === 'navigate').url, 'https://example.com/');
+  assert.equal(c.identityProfile, 'firefox-esr');
+  await assert.rejects(c.setProfiles('invalid'), /Unknown/);
+  assert.equal(workers.length, 2);
+  c.dispose();
+});
+
+test('worker selects identity and TLS before it starts loading any page', async () => {
+  const engine = fakeEngine();
+  const h = hostHarness(engine);
+  await h.host.handle({ id: 1, type: 'init', relayUrl: 'tor:', identityProfile: 'firefox-esr', tlsProfile: 'firefox-order' });
+  assert.deepEqual(engine.calls.slice(1, 3), [['identity', 'firefox-esr'], ['tls', 'firefox-order']]);
+});
+
 test('external Google sign-in keeps the destination but starts a separate browser session', () => {
   for (const path of ['/v3/signin/identifier', '/v3/signin/rejected']) {
     const original = new URL(`https://accounts.google.com${path}?hl=en&flowName=GlifWebSignIn&service=mail&continue=https%3A%2F%2Fmail.google.com%2Fmail%2F&dsh=session&TL=token&idnf=private-identifier&epd=session-data`);
@@ -262,6 +288,8 @@ function fakeEngine({ panicOn } = {}) {
   class Browser {
     constructor(fonts, relay, cookies, storage, wake) { calls.push(['new', fonts.length, relay, cookies, storage]); this.wake = wake; this.frames = 0; }
     resize(...a) { calls.push(['resize', ...a]); }
+    setIdentity(value) { calls.push(['identity', value]); }
+    setTlsProfile(value) { calls.push(['tls', value]); }
     tick() { calls.push(['tick']); if (panicOn === 'tick') throw new Error('RuntimeError: unreachable'); return this.frames++ === 0 ? 16 : -1; }
     takeFrame() { return this.frames === 1 ? new Uint8Array(2 * 1 * 4).fill(255) : undefined; }
     frameWidth() { return 2; } frameHeight() { return 1; }

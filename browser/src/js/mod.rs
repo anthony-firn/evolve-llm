@@ -26,6 +26,7 @@ pub const PRELUDE: &str = include_str!("prelude.js");
 
 /// Per-page state the host API reads and writes while script runs.
 pub struct PageState {
+    pub identity: crate::identity::Identity,
     pub id: u64,
     pub url: Url,
     pub referrer: String,
@@ -62,6 +63,7 @@ pub enum HistoryOp {
 impl PageState {
     pub fn new(id: u64, url: Url, referrer: String, local: Rc<RefCell<HashMap<String, String>>>, session: Rc<RefCell<HashMap<String, String>>>) -> Self {
         PageState {
+            identity: crate::identity::Identity::default(),
             id,
             url,
             referrer,

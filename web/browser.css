@@ -99,3 +99,6 @@
 .browser-menu-option[aria-disabled="true"]{opacity:.45;cursor:default}
 .browser-menu-done{margin:6px 8px 2px}
 @media (pointer:coarse){.browser-menu-option{padding:10px 14px;font-size:15px}}
+
+.browser-relay-settings label:has(>select){display:grid;gap:5px;margin-bottom:7px}
+.browser-relay-settings select{max-width:100%;min-width:0;padding:7px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text);font:inherit}

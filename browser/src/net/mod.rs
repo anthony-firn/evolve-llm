@@ -2,6 +2,7 @@
 
 pub mod http;
 pub mod policy;
+pub mod tls;
 pub mod wisp;
 #[cfg(target_arch = "wasm32")]
 pub mod client;

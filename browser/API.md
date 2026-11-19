@@ -28,6 +28,9 @@ class Browser {
               storageJson: string | null, wake: () => void);
   resize(cssWidth: number, cssHeight: number, devicePixelRatio: number): void;
   setRelay(url: string): void;          // switch the route ("tor:" or ws(s)://); drops open connections
+  setIdentity(profile: 'legacy' | 'firefox-esr' | 'firefox' | 'chrome' | 'evolve'): void;
+  setTlsProfile(profile: 'default' | 'firefox-order'): void;
+  // Both profile setters are diagnostic and throw after navigation starts. Restart to change.
   prepareNetwork(): void;              // start connecting now (Tor: bridge + first circuit, ~5–20 s)
   setTorConsensus(baseUrls: string[]): void; // where consensus.txt.br / microdescriptors.txt.br live
   navigate(url: string): void;          // typed into the address bar; "example.com" → https://
@@ -136,7 +139,10 @@ The doc passed in is fully resolved (styles and layout up to date).
 export class BrowserClient extends EventTarget {
   // relayUrl: the default route setting ("auto" when omitted; see docs/browser.md). The person's
   // own choice is saved in localStorage and wins.
-  constructor(options?: { relayUrl?: string });
+  constructor(options?: { relayUrl?: string; identityProfile?: string; tlsProfile?: string });
+  identityProfile: string; tlsProfile: string;
+  setProfiles(identityProfile: string, tlsProfile?: string): Promise<void>;
+  // setProfiles persists cookies/localStorage, restarts the worker and reloads the current URL.
   mount(container: HTMLElement): void;   // address bar, canvas, status, agent overlay
   ready: Promise<void>;
   navigate(url: string): Promise<void>;
