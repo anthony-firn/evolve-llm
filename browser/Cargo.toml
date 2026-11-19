@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["svg", "woff", "accessibility", "floats"] }
 blitz-html = "=0.3.0-beta.4"
+html5ever = "=0.40.1"
 blitz-paint = { version = "=0.3.0-beta.4", default-features = false, features = ["svg"] }
 blitz-traits = "=0.3.0-beta.4"
 anyrender = "0.14"

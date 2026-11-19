@@ -130,6 +130,17 @@ A deployment can preset the default route in `web/browser-config.json`
   back after a reload. There is no profile sync.
 - The engine has no access to the workbench page, your real browser's cookies or saved passwords.
 
+HTML parsing uses scripting-enabled rules, including for `innerHTML`: markup inside `noscript`
+stays inert. In particular, a site's no-JavaScript fallback stylesheet cannot hide its scripted
+sign-in page. Dynamically inserted scripts with `async = false` download concurrently and run
+in insertion order; ordinary async scripts can still run while those scripts wait.
+
+Constructed `CSSStyleSheet` objects support `replaceSync`, `replace`, `insertRule`, `deleteRule`,
+disabling, media conditions and adoption by a document or shadow root. Shared sheets update all
+adopters. Rules are exposed as a live list of `CSSRule` objects with `cssText`; editing individual
+rule declarations and a complete grouping-rule CSSOM are not implemented. Shadow-root adoption
+uses the same light-DOM approximation as the rest of this engine.
+
 ## What works
 
 Measured in Chrome on Linux (1280×900 panel), over the **Tor route** with nothing installed
@@ -167,13 +178,22 @@ Diagnostics: setting `localStorage['evolve-browser-tor-log'] = '1'` logs the Tor
 (circuits, extends, streams) to the worker console, and `getBrowser().request('torStats')`
 returns byte and frame counters for each Snowflake layer.
 
-Tests: 16 engine tests (`cargo test --manifest-path browser/Cargo.toml --test engine`: scripts,
+Tests: 20 engine tests (`cargo test --manifest-path browser/Cargo.toml --test engine`: scripts,
 modules and import maps, DOM APIs, events, forms, timers, fetch, cookies, history, the select
 menu, the agent sharing a page), 16 unit tests for HTTP, Wisp, cookie and CORS rules and the
 snapshot, 29 relay tests (Wisp, limits, Nostr announcements with the BIP-340 vectors), 6 tests for
 finding community relays (`tests/relay-directory.test.mjs`), `tests/browser_view_browser_test.py`,
 which drives the real engine in Chrome through the relay with the agent and the person on the same
 page, and `tests/browser_tor_live_test.py`, which loads real sites over the live Tor network.
+
+`python3 -B tests/browser_google_live_test.py --runtime web --screens /tmp/google-ui` checks
+Google's public sign-in page over Tor: visible canvas pixels and the response to clicking Next
+with an empty identifier. It uses a temporary Chrome profile and never supplies account details.
+Passing this test establishes UI compatibility, not authenticated sign-in or Google approval of
+this client. Google can still reject an embedded browser or a Tor exit during authentication.
+The modern Google page rendered and responded to empty-field validation in 17.2 seconds in the
+2026-11-19 UTC run. No Google-specific CSS override or new browser-identity spoof was needed:
+the fixes are the parser's scripting flag, ordered dynamic scripts and constructed stylesheets.
 
 ## Limits
 

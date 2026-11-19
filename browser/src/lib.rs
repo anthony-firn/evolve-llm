@@ -21,3 +21,4 @@ pub mod testing;
 pub mod web;
 
 pub use engine::Engine;
+mod html;

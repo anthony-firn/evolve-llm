@@ -36,6 +36,8 @@ pub struct PageState {
     pub listened: HashSet<String>,
     /// `<script>` elements inserted by script, waiting to run
     pub dynamic_scripts: Vec<NodeId>,
+    /// Script-created elements start with force-async set, until the async setter clears it.
+    pub force_async_scripts: HashSet<NodeId>,
     /// Navigations requested by script: (url, replace)
     pub navigations: Vec<(String, bool)>,
     /// history.pushState/replaceState: (url, replace, state json)
@@ -68,6 +70,7 @@ impl PageState {
             animation_frame: false,
             listened: HashSet::new(),
             dynamic_scripts: vec![],
+            force_async_scripts: HashSet::new(),
             navigations: vec![],
             history: vec![],
             layout_dirty: true,
