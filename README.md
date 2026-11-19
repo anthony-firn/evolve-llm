@@ -145,6 +145,7 @@ Reference results come from independent implementations (`tools/make_fixtures.py
 | Streamed against resident runs of Llama 3.2 1B and OLMoE 1B-7B | The same engine with everything on the GPU | Identical greedy replies |
 | Kimi K3.1 layout (tiny random model, akopytko/tiny-kimi-k3.1-pro-GGUF), dense and with the indexer's top-k at 8 | `tools/ref_kimi_k31.py`, float64 NumPy written from llama.cpp's graph | Within 0.06% of the logit range, resident and streamed with a 16-slot expert cache |
 | Llama 3.2 1B read from Hugging Face (`hf:` path, 300 MB GPU budget) | The same model from a local file | Identical greedy replies |
+| The same tiny Kimi K3.1 in llama.cpp 2cbfc3c (`kimi_k31_matches_llama_cpp`), dense on 7 tokens and with sparse attention selecting on 22 | llama.cpp's CPU logits (all 163,840 compared once; the test keeps its top 256) | Within 0.17% of the logit range, correlation 0.999995 and up, the same top 10 and most likely token, resident and streamed; llama.cpp rounds activations to bf16, which accounts for the difference |
 | Kimi K3.1 Pro IQ1_S headers (14 parts, 2,693 tensors) | The engine's shape and format checks, over the network | Every tensor accepted |
 | Kimi K3.1, DeepSeek V3, Qwen3 MoE (tiny) and Llama 3.2 1B split across three engines (`split_across_devices_matches_one_device`) | The model on one engine | Bit-identical logits, resident and streamed (layer-by-layer prompts included; 1e-5 where a stage's share fits its budget and uses the faster layout); the same greedy text over two turns |
 | A phone using a computer (`tests/remote_browser_test.py`): a Pixel 7 profile in a browser with no GPU adapter, SmolLM2 135M loaded onto the computer from the phone | The model run directly on the computer | Identical replies, also after the phone reloads and reconnects to the model still loaded; with `--pi-hf` Qwen2.5 0.5B, Pi on the phone wrote a file with a tool call |
@@ -287,6 +288,10 @@ akopytko/tiny-kimi-k3.1-pro-GGUF:
 python3 tools/ref_kimi_k31.py $EVOLVE_LLM_MODELS/tiny-k31-bf16.gguf tests/fixtures/tiny-kimik31.json
 python3 tools/ref_kimi_k31.py $EVOLVE_LLM_MODELS/tiny-k31-bf16.gguf tests/fixtures/tiny-kimik31-topk8.json --top-k 8
 ```
+
+`tests/fixtures/k31-llama-cpp.json` holds llama.cpp's largest logits for the same model and two
+prompts, from `llama-eval-callback -m <model> -p <prompt> -n 1` with its tensor printer patched
+to print every value at full precision (the fixture records the prompts and tokens).
 
 ## License
 

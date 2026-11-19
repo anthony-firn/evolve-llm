@@ -377,3 +377,40 @@ fn split_across_devices_matches_one_device() {
     pipeline_matches("Llama-3.2-1B-Instruct-Q4_K_M.gguf", None, 40);
     pipeline_matches("Llama-3.2-1B-Instruct-Q4_K_M.gguf", Some(300 << 20), 300);
 }
+
+/// Kimi K3.1 against llama.cpp (an independent implementation of the architecture), on a tiny
+/// model from Hugging Face (akopytko/tiny-kimi-k3.1-pro-GGUF), dense and with sparse attention
+/// selecting. The fixture holds llama.cpp's 256 largest logits for each prompt; its CPU path
+/// rounds activations to bf16, which bounds the agreement (about 0.2% of a value).
+#[test]
+fn kimi_k31_matches_llama_cpp() {
+    let fx: Value = serde_json::from_str(include_str!("fixtures/k31-llama-cpp.json")).unwrap();
+    for case in fx["cases"].as_array().unwrap() {
+        let file = case["model"].as_str().unwrap();
+        let Ok(bytes) = std::fs::read(models_dir().join(file)) else {
+            eprintln!("skipping {file}: not found");
+            continue;
+        };
+        let g = gguf::parse(&bytes).unwrap();
+        let tokens: Vec<u32> = case["tokens"].as_array().unwrap().iter().map(|t| t.as_u64().unwrap() as u32).collect();
+        let top: Vec<(usize, f32)> = case["top"].as_array().unwrap().iter().map(|p| (p[0].as_u64().unwrap() as usize, p[1].as_f64().unwrap() as f32)).collect();
+        let range = (case["max"].as_f64().unwrap() - case["min"].as_f64().unwrap()) as f32;
+        for budget in [None, Some(1)] {
+            let Some(e) = stage_engine(&g, &bytes, budget, None, 256) else {
+                eprintln!("skipping {file}: no GPU adapter");
+                return;
+            };
+            let got = pollster::block_on(e.forward(&tokens, 0)).unwrap();
+            assert_eq!(got.len(), case["n_vocab"].as_u64().unwrap() as usize);
+            let worst = top.iter().map(|&(i, v)| (got[i] - v).abs()).fold(0f32, f32::max) / range;
+            let mut order: Vec<usize> = (0..got.len()).collect();
+            order.sort_by(|&x, &y| got[y].total_cmp(&got[x]));
+            let ours: Vec<usize> = order[..10].to_vec();
+            let theirs: Vec<usize> = top[..10].iter().map(|t| t.0).collect();
+            eprintln!("{file} ({} tokens, streamed {}): {worst:.1e} of the logit range from llama.cpp over its top 256; top 10 {}", tokens.len(), budget.is_some(), if ours == theirs { "identical" } else if ours.iter().all(|i| theirs.contains(i)) { "the same tokens, near-ties in another order" } else { "differs" });
+            assert!(worst < 3e-3, "{file}: logits differ from llama.cpp");
+            assert_eq!(ours[0], theirs[0], "{file}: a different most likely token than llama.cpp");
+            assert_eq!(ours.iter().filter(|i| theirs.contains(i)).count(), 10, "{file}: a different top 10 than llama.cpp");
+        }
+    }
+}
