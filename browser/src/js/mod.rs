@@ -495,36 +495,20 @@ impl JsRuntime {
         FRAMES.with(|f| *f.top.borrow_mut() = Some(FrameEntry { realm: None, window, origin: origin.to_string() }));
     }
 
-    /// Runs an iframe's classic scripts in their own realm (fresh global, shared heap) so the
+    /// Runs an iframe's classic scripts in its own realm (fresh global, shared heap) so the
     /// frame's `window` is a distinct object the parent can reach as `iframe.contentWindow`, and
     /// `postMessage` across the boundary carries the right source and origin. `node_id` is the
-    /// iframe's node id in the parent document (used as the frame id). Returns the first error.
+    /// iframe's node id in the parent document (used as the frame id). The realm may already exist
+    /// (created eagerly on a synchronous `contentWindow` access); its scripts then run in it.
+    /// Returns the first error.
     pub fn run_frame(&self, node_id: u64, origin: &str, url: &str, scripts: &[String]) -> Result<(), String> {
         let mut guard = self.cell.borrow_mut();
         let ctx: &mut Context = &mut guard;
-        let realm = ctx.create_realm().map_err(|e| e.to_string())?;
-        let prev = ctx.enter_realm(realm.clone());
-        let result = (|| -> Result<JsObject, String> {
-            host_api::install(ctx).map_err(|e| e.to_string())?;
-            let top = FRAMES.with(|f| f.top.borrow().as_ref().map(|e| e.window.clone()));
-            let attr = Attribute::all();
-            ctx.register_global_property(JsString::from("__frameId_value"), JsValue::from(node_id as f64), attr).map_err(|e| e.to_string())?;
-            ctx.register_global_property(JsString::from("__frameOrigin"), js_str(origin), attr).map_err(|e| e.to_string())?;
-            ctx.register_global_property(JsString::from("__frameUrl"), js_str(url), attr).map_err(|e| e.to_string())?;
-            if let Some(top) = top {
-                ctx.register_global_property(JsString::from("__parentWindow"), JsValue::from(top.clone()), attr).map_err(|e| e.to_string())?;
-                ctx.register_global_property(JsString::from("__topWindow"), JsValue::from(top), attr).map_err(|e| e.to_string())?;
-            }
-            ctx.eval(Source::from_bytes(FRAME_PRELUDE.as_bytes()).with_path(Path::new("evolve:frame"))).map_err(|e| e.to_string())?;
-            Ok(ctx.global_object())
-        })();
-        let window = match result {
-            Ok(w) => w,
-            Err(e) => { ctx.enter_realm(prev); return Err(e); }
+        create_frame_realm(ctx, node_id, origin, url)?;
+        let Some(realm) = FRAMES.with(|f| f.frames.borrow().get(&node_id).and_then(|e| e.realm.clone())) else {
+            return Ok(());
         };
-        // Register before running scripts: a script may post synchronously and the parent's
-        // handler then looks this frame up as `event.source`.
-        FRAMES.with(|f| f.frames.borrow_mut().insert(node_id, FrameEntry { realm: Some(realm), window, origin: origin.to_string() }));
+        let prev = ctx.enter_realm(realm);
         FRAMES.with(|f| f.current.set(node_id));
         let mut first_err = None;
         for code in scripts {
@@ -537,6 +521,39 @@ impl JsRuntime {
         ctx.enter_realm(prev);
         match first_err { Some(e) => Err(e), None => Ok(()) }
     }
+}
+
+/// Creates (or returns the existing) realm and window for an iframe node: a fresh global running
+/// the frame prelude, registered in the frame table so `postMessage` and `contentWindow` resolve
+/// it. No scripts run here. Used both eagerly (synchronous same-origin `contentWindow` access,
+/// matching a real browser's immediate about:blank window) and when the sub-document loads.
+pub(crate) fn create_frame_realm(ctx: &mut Context, node_id: u64, origin: &str, url: &str) -> Result<JsObject, String> {
+    if let Some(window) = FRAMES.with(|f| f.frames.borrow().get(&node_id).map(|e| e.window.clone())) {
+        return Ok(window);
+    }
+    let realm = ctx.create_realm().map_err(|e| e.to_string())?;
+    let prev = ctx.enter_realm(realm.clone());
+    let result = (|| -> Result<JsObject, String> {
+        host_api::install(ctx).map_err(|e| e.to_string())?;
+        let top = FRAMES.with(|f| f.top.borrow().as_ref().map(|e| e.window.clone()));
+        let attr = Attribute::all();
+        ctx.register_global_property(JsString::from("__frameId_value"), JsValue::from(node_id as f64), attr).map_err(|e| e.to_string())?;
+        ctx.register_global_property(JsString::from("__frameOrigin"), js_str(origin), attr).map_err(|e| e.to_string())?;
+        ctx.register_global_property(JsString::from("__frameUrl"), js_str(url), attr).map_err(|e| e.to_string())?;
+        if let Some(top) = top {
+            ctx.register_global_property(JsString::from("__parentWindow"), JsValue::from(top.clone()), attr).map_err(|e| e.to_string())?;
+            ctx.register_global_property(JsString::from("__topWindow"), JsValue::from(top), attr).map_err(|e| e.to_string())?;
+        }
+        ctx.eval(Source::from_bytes(FRAME_PRELUDE.as_bytes()).with_path(Path::new("evolve:frame"))).map_err(|e| e.to_string())?;
+        Ok(ctx.global_object())
+    })();
+    let window = match result {
+        Ok(w) => w,
+        Err(e) => { ctx.enter_realm(prev); return Err(e); }
+    };
+    ctx.enter_realm(prev);
+    FRAMES.with(|f| f.frames.borrow_mut().insert(node_id, FrameEntry { realm: Some(realm), window: window.clone(), origin: origin.to_string() }));
+    Ok(window)
 }
 
 impl Drop for JsRuntime {

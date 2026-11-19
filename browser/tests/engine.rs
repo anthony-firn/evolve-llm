@@ -474,6 +474,22 @@ fn iframe_postmessage_is_bidirectional() {
     assert_eq!(t.eval("window.__reply.fromChild"), "true");
 }
 
+// A same-origin iframe exposes its window synchronously (as a real browser does, about:blank),
+// before its content has loaded; a cross-origin one does not until it loads.
+#[test]
+fn same_origin_iframe_window_is_available_synchronously() {
+    let mut t = h();
+    t.site.add("https://app.test/", "text/html", "<!doctype html><body></body>");
+    t.open("https://app.test/");
+    // Same-origin frame: contentWindow is a usable window immediately after the element exists,
+    // before any network load.
+    assert_eq!(t.eval(r#"(() => { const f = document.createElement('iframe'); f.src = '/relay'; document.body.appendChild(f); const w = f.contentWindow; return w && typeof w.postMessage; })()"#), "\"function\"", "{:?}", t.console());
+    // A src-less (about:blank) same-origin frame too.
+    assert_eq!(t.eval(r#"(() => { const f = document.createElement('iframe'); document.body.appendChild(f); return f.contentWindow ? 'win' : 'null'; })()"#), "\"win\"");
+    // Cross-origin frame: no window until it actually loads.
+    assert_eq!(t.eval(r#"(() => { const f = document.createElement('iframe'); f.src = 'https://other.test/x'; document.body.appendChild(f); return f.contentWindow === null ? 'null' : 'win'; })()"#), "\"null\"");
+}
+
 // targetOrigin must match the receiver's origin (or be "*"): a mismatched origin is dropped.
 #[test]
 fn iframe_postmessage_respects_target_origin() {

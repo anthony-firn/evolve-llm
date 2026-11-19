@@ -75,6 +75,7 @@ pub fn install(ctx: &mut Context) -> JsResult<()> {
         ("log", log, 2),
         ("dialog", dialog, 2),
         ("frameWindow", frame_window, 1),
+        ("ensureFrameWindow", ensure_frame_window, 1),
         ("postMessage", post_message, 3),
         ("now", now, 0),
         ("random", random, 1),
@@ -1206,6 +1207,43 @@ fn frame_window(_: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<J
         return Ok(JsValue::null());
     }
     Ok(super::frame_window(id as u64).map(JsValue::from).unwrap_or(JsValue::null()))
+}
+
+/// `__h.ensureFrameWindow(nodeId)` — for a SAME-ORIGIN iframe whose content has not loaded yet,
+/// creates its window eagerly (a real browser exposes a same-origin frame's window synchronously,
+/// as about:blank, the moment the element exists). Returns the window, or null for a cross-origin
+/// frame not yet loaded (its window appears only once its content arrives).
+fn ensure_frame_window(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let n = arg_num(args, 0);
+    if !n.is_finite() || n < 0.0 {
+        return Ok(JsValue::null());
+    }
+    let id = n as u64;
+    if let Some(window) = super::frame_window(id) {
+        return Ok(JsValue::from(window));
+    }
+    let Some((src, page)) = with_host(|doc, state| {
+        let src = doc.get_node(NodeId::from_u64(id)).and_then(|node| node.element_data()).and_then(|el| el.attr(local_name!("src")).map(str::to_string));
+        (src, state.url.clone())
+    }) else {
+        return Ok(JsValue::null());
+    };
+    let page_origin = page.origin().ascii_serialization();
+    let (origin, url) = match src.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => match page.join(s) {
+            Ok(u) => (u.origin().ascii_serialization(), u.to_string()),
+            Err(_) => return Ok(JsValue::null()),
+        },
+        // No src yet is about:blank, which inherits the embedding document's origin.
+        _ => (page_origin.clone(), "about:blank".to_string()),
+    };
+    if origin != page_origin {
+        return Ok(JsValue::null());
+    }
+    match super::create_frame_realm(ctx, id, &origin, &url) {
+        Ok(window) => Ok(JsValue::from(window)),
+        Err(_) => Ok(JsValue::null()),
+    }
 }
 
 /// `__h.postMessage(targetWindow, data, targetOrigin)` — delivers a message to another frame

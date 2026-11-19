@@ -886,7 +886,7 @@
   reflect(C.HTMLIFrameElement, [['src', 'src', 'url'], 'srcdoc', 'name', 'allow', ['allowFullscreen', 'allowfullscreen', 'bool'], 'width', 'height', 'loading', ['referrerPolicy', 'referrerpolicy', 'string']]);
   // contentWindow is the frame's realm window (shared heap, so identity holds for event.source);
   // contentDocument stays null (cross-origin frames expose no document here).
-  getters(C.HTMLIFrameElement.prototype, { contentWindow() { return H.frameWindow(this[ID]) || null; }, contentDocument() { return null; }, sandbox() { return new DOMTokenList(this, 'sandbox'); } });
+  getters(C.HTMLIFrameElement.prototype, { contentWindow() { return H.frameWindow(this[ID]) || H.ensureFrameWindow(this[ID]) || null; }, contentDocument() { return null; }, sandbox() { return new DOMTokenList(this, 'sandbox'); } });
   reflect(C.HTMLCanvasElement, [['width', 'width', 'int', 300], ['height', 'height', 'int', 150]]);
   Object.assign(C.HTMLCanvasElement.prototype, { getContext() { return null; }, toDataURL() { return 'data:,'; }, toBlob(cb) { setTimeout(() => cb(null), 0); }, captureStream() { return null; }, transferControlToOffscreen() { throw new DOMException('Not supported', 'NotSupportedError'); } });
   reflect(C.HTMLMediaElement, [['src', 'src', 'url'], ['autoplay', 'autoplay', 'bool'], ['loop', 'loop', 'bool'], ['controls', 'controls', 'bool'], ['muted', 'muted', 'bool'], 'preload', ['crossOrigin', 'crossorigin', 'string'], ['playsInline', 'playsinline', 'bool'], 'poster']);
@@ -1624,7 +1624,19 @@
   define(WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
   class CloseEvent extends Event { constructor(t, i = {}) { super(t, i); this.code = i.code || 1000; this.reason = i.reason || ''; this.wasClean = !!i.wasClean; } }
   class EventSource extends EventTarget { constructor(url) { super(); this.url = String(url); this.readyState = 2; this.withCredentials = false; } close() {} }
-  class BroadcastChannel extends EventTarget { constructor(name) { super(); this.name = name; } postMessage() {} close() {} }
+  // A working same-realm BroadcastChannel: a message reaches every other open channel of the
+  // same name (not the sender), on a later turn. SPAs use this to coordinate app contexts.
+  const bcChannels = new Map();
+  class BroadcastChannel extends EventTarget {
+    constructor(name) { super(); this.name = String(name); this._closed = false; const set = bcChannels.get(this.name) || new Set(); set.add(this); bcChannels.set(this.name, set); }
+    postMessage(data) {
+      if (this._closed) throw new DOMException('BroadcastChannel is closed', 'InvalidStateError');
+      const peers = [...(bcChannels.get(this.name) || [])].filter((c) => c !== this && !c._closed);
+      const cloned = structuredClone(data);
+      for (const c of peers) setTimeout(() => { if (c._closed) return; const e = new MessageEvent('message', { data: cloned, origin: location.origin, source: null }); if (c.onmessage) call(c.onmessage, c, [e]); c.dispatchEvent(e); }, 0);
+    }
+    close() { this._closed = true; const set = bcChannels.get(this.name); if (set) { set.delete(this); if (!set.size) bcChannels.delete(this.name); } }
+  }
   class MessageChannel { constructor() { this.port1 = new MessagePort(); this.port2 = new MessagePort(); this.port1._other = this.port2; this.port2._other = this.port1; } }
   class MessagePort extends EventTarget { postMessage(data) { const o = this._other; setTimeout(() => { const e = new MessageEvent('message', { data }); if (o.onmessage) call(o.onmessage, o, [e]); o.dispatchEvent(e); }, 0); } start() {} close() {} }
   class Worker extends EventTarget { constructor() { super(); throw new DOMException('Web Workers are not supported in this browser yet', 'NotSupportedError'); } }
