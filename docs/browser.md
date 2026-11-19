@@ -207,6 +207,9 @@ and it does not rewrite OAuth grant URLs or account challenges.
 
 ## User-agent and TLS experiments
 
+For the measured native TLS/HTTP2 target and Google request sequence, see the
+[Firefox ESR protocol reference](browser-protocol-reference.md).
+
 Open the route button (Tor/Relay) and use **Compatibility experiments**. The user-agent
 profiles are the existing Chrome 131 + Evolve identity (default), plain Chrome 131,
 Firefox ESR 153, Firefox 160 and EvolveBrowser only. Firefox version labels were checked

@@ -3,6 +3,18 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  protocol-reference:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r tools/requirements-browser-trace.txt
+      - name: Check protocol reference and trace export privacy
+        run: |
+          python -B tests/test_browser_trace_extract_tls.py
+          python -B tests/test_browser_trace_summary.py
   sdk:
     runs-on: ubuntu-24.04
     steps:
