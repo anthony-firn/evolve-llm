@@ -18,7 +18,10 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   const head=node('header'),title=node('div');title.append(node('strong','Terminal & Pi'),node('small','WASM workspace · local model'));
   const tokenLabel=node('label'),tokenLimit=node('select');tokenLimit.id='pi-output-tokens';for(const value of [1024,2048,4096]){const option=node('option',String(value));option.value=value;tokenLimit.append(option)}tokenLimit.value='2048';tokenLabel.append(node('span','Pi tokens'),tokenLimit);
   const webLabel=node('label'),webToggle=node('input');webToggle.type='checkbox';webToggle.id='terminal-web';webLabel.append(webToggle,node('span','Web access'));
-  const close=button('Close',()=>{if(!externalTask)cancel();preview.stop();previewPanel.hidden=true;console.classList.remove('preview-expanded');root.hidden=true});head.append(title,tokenLabel,webLabel,close);
+  const close=button('Close',()=>{if(!externalTask)cancel();preview.stop();previewPanel.hidden=true;console.classList.remove('preview-expanded');root.hidden=true});
+  // The Linux terminal: the Evolve VM (web/vm/) in a GNOME-style window, in place of the console.
+  const linuxToggle=button('Linux terminal',()=>toggleLinux());linuxToggle.id='linux-terminal-toggle';linuxToggle.title='A Linux-style shell in this page: real programs compiled to WebAssembly';
+  head.append(title,tokenLabel,webLabel,linuxToggle,close);
   const notice=node('p','Commands and files stay in a browser-only /workspace. Web searches and page URLs go to external services when enabled. This supports a shell subset, not host Bash.','workbench-note');
   const layout=node('div',undefined,'workbench-layout'),aside=node('aside'),files=node('div',undefined,'workbench-files');files.id='workspace-files';
   const actions=node('div',undefined,'workspace-actions');
@@ -34,7 +37,19 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   previewPanel.append(previewTitle,previewActions,previewHost);
   const preview=new AppPreview({container:previewHost,onResult:result=>{if(result.late)record('Preview runtime error',result.errors.join('\n'),'error')}});let previewPath=null;
   const console=node('div',undefined,'terminal-console');console.append(log,previewPanel,form,status);
-  aside.append(node('h2','Workspace files'),actions,files);layout.append(aside,console);root.append(head,notice,layout,filePicker,restorePicker);document.body.append(root);
+  const vmHost=node('div',undefined,'vm-console');vmHost.hidden=true;
+  aside.append(node('h2','Workspace files'),actions,files);layout.append(aside,console,vmHost);root.append(head,notice,layout,filePicker,restorePicker);document.body.append(root);
+  let vmWindow=null;
+  async function toggleLinux(){
+    const on=vmHost.hidden;vmHost.hidden=!on;aside.hidden=on;console.hidden=on;layout.classList.toggle('vm-mode',on);
+    linuxToggle.textContent=on?'Pi workspace':'Linux terminal';
+    if(on&&!vmWindow){
+      if(!document.querySelector('link[href$="vm/terminal.css"]')){const l=document.createElement('link');l.rel='stylesheet';l.href=new URL('./vm/terminal.css',import.meta.url).href;document.head.append(l)}
+      const [{sharedVm},{TerminalWindow}]=await Promise.all([import('./vm/client.mjs'),import('./vm/terminal.mjs')]);
+      vmWindow=new TerminalWindow({vm:sharedVm(),container:vmHost});await vmWindow.open();
+    }
+    if(on)vmWindow?.active?.term.focus();
+  }
   let initialized=false, initialization=null, task=null, busy=false, externalTask=false, saving=Promise.resolve(), agent=null, abortWeb=new AbortController(), history=[],cursor=0;
   function record(label,text='',className='') {
     const row=node('section',undefined,'terminal-entry '+className),labelNode=node('strong',label),output=node('pre',String(text).slice(0,65536));row.append(labelNode,output);log.append(row);

@@ -151,6 +151,18 @@ const handlers = {
     host.changed();
   },
   resize: ({ tty, cols, rows }) => vm.tty_resize(tty, cols, rows),
+  close: ({ tty }) => {
+    // A closed tab ends its shell and everything it runs.
+    const pid = sessions.get(tty);
+    if (pid !== undefined) {
+      sessions.delete(tty);
+      vm.kill_group(vm.pgid(pid), 129);
+      vm.set_ignore_interrupt(pid, false);
+      vm.kill_group(vm.pgid(pid), 129);
+      host.ttys.delete(tty);
+      host.changed();
+    }
+  },
   exec: async (m) => postMessage({ type: 'result', id: m.id, ...(await exec(m)) }),
   read: ({ id, path }) => {
     const d = vm.read_file(path);

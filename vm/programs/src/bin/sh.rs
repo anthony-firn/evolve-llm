@@ -878,7 +878,8 @@ fn main() {
                 let home = sh.lookup("HOME");
                 let dir = cwd();
                 let shown = if dir == home { "~".to_string() } else if let Some(rest) = dir.strip_prefix(&format!("{home}/")) { format!("~/{rest}") } else { dir };
-                print!("\x1b[1;32muser@evolve\x1b[0m:\x1b[1;34m{shown}\x1b[0m$ ");
+                // The window title (OSC 0), then the prompt.
+                print!("\x1b]0;user@evolve: {shown}\x07\x1b[1;92muser@evolve\x1b[0m:\x1b[1;94m{shown}\x1b[0m$ ");
                 let _ = io::stdout().flush();
                 let mut line = String::new();
                 match stdin.lock().read_line(&mut line) {

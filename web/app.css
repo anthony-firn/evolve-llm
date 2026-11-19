@@ -289,3 +289,4 @@ button:disabled{cursor:not-allowed;opacity:.5}
 .settings #host-info[hidden]{display:none}
 .settings .qr{width:min(200px,60vw);align-self:center;border-radius:8px;overflow:hidden;line-height:0}
 .settings .qr svg{width:100%;height:auto;display:block}
+.workbench .vm-console{grid-column:1/-1;min-height:0;padding:8px}.workbench .vm-console[hidden],.workbench aside[hidden],.workbench .terminal-console[hidden]{display:none}.workbench-layout.vm-mode{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr)}

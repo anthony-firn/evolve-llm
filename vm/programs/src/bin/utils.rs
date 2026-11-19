@@ -174,9 +174,9 @@ fn ls(args: &[String], out: &mut dyn Write) -> R {
         let colored = if !tty {
             name.to_string()
         } else if ft.is_dir() {
-            format!("\x1b[1;34m{name}\x1b[0m")
+            format!("\x1b[1;94m{name}\x1b[0m")
         } else if ft.is_symlink() {
-            format!("\x1b[1;36m{name}\x1b[0m")
+            format!("\x1b[1;96m{name}\x1b[0m")
         } else {
             name.to_string()
         };
