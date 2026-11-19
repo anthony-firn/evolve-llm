@@ -201,8 +201,9 @@ so streaming in the browser is slower than native.
   here, but they have not produced a reply end to end: over the test laptop's connection one
   token of Kimi K3.1 Pro takes hours. Their speed depends on the connection and on how much
   of each token's reads the device cache holds.
-- Kimi K3.1 is checked against a NumPy transcription of llama.cpp's graph, not against llama.cpp
-  itself or the original weights. Its linear-attention state cannot be rewound, so when a new
+- Kimi K3.1 is checked against llama.cpp and a NumPy transcription of its graph on a tiny random
+  model, not against the original weights (no reply from Kimi K3.1 Pro yet, see above). Its
+  linear-attention state cannot be rewound, so when a new
   turn changes earlier text the prompt is read again from the snapshot taken at the end of the
   previous prompt, or from the start.
 - The indexer's keys are cached in f16; where two positions score within that precision of the
