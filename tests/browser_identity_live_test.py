@@ -20,9 +20,12 @@ GOOGLE = "https://accounts.google.com/v3/signin/identifier?flowName={}&flowEntry
 
 def fingerprint(data):
     tls = data.get("tls", {})
+    http2 = data.get("http2") or {}
     return {"http_version": data.get("http_version"), "user_agent": data.get("user_agent"),
             "ja3": tls.get("ja3"), "ja3_hash": tls.get("ja3_hash"), "ja4": tls.get("ja4"),
-            "ciphers": tls.get("ciphers"), "extensions": tls.get("extensions")}
+            "ciphers": tls.get("ciphers"), "extensions": tls.get("extensions"),
+            # SETTINGS|WINDOW_UPDATE|PRIORITY|pseudo-header order, as the server observed them
+            "http2_akamai": http2.get("akamai_fingerprint")}
 
 
 def poll(page, callback, timeout=90):
