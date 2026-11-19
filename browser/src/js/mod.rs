@@ -11,7 +11,9 @@ use blitz_traits::events::DomEvent;
 use boa_engine::job::{GenericJob, Job, JobExecutor, NativeAsyncJob, PromiseJob};
 use boa_engine::module::{ModuleLoader, Referrer};
 use boa_engine::object::builtins::JsPromise;
-use boa_engine::{Context, JsResult, JsString, JsValue, Module, Source};
+use boa_engine::property::Attribute;
+use boa_engine::realm::Realm;
+use boa_engine::{Context, JsObject, JsResult, JsString, JsValue, Module, Source};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -23,6 +25,72 @@ use std::task::{Wake, Waker};
 use url::Url;
 
 pub const PRELUDE: &str = include_str!("prelude.js");
+pub const FRAME_PRELUDE: &str = include_str!("frame.js");
+
+/// Per-page registry of iframe JS realms, so cross-frame `postMessage` delivers to the right
+/// window with the right `event.source`/`event.origin`. Keyed by the parent document's iframe
+/// node id; the top window is id 0 (no real iframe is node 0).
+#[derive(Default)]
+struct FrameTable {
+    /// The window whose script is currently executing (0 = top), so a `postMessage` knows its
+    /// source. It is also set to the target window while that window's handlers run.
+    current: Cell<u64>,
+    top: RefCell<Option<FrameEntry>>,
+    frames: RefCell<HashMap<u64, FrameEntry>>,
+}
+
+#[derive(Clone)]
+struct FrameEntry {
+    #[allow(dead_code)] // held so the realm's intrinsics outlive the windows that use them
+    realm: Option<Realm>,
+    window: JsObject,
+    origin: String,
+}
+
+thread_local! {
+    static FRAMES: FrameTable = FrameTable::default();
+}
+
+/// Clears every frame realm. Must run before the owning `Context` is dropped, since the stored
+/// window objects belong to it.
+pub(crate) fn frames_clear() {
+    FRAMES.with(|f| {
+        f.current.set(0);
+        *f.top.borrow_mut() = None;
+        f.frames.borrow_mut().clear();
+    });
+}
+
+/// The window object and origin a message posted right now should carry as its source.
+pub(crate) fn frame_source() -> Option<(JsObject, String)> {
+    FRAMES.with(|f| {
+        let id = f.current.get();
+        let entry = if id == 0 { f.top.borrow().clone() } else { f.frames.borrow().get(&id).cloned() };
+        entry.map(|e| (e.window, e.origin))
+    })
+}
+
+/// The origin of the window a message is being posted to (by its `__frameId`), for the
+/// `targetOrigin` check.
+pub(crate) fn frame_origin(id: u64) -> Option<String> {
+    FRAMES.with(|f| {
+        if id == 0 { f.top.borrow().as_ref().map(|e| e.origin.clone()) } else { f.frames.borrow().get(&id).map(|e| e.origin.clone()) }
+    })
+}
+
+/// The window object for an iframe node, for `iframe.contentWindow`.
+pub(crate) fn frame_window(id: u64) -> Option<JsObject> {
+    FRAMES.with(|f| f.frames.borrow().get(&id).map(|e| e.window.clone()))
+}
+
+/// Runs `body` with the current source window temporarily set to `id` (a window's handlers run
+/// as that window), so a `postMessage` sent from within them has the right source.
+pub(crate) fn frame_with_current<R>(id: u64, body: impl FnOnce() -> R) -> R {
+    let prev = FRAMES.with(|f| f.current.replace(id));
+    let r = body();
+    FRAMES.with(|f| f.current.set(prev));
+    r
+}
 
 /// Per-page state the host API reads and writes while script runs.
 pub struct PageState {
@@ -418,10 +486,63 @@ impl JsRuntime {
     pub fn modules_pending(&self) -> bool {
         !self.pending_modules.borrow().is_empty() || self.executor.has_async()
     }
+
+    /// Records the top document's window as frame 0, so cross-frame messaging can reach it.
+    /// Call once after `install_prelude`, with the document's origin.
+    pub fn record_top_window(&self, origin: &str) {
+        frames_clear();
+        let window = self.cell.borrow_mut().global_object();
+        FRAMES.with(|f| *f.top.borrow_mut() = Some(FrameEntry { realm: None, window, origin: origin.to_string() }));
+    }
+
+    /// Runs an iframe's classic scripts in their own realm (fresh global, shared heap) so the
+    /// frame's `window` is a distinct object the parent can reach as `iframe.contentWindow`, and
+    /// `postMessage` across the boundary carries the right source and origin. `node_id` is the
+    /// iframe's node id in the parent document (used as the frame id). Returns the first error.
+    pub fn run_frame(&self, node_id: u64, origin: &str, url: &str, scripts: &[String]) -> Result<(), String> {
+        let mut guard = self.cell.borrow_mut();
+        let ctx: &mut Context = &mut guard;
+        let realm = ctx.create_realm().map_err(|e| e.to_string())?;
+        let prev = ctx.enter_realm(realm.clone());
+        let result = (|| -> Result<JsObject, String> {
+            host_api::install(ctx).map_err(|e| e.to_string())?;
+            let top = FRAMES.with(|f| f.top.borrow().as_ref().map(|e| e.window.clone()));
+            let attr = Attribute::all();
+            ctx.register_global_property(JsString::from("__frameId_value"), JsValue::from(node_id as f64), attr).map_err(|e| e.to_string())?;
+            ctx.register_global_property(JsString::from("__frameOrigin"), js_str(origin), attr).map_err(|e| e.to_string())?;
+            ctx.register_global_property(JsString::from("__frameUrl"), js_str(url), attr).map_err(|e| e.to_string())?;
+            if let Some(top) = top {
+                ctx.register_global_property(JsString::from("__parentWindow"), JsValue::from(top.clone()), attr).map_err(|e| e.to_string())?;
+                ctx.register_global_property(JsString::from("__topWindow"), JsValue::from(top), attr).map_err(|e| e.to_string())?;
+            }
+            ctx.eval(Source::from_bytes(FRAME_PRELUDE.as_bytes()).with_path(Path::new("evolve:frame"))).map_err(|e| e.to_string())?;
+            Ok(ctx.global_object())
+        })();
+        let window = match result {
+            Ok(w) => w,
+            Err(e) => { ctx.enter_realm(prev); return Err(e); }
+        };
+        // Register before running scripts: a script may post synchronously and the parent's
+        // handler then looks this frame up as `event.source`.
+        FRAMES.with(|f| f.frames.borrow_mut().insert(node_id, FrameEntry { realm: Some(realm), window, origin: origin.to_string() }));
+        FRAMES.with(|f| f.current.set(node_id));
+        let mut first_err = None;
+        for code in scripts {
+            if let Err(e) = ctx.eval(Source::from_bytes(code.as_bytes()).with_path(Path::new("evolve:frame-script"))) {
+                if first_err.is_none() { first_err = Some(e.to_string()); }
+            }
+            let _ = ctx.run_jobs();
+        }
+        FRAMES.with(|f| f.current.set(0));
+        ctx.enter_realm(prev);
+        match first_err { Some(e) => Err(e), None => Ok(()) }
+    }
 }
 
 impl Drop for JsRuntime {
     fn drop(&mut self) {
+        // Frame realms hold window objects from this context; release them before it is dropped.
+        frames_clear();
         // Futures borrow the context cell; drop them first.
         self.executor.running.borrow_mut().clear();
         self.executor.new_async.borrow_mut().clear();

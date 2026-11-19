@@ -74,6 +74,8 @@ pub fn install(ctx: &mut Context) -> JsResult<()> {
         ("storage", storage, 4),
         ("log", log, 2),
         ("dialog", dialog, 2),
+        ("frameWindow", frame_window, 1),
+        ("postMessage", post_message, 3),
         ("now", now, 0),
         ("random", random, 1),
         ("encode", encode, 1),
@@ -1194,4 +1196,54 @@ fn sheets(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
         let _ = ctx;
         v
     })
+}
+
+/// `__h.frameWindow(nodeId)` — the window object for an iframe node, or null. Backs
+/// `iframe.contentWindow`, so a parent can hold the same object a message carries as `source`.
+fn frame_window(_: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    let id = arg_num(args, 0);
+    if !id.is_finite() || id < 0.0 {
+        return Ok(JsValue::null());
+    }
+    Ok(super::frame_window(id as u64).map(JsValue::from).unwrap_or(JsValue::null()))
+}
+
+/// `__h.postMessage(targetWindow, data, targetOrigin)` — delivers a message to another frame
+/// (or the top window) with the posting frame as `event.source` and its origin as `event.origin`,
+/// honouring `targetOrigin` ("*" or an exact origin match). The posting frame is whichever one is
+/// currently executing, tracked natively so identity holds across realms.
+fn post_message(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(target) = args.get_or_undefined(0).as_object() else {
+        return Err(JsNativeError::typ().with_message("postMessage target is not a window").into());
+    };
+    let data = args.get_or_undefined(1).clone();
+    let target_origin = arg_str(args, 2, ctx)?;
+    // Which window is the target (0 = top), from its hidden frame id.
+    let target_id = target.get(JsString::from("__frameId"), ctx)?.as_number().unwrap_or(f64::NAN);
+    if !target_id.is_finite() || target_id < 0.0 {
+        return Ok(JsValue::undefined());
+    }
+    let target_id = target_id as u64;
+    let Some(target_actual_origin) = super::frame_origin(target_id) else {
+        return Ok(JsValue::undefined());
+    };
+    let (source_window, source_origin) = super::frame_source().map(|(w, o)| (JsValue::from(w), o)).unwrap_or((JsValue::null(), String::new()));
+    // targetOrigin gate: "*" matches anything, "/" means the sender's own origin, else exact.
+    let allowed = match target_origin.as_str() {
+        "*" => true,
+        "/" => source_origin == target_actual_origin,
+        other => other == target_actual_origin,
+    };
+    if !allowed {
+        return Ok(JsValue::undefined());
+    }
+    let deliver = target.get(JsString::from("__deliverMessage"), ctx)?;
+    let Some(deliver) = deliver.as_callable() else {
+        return Ok(JsValue::undefined());
+    };
+    let target_val = JsValue::from(target);
+    let origin_val = js_str(&source_origin);
+    // The target's handlers run as the target window, so a reply they post has the right source.
+    super::frame_with_current(target_id, || deliver.call(&target_val, &[data, origin_val, source_window], ctx))?;
+    Ok(JsValue::undefined())
 }

@@ -70,6 +70,8 @@ pub struct Page {
     load_fired: bool,
     dom_loaded_at: f64,
     last_frame_time: f64,
+    /// iframe nodes whose sub-document scripts have already been run in their realm.
+    framed: HashSet<NodeId>,
 }
 
 struct PendingNav {
@@ -455,14 +457,17 @@ impl Engine {
         let mut doc = Box::new(crate::html::document(html, config));
         let origin = url.origin().ascii_serialization();
         let local = self.local.entry(origin.clone()).or_default().clone();
-        let session = self.session.entry(origin).or_default().clone();
+        let session = self.session.entry(origin.clone()).or_default().clone();
         let mut state = PageState::new(id, url.clone(), referrer, local, session);
         state.identity = self.identity;
         state.viewport = (self.css_width as f32, self.css_height as f32, self.dpr);
         state.now = crate::clock::now();
         let js = match JsRuntime::new(id, &url).and_then(|js| {
             let _s = js::enter(&mut doc, &mut state);
-            js.install_prelude().map(|_| js)
+            js.install_prelude().map(|_| {
+                js.record_top_window(&origin);
+                js
+            })
         }) {
             Ok(js) => Some(js),
             Err(e) => {
@@ -483,6 +488,7 @@ impl Engine {
             load_fired: false,
             dom_loaded_at: 0.0,
             last_frame_time: 0.0,
+            framed: HashSet::new(),
         };
         if page.js.is_some() {
             collect_parser_scripts(&mut page);
@@ -571,6 +577,13 @@ impl Engine {
             }
         }
         self.render(now);
+        // After render (which attaches any newly-loaded iframe sub-documents), run their scripts
+        // so the frame can message the parent on the next turn.
+        if let Some(page) = &mut self.page {
+            if page.js.is_some() {
+                run_iframe_scripts(page);
+            }
+        }
         self.next_delay(now)
     }
 
@@ -1000,6 +1013,58 @@ impl Engine {
 }
 
 // ---------------------------------------------------------------------- scripts
+
+/// Runs the inline classic scripts of any newly-attached iframe sub-document in its own realm,
+/// so the frame has a real `window` that can message the parent (and be reached as
+/// `contentWindow`). External and module frame scripts are not yet run here.
+fn run_iframe_scripts(page: &mut Page) {
+    if page.js.is_none() {
+        return;
+    }
+    let frame_ids: Vec<NodeId> = page.doc.sub_document_node_ids();
+    for node_id in frame_ids {
+        if page.framed.contains(&node_id) {
+            continue;
+        }
+        let Some((origin, url, scripts)) = collect_frame_scripts(&page.doc, node_id) else {
+            continue;
+        };
+        page.framed.insert(node_id);
+        if scripts.is_empty() {
+            continue;
+        }
+        let js = page.js.as_ref().unwrap();
+        let _s = js::enter(&mut page.doc, &mut page.state);
+        if let Err(e) = js.run_frame(node_id.as_u64(), &origin, &url, &scripts) {
+            host::emit(OutEvent::Console { level: "error".into(), text: format!("Frame script failed: {e}") });
+        }
+        report_errors(js);
+    }
+}
+
+/// Collects an iframe sub-document's origin, URL and inline classic script sources.
+fn collect_frame_scripts(doc: &BaseDocument, node_id: NodeId) -> Option<(String, String, Vec<String>)> {
+    let guard = doc.get_node(node_id)?.element_data()?.sub_doc_data()?.inner();
+    let sub: &BaseDocument = &guard;
+    let url = sub.base_url().clone();
+    let origin = url.origin().ascii_serialization();
+    let mut scripts = Vec::new();
+    let script_ids = sub.query_selector_all("script").map(|v| v.to_vec()).unwrap_or_default();
+    for sid in script_ids {
+        let Some(node) = sub.get_node(sid) else { continue };
+        let ty = node.attr(local_name!("type")).unwrap_or("").trim().to_ascii_lowercase();
+        let ty = ty.split(';').next().unwrap_or("").trim();
+        let is_classic_js = matches!(ty, "" | "text/javascript" | "application/javascript" | "text/ecmascript" | "application/ecmascript" | "application/x-javascript" | "text/jscript");
+        if !is_classic_js || node.attr(local_name!("src")).is_some() {
+            continue;
+        }
+        let code = node.text_content();
+        if !code.trim().is_empty() {
+            scripts.push(code);
+        }
+    }
+    Some((origin, url.to_string(), scripts))
+}
 
 fn collect_parser_scripts(page: &mut Page) {
     let ids: Vec<NodeId> = page.doc.query_selector_all("script").map(|v| v.to_vec()).unwrap_or_default();

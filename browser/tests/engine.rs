@@ -423,6 +423,51 @@ fn typing_inserts_each_character_once() {
     assert_eq!(t.eval("document.getElementById('i').value + ':' + keys"), "\"h:hiBackspace\"");
 }
 
+// A cross-origin child frame posting to its parent, as Google's sign-in does to probe
+// third-party cookies: the parent must receive the message with the child's origin and with
+// event.source identical to the iframe's contentWindow.
+#[test]
+fn cross_origin_iframe_posts_message_to_parent() {
+    let mut t = h();
+    t.site.add("https://accounts.google.test/", "text/html", r#"<!doctype html><body><script>
+        window.__got = null;
+        window.addEventListener('message', (e) => { window.__got = { data: e.data, origin: e.origin, sameSource: e.source === frame.contentWindow, isWindow: e.source === frame.contentWindow }; });
+        var frame = document.createElement('iframe');
+        document.body.appendChild(frame);
+        frame.src = 'https://checkcookie.youtube.test/check';
+    </script></body>"#);
+    t.site.add("https://checkcookie.youtube.test/check", "text/html", r#"<!doctype html><script>
+        if (window.parent && window.parent.postMessage) window.parent.postMessage('youtube:0', 'https://accounts.google.test');
+    </script>"#);
+    t.open("https://accounts.google.test/");
+    assert_eq!(t.eval("window.__got && window.__got.data"), "\"youtube:0\"", "{:?}", t.console());
+    assert_eq!(t.eval("window.__got.origin"), "\"https://checkcookie.youtube.test\"");
+    assert_eq!(t.eval("window.__got.sameSource"), "true", "event.source must be the iframe's contentWindow");
+    // The child's realm is its own global: its window is not the parent's.
+    assert_eq!(t.eval("frame.contentWindow === window"), "false");
+}
+
+// targetOrigin must match the receiver's origin (or be "*"): a mismatched origin is dropped.
+#[test]
+fn iframe_postmessage_respects_target_origin() {
+    let mut t = h();
+    t.site.add("https://parent.test/", "text/html", r#"<!doctype html><body><script>
+        window.__count = 0;
+        window.addEventListener('message', () => { window.__count++; });
+        var frame = document.createElement('iframe');
+        document.body.appendChild(frame);
+        frame.src = 'https://child.test/f';
+    </script></body>"#);
+    t.site.add("https://child.test/f", "text/html", r#"<!doctype html><script>
+        window.parent.postMessage('wrong', 'https://evil.test');
+        window.parent.postMessage('right', 'https://parent.test');
+        window.parent.postMessage('any', '*');
+    </script>"#);
+    t.open("https://parent.test/");
+    // Only the matching-origin and "*" posts are delivered.
+    assert_eq!(t.eval("window.__count"), "2", "{:?}", t.console());
+}
+
 #[test]
 fn import_meta_and_blob_scripts() {
     let mut t = h();
