@@ -200,6 +200,15 @@ identifier test reproduced a stalled modern form. Google's basic form completed 
 request, but an owner-authorized real-account attempt returned “This browser or app may not be
 secure” before a password prompt. No password or verification code was entered. This follows
 Google's [supported-browser guidance](https://support.google.com/accounts/answer/7675428?hl=en).
+Tracing caught initialization promises on 2026-11-19 found two additional platform defects:
+missing numeric navigation-timing fields produced an `int32` validation error, and dynamically
+inserted inline classic scripts ran after insertion returned. Inline scripts now run during
+insertion with normal global Script semantics and `document.currentScript` restoration;
+external scripts and modules continue through the loading queue. Navigation timing exposes
+numeric fields and records DOM/load lifecycle events. Uninstrumented transport timings remain
+zero; they are not fabricated from a reference browser. These fixes have regression coverage;
+Google authentication still requires a separate live identifier/password-prompt check.
+
 The notice on ordinary Google sign-in and rejection pages offers **Open Google in new tab**.
 It starts a separate sign-in in the visitor's regular browser, retaining only the service,
 language and return destination. It does not copy panel session tokens or sign the panel in,

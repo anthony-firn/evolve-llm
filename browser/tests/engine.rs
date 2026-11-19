@@ -84,6 +84,51 @@ fn runs_scripts_in_order_and_mutates_the_dom() {
 }
 
 #[test]
+fn inserted_inline_scripts_execute_before_insertion_returns_once_per_element() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", r#"<script id=outer>
+      window.order = ['before'];
+      const s = document.createElement('script');
+      s.id = 'inner';
+      s.text = "order.push('inline:' + document.currentScript.id); window.readyNow = true; let insertedLexical = 42";
+      document.head.appendChild(s);
+      order.push('after:' + readyNow + ':' + document.currentScript.id);
+      s.remove(); document.head.appendChild(s);
+      const detached = document.createElement('div');
+      const nested = document.createElement('script'); nested.textContent = "order.push('nested')";
+      detached.appendChild(nested);
+      order.push('detached'); document.body.appendChild(detached);
+      const fails = document.createElement('script'); fails.text = "throw Error('expected inline error')";
+      document.head.insertBefore(fails, s); order.push('continued');
+    </script>"#);
+    t.open("https://a.test/");
+    assert_eq!(t.eval("order.join(',')"), "\"before,inline:inner,after:true:outer,detached,nested,continued\"");
+    assert_eq!(t.eval("document.currentScript"), "null");
+    assert_eq!(t.eval("insertedLexical"), "42");
+}
+
+#[test]
+fn navigation_timing_is_numeric_and_tracks_document_events() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", r#"<script>
+      window.nav = performance.getEntriesByType('navigation')[0];
+      window.earlyLoad = nav.loadEventEnd;
+      document.addEventListener('DOMContentLoaded', () => {
+        window.duringDcl = nav.domContentLoadedEventStart;
+        window.endDuringDcl = nav.domContentLoadedEventEnd;
+      });
+      window.addEventListener('load', () => window.duringLoad = nav.loadEventStart);
+    </script>"#);
+    t.open("https://a.test/");
+    assert_eq!(t.eval("nav instanceof PerformanceNavigationTiming && nav instanceof PerformanceResourceTiming && nav instanceof PerformanceEntry"), "true");
+    assert_eq!(t.eval("earlyLoad === 0 && endDuringDcl === 0"), "true");
+    assert_eq!(t.eval("['fetchStart','domainLookupStart','domainLookupEnd','connectStart','connectEnd','requestStart','responseStart','responseEnd','domInteractive','domComplete','loadEventStart','loadEventEnd'].every(k => Number.isFinite(Math.round(nav[k])))"), "true");
+    assert_eq!(t.eval("nav.domInteractive <= duringDcl && duringDcl <= nav.domContentLoadedEventEnd && nav.domContentLoadedEventEnd <= nav.domComplete && nav.domComplete <= duringLoad && duringLoad <= nav.loadEventEnd"), "true");
+    assert_eq!(t.eval("nav.duration === nav.loadEventEnd && performance.getEntries()[0] === nav && performance.getEntriesByName(location.href, 'navigation')[0] === nav && performance.getEntriesByName(location.href, 'mark').length === 0"), "true");
+    assert_eq!(t.eval("JSON.parse(JSON.stringify(nav)).entryType"), "\"navigation\"");
+}
+
+#[test]
 fn dom_apis_behave_like_a_browser() {
     let mut t = h();
     t.site.add("https://a.test/", "text/html", "<div id=root class='a b'><span>one</span><span>two</span></div>");

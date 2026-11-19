@@ -65,7 +65,6 @@ pub struct Page {
     next_ordered: usize,
     /// async and dynamically inserted scripts, run as they arrive
     unordered: Vec<ScriptItem>,
-    started: HashSet<NodeId>,
     dom_loaded: bool,
     load_fired: bool,
     dom_loaded_at: f64,
@@ -483,7 +482,6 @@ impl Engine {
             ordered: vec![],
             next_ordered: 0,
             unordered: vec![],
-            started: HashSet::new(),
             dom_loaded: false,
             load_fired: false,
             dom_loaded_at: 0.0,
@@ -1071,7 +1069,7 @@ fn collect_parser_scripts(page: &mut Page) {
     let base = page.doc.base_url().clone();
     let mut deferred = vec![];
     for id in ids {
-        page.started.insert(id);
+        page.state.started_scripts.insert(id);
         let Some(item) = prepare_script(&mut page.doc, id, &base) else { continue };
         let node = page.doc.get_node(id).unwrap();
         let is_async = node.data.has_attr(local_name!("async")) && item.url.is_some();
@@ -1239,7 +1237,7 @@ fn insert_written_html(page: &mut Page, after: NodeId, html: &str) {
         }
         ids.extend(page.doc.query_selector_all_in(k, "script").map(|v| v.to_vec()).unwrap_or_default());
         for id in ids {
-            if page.started.insert(id) {
+            if page.state.started_scripts.insert(id) {
                 if let Some(item) = prepare_script(&mut page.doc, id, &base) {
                     new_items.push(item);
                 }
@@ -1268,7 +1266,7 @@ fn run_scripts(page: &mut Page) {
     let dynamic: Vec<NodeId> = page.state.dynamic_scripts.drain(..).collect();
     let base = page.doc.base_url().clone();
     for id in dynamic {
-        if !page.started.insert(id) {
+        if !page.state.started_scripts.insert(id) {
             continue;
         }
         if let Some(mut item) = prepare_script(&mut page.doc, id, &base) {

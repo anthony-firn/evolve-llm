@@ -9,7 +9,7 @@ use blitz_traits::events::DomEvent;
 use boa_engine::object::builtins::{JsArray, JsUint8Array};
 use boa_engine::object::ObjectInitializer;
 use boa_engine::property::Attribute;
-use boa_engine::{Context, JsArgs, JsNativeError, JsResult, JsString, JsValue, NativeFunction};
+use boa_engine::{Context, JsArgs, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source};
 use url::Url;
 
 type HostFn = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
@@ -87,6 +87,7 @@ pub fn install(ctx: &mut Context) -> JsResult<()> {
         ("scrollTo", scroll_to, 2),
         ("listen", listen, 1),
         ("runScript", run_script, 1),
+        ("evalClassic", eval_classic, 1),
         ("write", write, 1),
         ("importMap", import_map, 1),
         ("supports", supports, 2),
@@ -1155,13 +1156,32 @@ fn listen(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue>
     })
 }
 
+// Return inline classic source to the DOM insertion operation. It executes in JavaScript
+// after this host borrow ends, before appendChild/insertBefore returns. External scripts and
+// modules keep using the engine's fetch/task queue.
 fn run_script(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
     let id = arg_id(args, 0)?;
-    host(|_, state| {
+    host(|doc, state| {
+        if state.started_scripts.contains(&id) { return JsValue::undefined(); }
+        let Some(node) = doc.get_node(id) else { return JsValue::undefined() };
+        let ty = node.attr(local_name!("type")).unwrap_or("").trim().to_ascii_lowercase();
+        let classic = matches!(ty.split(';').next().unwrap_or("").trim(), "" | "text/javascript" | "application/javascript" | "text/ecmascript" | "application/ecmascript" | "application/x-javascript" | "text/jscript" | "text/livescript" | "text/x-javascript");
+        if classic && !node.data.has_attr(local_name!("src")) && !node.data.has_attr(local_name!("nomodule")) {
+            let source = node.text_content();
+            if source.is_empty() { return JsValue::undefined(); }
+            state.started_scripts.insert(id);
+            return js_str(&source);
+        }
         state.dynamic_scripts.push(id);
         host::wake();
         JsValue::undefined()
     })
+}
+// This entry point owns no document/state borrow while evaluating. Use Script semantics
+// rather than indirect eval: top-level lexical bindings must survive later script elements.
+fn eval_classic(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let source = arg_str(args, 0, ctx)?;
+    ctx.eval(Source::from_bytes(source.as_bytes()))
 }
 
 /// document.write while the page is loading: buffered and inserted after the running script.

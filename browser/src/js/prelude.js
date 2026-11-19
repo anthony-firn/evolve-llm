@@ -357,11 +357,19 @@
     if (oldParent && observers.length) queueRecord({ type: 'childList', target: oldParent, removedNodes: [child], addedNodes: [] });
     queueRecord({ type: 'childList', target: parent, addedNodes: [child], removedNodes: [], nextSibling: ref || null, previousSibling: child.previousSibling });
     if (child.nodeType === 1 && parent.isConnected) {
-      if (child.localName === 'script') H.runScript(child[ID]);
-      else if (H.children(child[ID]).length) for (const s of H.queryAll(child[ID], 'script')) H.runScript(s);
+      if (child.localName === 'script') runInsertedScript(child);
+      else if (H.children(child[ID]).length) for (const s of H.queryAll(child[ID], 'script')) runInsertedScript(wrap(s));
       if (customDefs.size && !wasConnected) { upgradeTree(child); walkCustom(child, 'connectedCallback'); }
       if (child.localName === 'img' || child.localName === 'iframe') scheduleLoad(child);
     }
+  }
+  function runInsertedScript(el) {
+    const source = H.runScript(el[ID]);
+    if (typeof source !== 'string') return;
+    const previous = currentScript;
+    currentScript = el;
+    try { H.evalClassic(source); } catch (e) { reportError(e); }
+    finally { currentScript = previous; }
   }
   function scheduleLoad(el) { if (!el.getAttribute('src')) return; setTimeout(() => el.dispatchEvent(new Event('load')), 0); }
 
@@ -1708,13 +1716,50 @@
   };
   const timeOrigin = Date.now() - H.now();
   const marks = [];
+  // Navigation timing fields are numeric even before an event has occurred. Transport
+  // phases are not yet instrumented, so leave those at zero rather than invent times.
+  const navigationTimes = Object.fromEntries([
+    'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd', 'workerStart',
+    'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+    'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd',
+    'domInteractive', 'domContentLoadedEventStart', 'domContentLoadedEventEnd',
+    'domComplete', 'loadEventStart', 'loadEventEnd', 'activationStart',
+  ].map(name => [name, 0]));
+  class PerformanceEntry {
+    toJSON() { const result = {}; for (const key of ['name', 'entryType', 'startTime', 'duration']) result[key] = this[key]; return result; }
+  }
+  class PerformanceResourceTiming extends PerformanceEntry {}
+  class PerformanceNavigationTiming extends PerformanceResourceTiming {
+    get name() { return H.url(); }
+    get entryType() { return 'navigation'; }
+    get startTime() { return 0; }
+    get duration() { return navigationTimes.loadEventEnd; }
+    get type() { return 'navigate'; }
+    get redirectCount() { return 0; }
+    get initiatorType() { return 'navigation'; }
+    get nextHopProtocol() { return ''; }
+    get transferSize() { return 0; }
+    get encodedBodySize() { return 0; }
+    get decodedBodySize() { return 0; }
+    get serverTiming() { return []; }
+    toJSON() {
+      const result = super.toJSON();
+      for (const key of [...Object.keys(navigationTimes), 'type', 'redirectCount', 'initiatorType', 'nextHopProtocol', 'transferSize', 'encodedBodySize', 'decodedBodySize', 'serverTiming']) result[key] = this[key];
+      return result;
+    }
+  }
+  for (const name of Object.keys(navigationTimes)) Object.defineProperty(PerformanceNavigationTiming.prototype, name, { get() { return navigationTimes[name]; }, enumerable: true });
+  const navigationEntry = new PerformanceNavigationTiming();
+  const legacyTiming = { navigationStart: timeOrigin, domLoading: timeOrigin };
+  for (const name of Object.keys(navigationTimes)) Object.defineProperty(legacyTiming, name, { get() { return navigationTimes[name] ? Math.floor(timeOrigin + navigationTimes[name]) : 0; }, enumerable: true });
+  const recordNavigationTime = name => { if (!navigationTimes[name]) navigationTimes[name] = H.now(); };
   const performance = {
     now: () => H.now(), timeOrigin,
     mark(name, opts) { const m = { name, entryType: 'mark', startTime: H.now(), duration: 0, detail: opts && opts.detail }; marks.push(m); return m; },
     measure(name, a, b) { const s = typeof a === 'string' ? (marks.find(m => m.name === a) || { startTime: 0 }).startTime : 0; const e = typeof b === 'string' ? (marks.find(m => m.name === b) || { startTime: H.now() }).startTime : H.now(); const m = { name, entryType: 'measure', startTime: s, duration: e - s }; marks.push(m); return m; },
-    getEntries: () => marks.slice(), getEntriesByType: (t) => t === 'navigation' ? [{ name: H.url(), entryType: 'navigation', startTime: 0, duration: 0, type: 'navigate', domContentLoadedEventEnd: 0, loadEventEnd: 0, transferSize: 0 }] : marks.filter(m => m.entryType === t),
-    getEntriesByName: (n) => marks.filter(m => m.name === n), clearMarks() { marks.length = 0; }, clearMeasures() {}, clearResourceTimings() {}, setResourceTimingBufferSize() {},
-    timing: { navigationStart: timeOrigin, fetchStart: timeOrigin, domLoading: timeOrigin, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: timeOrigin, responseEnd: timeOrigin, requestStart: timeOrigin, connectStart: timeOrigin, connectEnd: timeOrigin, domainLookupStart: timeOrigin, domainLookupEnd: timeOrigin, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0, secureConnectionStart: 0 },
+    getEntries: () => [navigationEntry, ...marks], getEntriesByType: (t) => t === 'navigation' ? [navigationEntry] : marks.filter(m => m.entryType === t),
+    getEntriesByName: (n, t) => [navigationEntry, ...marks].filter(m => m.name === n && (t === undefined || m.entryType === t)), clearMarks() { marks.length = 0; }, clearMeasures() {}, clearResourceTimings() {}, setResourceTimingBufferSize() {},
+    timing: legacyTiming,
     navigation: { type: 0, redirectCount: 0 }, memory: { jsHeapSizeLimit: 2172649472, totalJSHeapSize: 10000000, usedJSHeapSize: 5000000 },
     addEventListener() {}, removeEventListener() {}, toJSON() { return {}; },
   };
@@ -1894,6 +1939,7 @@
     PopStateEvent, HashChangeEvent, PageTransitionEvent, StorageEvent, PromiseRejectionEvent, AnimationEvent, TransitionEvent, ClipboardEvent, DragEvent, TouchEvent, CloseEvent,
     EventTarget, Node, Element, HTMLElement, SVGElement, SVGSVGElement, CharacterData, Text, Comment, CDATASection, ProcessingInstruction, Document, HTMLDocument, XMLDocument, DocumentFragment, ShadowRoot,
     Attr, NamedNodeMap, DOMTokenList, NodeList, HTMLCollection, CSSStyleDeclaration, CSSStyleSheet, StyleSheet, CSSRule, DOMRect, DOMRectReadOnly, DOMPoint, DOMPointReadOnly: DOMPoint, DOMMatrix, DOMMatrixReadOnly: DOMMatrix, DOMException,
+    PerformanceEntry, PerformanceResourceTiming, PerformanceNavigationTiming,
     DOMParser, XMLSerializer, Range, TreeWalker, NodeFilter, Animation, KeyframeEffect, MutationObserver, IntersectionObserver, ResizeObserver, PerformanceObserver,
     TextEncoder, TextDecoder, URL, URLSearchParams, Blob, File, FileReader, FormData, Headers, Request, Response, AbortController, AbortSignal, XMLHttpRequest,
     ReadableStream, WritableStream, TransformStream, WebSocket, EventSource, BroadcastChannel, MessageChannel, MessagePort, Worker, Storage, Location, MediaQueryList, FontFace,
@@ -1980,12 +2026,22 @@
     fetchDone: hostFetchDone,
     currentScript(id) { currentScript = id < 0 ? null : wrap(id); },
     scriptEvent(id, ok) { const el = wrap(id); if (!el) return; const e = new Event(ok ? 'load' : 'error'); e._trusted = true; dispatchTo(el, e); },
-    docEvent(type) { const e = new Event(type, { bubbles: type !== 'readystatechange' }); e._trusted = true; dispatchTo(document, e); },
+    docEvent(type) {
+      if (type === 'readystatechange') {
+        if (document.readyState === 'interactive') recordNavigationTime('domInteractive');
+        if (document.readyState === 'complete') recordNavigationTime('domComplete');
+      }
+      if (type === 'DOMContentLoaded') recordNavigationTime('domContentLoadedEventStart');
+      const e = new Event(type, { bubbles: type !== 'readystatechange' }); e._trusted = true; dispatchTo(document, e);
+      if (type === 'DOMContentLoaded') recordNavigationTime('domContentLoadedEventEnd');
+    },
     winEvent(type, init) {
+      if (type === 'load') recordNavigationTime('loadEventStart');
       const opts = init ? JSON.parse(init) : {};
       const cls = { popstate: PopStateEvent, hashchange: HashChangeEvent, pageshow: PageTransitionEvent, pagehide: PageTransitionEvent, storage: StorageEvent, message: MessageEvent }[type] || Event;
       if (type === 'popstate') historyState = opts.state === undefined ? null : opts.state;
       const e = new cls(type, opts); e._trusted = true; dispatchTo(G, e);
+      if (type === 'load') recordNavigationTime('loadEventEnd');
     },
     resized() { for (const m of mqls) { const e = new Event('change'); e.matches = m.matches; e.media = m.media; if (m.onchange) call(m.onchange, m, [e]); m.dispatchEvent(e); } evolve.winEvent('resize'); },
     historyLength(n) { historyLength = n; },

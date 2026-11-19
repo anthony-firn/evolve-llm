@@ -105,6 +105,8 @@ pub struct PageState {
     pub listened: HashSet<String>,
     /// `<script>` elements inserted by script, waiting to run
     pub dynamic_scripts: Vec<NodeId>,
+    /// Script elements already prepared, including synchronously inserted inline scripts.
+    pub started_scripts: HashSet<NodeId>,
     /// Script-created elements start with force-async set, until the async setter clears it.
     pub force_async_scripts: HashSet<NodeId>,
     /// Navigations requested by script: (url, replace)
@@ -140,6 +142,7 @@ impl PageState {
             animation_frame: false,
             listened: HashSet::new(),
             dynamic_scripts: vec![],
+            started_scripts: HashSet::new(),
             force_async_scripts: HashSet::new(),
             navigations: vec![],
             history: vec![],
@@ -182,8 +185,9 @@ pub(crate) fn with_host<R>(f: impl FnOnce(&mut BaseDocument, &mut PageState) -> 
         return None;
     }
     // SAFETY: the pointers are set by `enter` for the duration of a script call, during which
-    // the engine does not otherwise touch the document or state. Host functions never call back
-    // into script, so these borrows do not overlap.
+    // the engine does not otherwise touch the document or state. A host function must end
+    // its with_host closure before invoking script or converting values via page callbacks,
+    // so these borrows do not overlap.
     Some(unsafe { f(&mut *doc, &mut *state) })
 }
 
