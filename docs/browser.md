@@ -195,6 +195,16 @@ The modern Google page rendered and responded to empty-field validation in 17.2 
 2026-11-19 UTC run. No Google-specific CSS override or new browser-identity spoof was needed:
 the fixes are the parser's scripting flag, ordered dynamic scripts and constructed stylesheets.
 
+**Google account authentication is currently unsupported in this panel.** A later nonempty
+identifier test reproduced a stalled modern form. Google's basic form completed the identifier
+request, but an owner-authorized real-account attempt returned “This browser or app may not be
+secure” before a password prompt. No password or verification code was entered. This follows
+Google's [supported-browser guidance](https://support.google.com/accounts/answer/7675428?hl=en).
+The notice on ordinary Google sign-in and rejection pages offers **Open Google in new tab**.
+It starts a separate sign-in in the visitor's regular browser, retaining only the service,
+language and return destination. It does not copy panel session tokens or sign the panel in,
+and it does not rewrite OAuth grant URLs or account challenges.
+
 ## Limits
 
 - **JavaScript is interpreted.** Boa has no JIT, so script-heavy apps are slow and some large
@@ -205,7 +215,8 @@ the fixes are the parser's scripting flag, ordered dynamic scripts and construct
   (cookies and storage survive). Reload or navigate again.
 - **Missing web APIs:** canvas 2D and WebGL, audio and video playback, Web Workers, page
   WebSockets, IndexedDB, Service Workers and WebAuthn. Shadow DOM is approximated in the light
-  DOM. `Intl` is a small built-in subset (no ICU data).
+  DOM. Embedded-frame scripts do not run, and `iframe.contentWindow` is not implemented.
+  `Intl` is a small built-in subset (no ICU data).
 - **HTTP/1.1 only**, six connections per host, with stylesheets and documents first. Pages with
   hundreds of scripts load slowly, more so over Tor, where each connection is a Tor stream with
   its own TLS handshake; HTTP/2 would help.

@@ -40,6 +40,10 @@
 .browser-help{padding:10px 14px;border-bottom:1px solid var(--line);background:rgba(255,123,123,.08);font-size:13px;line-height:1.55}
 .browser-help code{font:12.5px var(--mono);padding:1px 6px;border-radius:5px;background:var(--tint-2)}
 .browser-help p{margin:4px 0;color:var(--text-2)}
+.browser-signin-help{display:flex;flex:none;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px 16px;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--bg-2);font-size:.875rem;line-height:1.5}
+.browser-signin-help[hidden]{display:none}
+.browser-signin-help span{flex:1;min-width:200px}
+.browser-signin-help .browser-button{display:inline-flex;align-items:center;font-size:.875rem;text-decoration:none;flex:none}
 
 .browser-stage{position:relative;flex:1;min-height:0;overflow:hidden;background:#fff;touch-action:none;user-select:none;-webkit-user-select:none;outline:none}
 .browser-canvas{position:absolute;inset:0;display:block;width:100%;height:100%}

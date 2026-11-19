@@ -38,6 +38,22 @@ export function addressToUrl(text) {
   return 'https://' + t;
 }
 
+/** Start ordinary Google sign-in in the real browser, without carrying panel session tokens. */
+export function externalGoogleSignInUrl(value) {
+  let current;
+  try { current = new URL(value); } catch { return null; }
+  if (current.protocol !== 'https:' || current.hostname !== 'accounts.google.com' || current.port || current.username || current.password) return null;
+  if (!['/', '/ServiceLogin', '/signin', '/v3/signin/identifier', '/v3/signin/rejected', '/signin/v2/identifier'].includes(current.pathname)) return null;
+  const flow = current.searchParams.get('flowName');
+  if (flow && !['GlifWebSignIn', 'WebLiteSignIn'].includes(flow)) return null;
+  if (['client_id', 'redirect_uri', 'scope', 'state'].some(key => current.searchParams.has(key))) return null;
+  const target = new URL('https://accounts.google.com/ServiceLogin');
+  for (const key of ['continue', 'service', 'hl']) {
+    if (current.searchParams.has(key)) target.searchParams.set(key, current.searchParams.get(key));
+  }
+  return target.href;
+}
+
 export function modifierBits(e) {
   return (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
 }
@@ -635,6 +651,10 @@ class BrowserView {
     const toolbar = el('header', { class: 'browser-toolbar' }, this.backButton, this.forwardButton, this.reloadButton, form, this.relayChip);
     if (onClose) toolbar.append(button('close', 'Close the browser', onClose));
 
+    this.externalSignIn = el('a', { class: 'browser-button', target: '_blank', rel: 'noopener noreferrer', text: 'Open Google in new tab' });
+    this.signInHelp = el('div', { class: 'browser-signin-help', role: 'status', hidden: true },
+      el('span', { text: 'Google can block sign-in in this panel. Use your regular browser to sign in. Signing in there does not sign this panel in.' }), this.externalSignIn);
+
     this.relayInput = el('input', { type: 'url', class: 'browser-relay-input', 'aria-label': 'Relay WebSocket address', placeholder: 'wss://relay.example/', spellcheck: 'false', autocomplete: 'off', oninput: () => { this.routeRadio('custom').checked = true; } });
     const option = (value, title, detail, extra) => el('label', { class: 'browser-route' },
       el('input', { type: 'radio', name: 'browser-route', value }),
@@ -679,7 +699,7 @@ class BrowserView {
     this.noteText = el('span', { class: 'browser-note', role: 'status' });
     const footer = el('footer', { class: 'browser-status' }, this.statusText, this.noteText, this.consoleBox);
 
-    this.root = el('div', { class: 'browser' }, toolbar, this.relaySettings, this.relayHelp, this.stage, footer);
+    this.root = el('div', { class: 'browser' }, toolbar, this.signInHelp, this.relaySettings, this.relayHelp, this.stage, footer);
     container.append(this.root);
     this.bindInput();
     this.observeSize();
@@ -799,6 +819,10 @@ class BrowserView {
     if (globalThis.document.activeElement !== this.addressInput) this.addressInput.value = s.url;
     this.backButton.disabled = !s.canBack;
     this.forwardButton.disabled = !s.canForward;
+    const externalSignIn = externalGoogleSignInUrl(s.url);
+    this.signInHelp.hidden = !externalSignIn;
+    if (externalSignIn) this.externalSignIn.href = externalSignIn;
+    else this.externalSignIn.removeAttribute('href');
     if (s.url) this.hideStart();
   }
 

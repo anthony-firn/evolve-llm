@@ -1,7 +1,7 @@
 // The WASM browser's main-thread client and worker host, with a fake worker and a fake engine.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BrowserClient, addressToUrl, modifierBits, isLocalOrigin, routeLabel, TOR_ROUTE, AUTO_ROUTE, DEFAULT_RELAY } from '../web/browser-client.mjs';
+import { BrowserClient, addressToUrl, externalGoogleSignInUrl, modifierBits, isLocalOrigin, routeLabel, TOR_ROUTE, AUTO_ROUTE, DEFAULT_RELAY } from '../web/browser-client.mjs';
 import { createBrowserHost, torConsensusSources } from '../web/browser-host.mjs';
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -33,6 +33,28 @@ function memoryPersistence(initial = {}) {
 }
 
 const client = (opts = {}) => new BrowserClient({ probe: async () => true, persistence: memoryPersistence(opts.saved), ...opts });
+
+test('external Google sign-in keeps the destination but starts a separate browser session', () => {
+  for (const path of ['/v3/signin/identifier', '/v3/signin/rejected']) {
+    const original = new URL(`https://accounts.google.com${path}?hl=en&flowName=GlifWebSignIn&service=mail&continue=https%3A%2F%2Fmail.google.com%2Fmail%2F&dsh=session&TL=token&idnf=private-identifier&epd=session-data`);
+    const external = new URL(externalGoogleSignInUrl(original.href));
+    assert.equal(external.origin, original.origin);
+    assert.equal(external.pathname, '/ServiceLogin');
+    for (const key of ['hl', 'service', 'continue']) assert.equal(external.searchParams.get(key), original.searchParams.get(key));
+    assert.deepEqual([...external.searchParams.keys()].sort(), ['continue', 'hl', 'service']);
+  }
+  assert.equal(externalGoogleSignInUrl('https://accounts.google.com/'), 'https://accounts.google.com/ServiceLogin');
+});
+
+test('external sign-in does not rewrite lookalikes, OAuth grants or account challenges', () => {
+  for (const url of [
+    'not a URL', 'http://accounts.google.com/', 'https://accounts.google.com.evil.test/',
+    'https://accounts.google.com:8443/', 'https://person:password@accounts.google.com/',
+    'https://accounts.google.com/v3/signin/challenge/pwd', 'https://accounts.google.com/o/oauth2/v2/auth',
+    'https://accounts.google.com/v3/signin/identifier?flowName=GeneralOAuthFlow',
+    ...['client_id', 'redirect_uri', 'scope', 'state'].map(key => `https://accounts.google.com/ServiceLogin?${key}=value`),
+  ]) assert.equal(externalGoogleSignInUrl(url), null, url);
+});
 
 test('address bar text becomes a URL or a search', () => {
   assert.equal(addressToUrl('example.com'), 'https://example.com');
