@@ -6,6 +6,7 @@ validation is not a test of authenticated sign-in or Google's acceptance of a re
 """
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 
@@ -88,6 +89,7 @@ def check(runtime, output, google=True, only=None, tls_only_profile=None):
                     if tls_only_profile and tls != tls_only_profile:
                         continue
                     result = {"identity": identity, "tls": tls}
+                    page = None
                     context = browser.new_context(viewport={"width": 1360, "height": 900})
                     try:
                         context.add_init_script(f"localStorage.setItem('evolve-browser-identity', {json.dumps(identity)});localStorage.setItem('evolve-browser-tls', {json.dumps(tls)});localStorage.setItem('evolve-browser-relay','tor:')")
@@ -96,6 +98,7 @@ def check(runtime, output, google=True, only=None, tls_only_profile=None):
                         page.locator("#open-browser").click()
                         page.wait_for_selector("#browser-panel:not([hidden]) .browser-toolbar")
                         client_call(page, "b.ready")
+                        client_call(page, "(globalThis.__evolveWorkerFailures = [], b.addEventListener('crashed', e => globalThis.__evolveWorkerFailures.push(String(e.detail?.error || 'worker stopped'))), true)")
                         client_call(page, f"b.navigate({json.dumps(TLS_URL)})")
                         def tls_data():
                             if not client_call(page, "b.state")["url"]:
@@ -128,6 +131,12 @@ def check(runtime, output, google=True, only=None, tls_only_profile=None):
                     except Exception as e:
                         result["error"] = type(e).__name__
                     finally:
+                        if page is not None:
+                            try:
+                                failures = page.evaluate("globalThis.__evolveWorkerFailures || []")
+                                result["worker_crashes"] = [re.sub(r"https?://\S+", "[URL]", str(e).splitlines()[0])[:400] for e in failures]
+                            except Exception:
+                                result["worker_crashes"] = ["diagnostic-unavailable"]
                         context.close()
                     results["cases"].append(result)
                     output.write_text(json.dumps(results, indent=2))
