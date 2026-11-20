@@ -43,6 +43,8 @@
     get code() { return { IndexSizeError: 1, HierarchyRequestError: 3, NotFoundError: 8, NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12, SecurityError: 18, NetworkError: 19, AbortError: 20, QuotaExceededError: 22, TimeoutError: 23 }[this.name] || 0; }
   }
 
+  /*__WINDOW_BRIDGE__*/
+
   // ---------------------------------------------------------------- Events
   class Event {
     constructor(type, init = {}) {
@@ -357,11 +359,19 @@
     if (oldParent && observers.length) queueRecord({ type: 'childList', target: oldParent, removedNodes: [child], addedNodes: [] });
     queueRecord({ type: 'childList', target: parent, addedNodes: [child], removedNodes: [], nextSibling: ref || null, previousSibling: child.previousSibling });
     if (child.nodeType === 1 && parent.isConnected) {
-      if (child.localName === 'script') H.runScript(child[ID]);
-      else if (H.children(child[ID]).length) for (const s of H.queryAll(child[ID], 'script')) H.runScript(s);
+      if (child.localName === 'script') runInsertedScript(child);
+      else if (H.children(child[ID]).length) for (const s of H.queryAll(child[ID], 'script')) runInsertedScript(wrap(s));
       if (customDefs.size && !wasConnected) { upgradeTree(child); walkCustom(child, 'connectedCallback'); }
       if (child.localName === 'img' || child.localName === 'iframe') scheduleLoad(child);
     }
+  }
+  function runInsertedScript(el) {
+    const source = H.runScript(el[ID]);
+    if (typeof source !== 'string') return;
+    const previous = currentScript;
+    currentScript = el;
+    try { H.evalClassic(source); } catch (e) { reportError(e); }
+    finally { currentScript = previous; }
   }
   function scheduleLoad(el) { if (!el.getAttribute('src')) return; setTimeout(() => el.dispatchEvent(new Event('load')), 0); }
 
@@ -884,7 +894,9 @@
   reflect(C.HTMLMetaElement, ['name', 'content', ['httpEquiv', 'http-equiv', 'string'], 'charset', 'media']);
   reflect(C.HTMLBaseElement, [['href', 'href', 'url'], 'target']);
   reflect(C.HTMLIFrameElement, [['src', 'src', 'url'], 'srcdoc', 'name', 'allow', ['allowFullscreen', 'allowfullscreen', 'bool'], 'width', 'height', 'loading', ['referrerPolicy', 'referrerpolicy', 'string']]);
-  getters(C.HTMLIFrameElement.prototype, { contentWindow() { return null; }, contentDocument() { return null; }, sandbox() { return new DOMTokenList(this, 'sandbox'); } });
+  // contentWindow is the frame's realm window (shared heap, so identity holds for event.source);
+  // contentDocument stays null (cross-origin frames expose no document here).
+  getters(C.HTMLIFrameElement.prototype, { contentWindow() { return windowProxy(H.frameWindow(this[ID]) ?? H.ensureFrameWindow(this[ID])); }, contentDocument() { return null; }, sandbox() { return new DOMTokenList(this, 'sandbox'); } });
   reflect(C.HTMLCanvasElement, [['width', 'width', 'int', 300], ['height', 'height', 'int', 150]]);
   Object.assign(C.HTMLCanvasElement.prototype, { getContext() { return null; }, toDataURL() { return 'data:,'; }, toBlob(cb) { setTimeout(() => cb(null), 0); }, captureStream() { return null; }, transferControlToOffscreen() { throw new DOMException('Not supported', 'NotSupportedError'); } });
   reflect(C.HTMLMediaElement, [['src', 'src', 'url'], ['autoplay', 'autoplay', 'bool'], ['loop', 'loop', 'bool'], ['controls', 'controls', 'bool'], ['muted', 'muted', 'bool'], 'preload', ['crossOrigin', 'crossorigin', 'string'], ['playsInline', 'playsinline', 'bool'], 'poster']);
@@ -1622,7 +1634,19 @@
   define(WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
   class CloseEvent extends Event { constructor(t, i = {}) { super(t, i); this.code = i.code || 1000; this.reason = i.reason || ''; this.wasClean = !!i.wasClean; } }
   class EventSource extends EventTarget { constructor(url) { super(); this.url = String(url); this.readyState = 2; this.withCredentials = false; } close() {} }
-  class BroadcastChannel extends EventTarget { constructor(name) { super(); this.name = name; } postMessage() {} close() {} }
+  // A working same-realm BroadcastChannel: a message reaches every other open channel of the
+  // same name (not the sender), on a later turn. SPAs use this to coordinate app contexts.
+  const bcChannels = new Map();
+  class BroadcastChannel extends EventTarget {
+    constructor(name) { super(); this.name = String(name); this._closed = false; const set = bcChannels.get(this.name) || new Set(); set.add(this); bcChannels.set(this.name, set); }
+    postMessage(data) {
+      if (this._closed) throw new DOMException('BroadcastChannel is closed', 'InvalidStateError');
+      const peers = [...(bcChannels.get(this.name) || [])].filter((c) => c !== this && !c._closed);
+      const cloned = structuredClone(data);
+      for (const c of peers) setTimeout(() => { if (c._closed) return; const e = new MessageEvent('message', { data: cloned, origin: location.origin, source: null }); if (c.onmessage) call(c.onmessage, c, [e]); c.dispatchEvent(e); }, 0);
+    }
+    close() { this._closed = true; const set = bcChannels.get(this.name); if (set) { set.delete(this); if (!set.size) bcChannels.delete(this.name); } }
+  }
   class MessageChannel { constructor() { this.port1 = new MessagePort(); this.port2 = new MessagePort(); this.port1._other = this.port2; this.port2._other = this.port1; } }
   class MessagePort extends EventTarget { postMessage(data) { const o = this._other; setTimeout(() => { const e = new MessageEvent('message', { data }); if (o.onmessage) call(o.onmessage, o, [e]); o.dispatchEvent(e); }, 0); } start() {} close() {} }
   class Worker extends EventTarget { constructor() { super(); throw new DOMException('Web Workers are not supported in this browser yet', 'NotSupportedError'); } }
@@ -1694,13 +1718,50 @@
   };
   const timeOrigin = Date.now() - H.now();
   const marks = [];
+  // Navigation timing fields are numeric even before an event has occurred. Transport
+  // phases are not yet instrumented, so leave those at zero rather than invent times.
+  const navigationTimes = Object.fromEntries([
+    'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd', 'workerStart',
+    'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+    'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd',
+    'domInteractive', 'domContentLoadedEventStart', 'domContentLoadedEventEnd',
+    'domComplete', 'loadEventStart', 'loadEventEnd', 'activationStart',
+  ].map(name => [name, 0]));
+  class PerformanceEntry {
+    toJSON() { const result = {}; for (const key of ['name', 'entryType', 'startTime', 'duration']) result[key] = this[key]; return result; }
+  }
+  class PerformanceResourceTiming extends PerformanceEntry {}
+  class PerformanceNavigationTiming extends PerformanceResourceTiming {
+    get name() { return H.url(); }
+    get entryType() { return 'navigation'; }
+    get startTime() { return 0; }
+    get duration() { return navigationTimes.loadEventEnd; }
+    get type() { return 'navigate'; }
+    get redirectCount() { return 0; }
+    get initiatorType() { return 'navigation'; }
+    get nextHopProtocol() { return ''; }
+    get transferSize() { return 0; }
+    get encodedBodySize() { return 0; }
+    get decodedBodySize() { return 0; }
+    get serverTiming() { return []; }
+    toJSON() {
+      const result = super.toJSON();
+      for (const key of [...Object.keys(navigationTimes), 'type', 'redirectCount', 'initiatorType', 'nextHopProtocol', 'transferSize', 'encodedBodySize', 'decodedBodySize', 'serverTiming']) result[key] = this[key];
+      return result;
+    }
+  }
+  for (const name of Object.keys(navigationTimes)) Object.defineProperty(PerformanceNavigationTiming.prototype, name, { get() { return navigationTimes[name]; }, enumerable: true });
+  const navigationEntry = new PerformanceNavigationTiming();
+  const legacyTiming = { navigationStart: timeOrigin, domLoading: timeOrigin };
+  for (const name of Object.keys(navigationTimes)) Object.defineProperty(legacyTiming, name, { get() { return navigationTimes[name] ? Math.floor(timeOrigin + navigationTimes[name]) : 0; }, enumerable: true });
+  const recordNavigationTime = name => { if (!navigationTimes[name]) navigationTimes[name] = H.now(); };
   const performance = {
     now: () => H.now(), timeOrigin,
     mark(name, opts) { const m = { name, entryType: 'mark', startTime: H.now(), duration: 0, detail: opts && opts.detail }; marks.push(m); return m; },
     measure(name, a, b) { const s = typeof a === 'string' ? (marks.find(m => m.name === a) || { startTime: 0 }).startTime : 0; const e = typeof b === 'string' ? (marks.find(m => m.name === b) || { startTime: H.now() }).startTime : H.now(); const m = { name, entryType: 'measure', startTime: s, duration: e - s }; marks.push(m); return m; },
-    getEntries: () => marks.slice(), getEntriesByType: (t) => t === 'navigation' ? [{ name: H.url(), entryType: 'navigation', startTime: 0, duration: 0, type: 'navigate', domContentLoadedEventEnd: 0, loadEventEnd: 0, transferSize: 0 }] : marks.filter(m => m.entryType === t),
-    getEntriesByName: (n) => marks.filter(m => m.name === n), clearMarks() { marks.length = 0; }, clearMeasures() {}, clearResourceTimings() {}, setResourceTimingBufferSize() {},
-    timing: { navigationStart: timeOrigin, fetchStart: timeOrigin, domLoading: timeOrigin, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: timeOrigin, responseEnd: timeOrigin, requestStart: timeOrigin, connectStart: timeOrigin, connectEnd: timeOrigin, domainLookupStart: timeOrigin, domainLookupEnd: timeOrigin, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0, secureConnectionStart: 0 },
+    getEntries: () => [navigationEntry, ...marks], getEntriesByType: (t) => t === 'navigation' ? [navigationEntry] : marks.filter(m => m.entryType === t),
+    getEntriesByName: (n, t) => [navigationEntry, ...marks].filter(m => m.name === n && (t === undefined || m.entryType === t)), clearMarks() { marks.length = 0; }, clearMeasures() {}, clearResourceTimings() {}, setResourceTimingBufferSize() {},
+    timing: legacyTiming,
     navigation: { type: 0, redirectCount: 0 }, memory: { jsHeapSizeLimit: 2172649472, totalJSHeapSize: 10000000, usedJSHeapSize: 5000000 },
     addEventListener() {}, removeEventListener() {}, toJSON() { return {}; },
   };
@@ -1880,6 +1941,7 @@
     PopStateEvent, HashChangeEvent, PageTransitionEvent, StorageEvent, PromiseRejectionEvent, AnimationEvent, TransitionEvent, ClipboardEvent, DragEvent, TouchEvent, CloseEvent,
     EventTarget, Node, Element, HTMLElement, SVGElement, SVGSVGElement, CharacterData, Text, Comment, CDATASection, ProcessingInstruction, Document, HTMLDocument, XMLDocument, DocumentFragment, ShadowRoot,
     Attr, NamedNodeMap, DOMTokenList, NodeList, HTMLCollection, CSSStyleDeclaration, CSSStyleSheet, StyleSheet, CSSRule, DOMRect, DOMRectReadOnly, DOMPoint, DOMPointReadOnly: DOMPoint, DOMMatrix, DOMMatrixReadOnly: DOMMatrix, DOMException,
+    PerformanceEntry, PerformanceResourceTiming, PerformanceNavigationTiming,
     DOMParser, XMLSerializer, Range, TreeWalker, NodeFilter, Animation, KeyframeEffect, MutationObserver, IntersectionObserver, ResizeObserver, PerformanceObserver,
     TextEncoder, TextDecoder, URL, URLSearchParams, Blob, File, FileReader, FormData, Headers, Request, Response, AbortController, AbortSignal, XMLHttpRequest,
     ReadableStream, WritableStream, TransformStream, WebSocket, EventSource, BroadcastChannel, MessageChannel, MessagePort, Worker, Storage, Location, MediaQueryList, FontFace,
@@ -1891,7 +1953,7 @@
     prompt: (m, d) => { H.dialog('prompt', m === undefined ? '' : String(m)); return d === undefined ? null : String(d); },
     print() {}, stop() {}, focus() {}, blur() {}, close() {}, moveTo() {}, moveBy() {}, resizeTo() {}, resizeBy() {}, captureEvents() {}, releaseEvents() {},
     open(url, target) { if (url) H.navigate(new URL(String(url), document.baseURI).href, false); return G; },
-    postMessage(data, origin) { setTimeout(() => dispatchTo(G, new MessageEvent('message', { data: structuredClone(data), origin: location.origin, source: G })), 0); },
+    postMessage(data, targetOrigin) { postToWindow(sourceFrame, data, targetOrigin); },
     getSelection: () => selection,
     scroll(x, y) { if (typeof x === 'object' && x) H.scrollTo(x.left === undefined ? NaN : x.left, x.top === undefined ? NaN : x.top); else H.scrollTo(x, y); },
     scrollTo(x, y) { G.scroll(x, y); },
@@ -1917,6 +1979,10 @@
   function Window() { throw new TypeError('Illegal constructor'); }
   Window.prototype = Object.getPrototypeOf(G);
   Object.defineProperty(G, 'Window', { value: Window, writable: true, configurable: true });
+  // Cross-frame messaging: the top window is frame 0; the host delivers posted messages here.
+  // Source is carried in the event, so delivering on a later turn keeps event.source correct.
+  Object.defineProperty(G, '__frameId', { value: 0, enumerable: false, configurable: true });
+  Object.defineProperty(G, '__deliverMessage', { value: (wire, origin, source) => { dispatchTo(G, new MessageEvent('message', { data: decodeWindowMessage(wire), origin, source: windowProxy(source) })); }, enumerable: false, configurable: true });
   let currentEvent;
 
   // ---------------------------------------------------------------- Engine entry points
@@ -1962,12 +2028,22 @@
     fetchDone: hostFetchDone,
     currentScript(id) { currentScript = id < 0 ? null : wrap(id); },
     scriptEvent(id, ok) { const el = wrap(id); if (!el) return; const e = new Event(ok ? 'load' : 'error'); e._trusted = true; dispatchTo(el, e); },
-    docEvent(type) { const e = new Event(type, { bubbles: type !== 'readystatechange' }); e._trusted = true; dispatchTo(document, e); },
+    docEvent(type) {
+      if (type === 'readystatechange') {
+        if (document.readyState === 'interactive') recordNavigationTime('domInteractive');
+        if (document.readyState === 'complete') recordNavigationTime('domComplete');
+      }
+      if (type === 'DOMContentLoaded') recordNavigationTime('domContentLoadedEventStart');
+      const e = new Event(type, { bubbles: type !== 'readystatechange' }); e._trusted = true; dispatchTo(document, e);
+      if (type === 'DOMContentLoaded') recordNavigationTime('domContentLoadedEventEnd');
+    },
     winEvent(type, init) {
+      if (type === 'load') recordNavigationTime('loadEventStart');
       const opts = init ? JSON.parse(init) : {};
       const cls = { popstate: PopStateEvent, hashchange: HashChangeEvent, pageshow: PageTransitionEvent, pagehide: PageTransitionEvent, storage: StorageEvent, message: MessageEvent }[type] || Event;
       if (type === 'popstate') historyState = opts.state === undefined ? null : opts.state;
       const e = new cls(type, opts); e._trusted = true; dispatchTo(G, e);
+      if (type === 'load') recordNavigationTime('loadEventEnd');
     },
     resized() { for (const m of mqls) { const e = new Event('change'); e.matches = m.matches; e.media = m.media; if (m.onchange) call(m.onchange, m, [e]); m.dispatchEvent(e); } evolve.winEvent('resize'); },
     historyLength(n) { historyLength = n; },

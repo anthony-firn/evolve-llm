@@ -9,12 +9,16 @@ use blitz_traits::events::DomEvent;
 use boa_engine::object::builtins::{JsArray, JsUint8Array};
 use boa_engine::object::ObjectInitializer;
 use boa_engine::property::Attribute;
-use boa_engine::{Context, JsArgs, JsNativeError, JsResult, JsString, JsValue, NativeFunction};
+use boa_engine::{Context, JsArgs, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source};
 use url::Url;
 
 type HostFn = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
 
-pub fn install(ctx: &mut Context) -> JsResult<()> {
+pub fn install(ctx: &mut Context) -> JsResult<()> { install_functions(ctx, false) }
+
+pub fn install_frame(ctx: &mut Context) -> JsResult<()> { install_functions(ctx, true) }
+
+fn install_functions(ctx: &mut Context, frame: bool) -> JsResult<()> {
     let fns: &[(&str, HostFn, usize)] = &[
         ("identity", identity, 0),
         ("info", info, 1),
@@ -74,6 +78,12 @@ pub fn install(ctx: &mut Context) -> JsResult<()> {
         ("storage", storage, 4),
         ("log", log, 2),
         ("dialog", dialog, 2),
+        ("frameWindow", frame_window, 1),
+        ("ensureFrameWindow", ensure_frame_window, 1),
+        ("postMessage", post_message, 5),
+        ("windowAccess", window_access, 3),
+        ("windowGet", window_get, 4),
+        ("windowSet", window_set, 5),
         ("now", now, 0),
         ("random", random, 1),
         ("encode", encode, 1),
@@ -84,6 +94,7 @@ pub fn install(ctx: &mut Context) -> JsResult<()> {
         ("scrollTo", scroll_to, 2),
         ("listen", listen, 1),
         ("runScript", run_script, 1),
+        ("evalClassic", eval_classic, 1),
         ("write", write, 1),
         ("importMap", import_map, 1),
         ("supports", supports, 2),
@@ -91,6 +102,9 @@ pub fn install(ctx: &mut Context) -> JsResult<()> {
     ];
     let mut obj = ObjectInitializer::new(ctx);
     for (name, f, arity) in fns {
+        // Child realms have no capabilities for the embedding document's DOM, cookies,
+        // storage or network. The remaining functions enforce origin/epoch checks.
+        if frame && !matches!(*name, "identity" | "log" | "postMessage" | "windowAccess" | "windowGet" | "windowSet") { continue; }
         obj.function(NativeFunction::from_fn_ptr(*f), JsString::from(*name), *arity);
     }
     let obj = obj.build();
@@ -1152,13 +1166,32 @@ fn listen(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue>
     })
 }
 
+// Return inline classic source to the DOM insertion operation. It executes in JavaScript
+// after this host borrow ends, before appendChild/insertBefore returns. External scripts and
+// modules keep using the engine's fetch/task queue.
 fn run_script(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
     let id = arg_id(args, 0)?;
-    host(|_, state| {
+    host(|doc, state| {
+        if state.started_scripts.contains(&id) { return JsValue::undefined(); }
+        let Some(node) = doc.get_node(id) else { return JsValue::undefined() };
+        let ty = node.attr(local_name!("type")).unwrap_or("").trim().to_ascii_lowercase();
+        let classic = matches!(ty.split(';').next().unwrap_or("").trim(), "" | "text/javascript" | "application/javascript" | "text/ecmascript" | "application/ecmascript" | "application/x-javascript" | "text/jscript" | "text/livescript" | "text/x-javascript");
+        if classic && !node.data.has_attr(local_name!("src")) && !node.data.has_attr(local_name!("nomodule")) {
+            let source = node.text_content();
+            if source.is_empty() { return JsValue::undefined(); }
+            state.started_scripts.insert(id);
+            return js_str(&source);
+        }
         state.dynamic_scripts.push(id);
         host::wake();
         JsValue::undefined()
     })
+}
+// This entry point owns no document/state borrow while evaluating. Use Script semantics
+// rather than indirect eval: top-level lexical bindings must survive later script elements.
+fn eval_classic(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let source = arg_str(args, 0, ctx)?;
+    ctx.eval(Source::from_bytes(source.as_bytes()))
 }
 
 /// document.write while the page is loading: buffered and inserted after the running script.
@@ -1194,4 +1227,97 @@ fn sheets(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
         let _ = ctx;
         v
     })
+}
+
+/// Return an existing frame's id, never its raw global. The realm-local WindowProxy cache
+/// gives contentWindow and message.source stable identity while enforcing origin checks.
+fn frame_window(_: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    let id = arg_num(args, 0);
+    if !id.is_finite() || id < 0.0 {
+        return Ok(JsValue::null());
+    }
+    Ok(if super::frame_window(id as u64).is_some() { JsValue::from(id) } else { JsValue::null() })
+}
+
+/// `__h.ensureFrameWindow(nodeId)` — for a SAME-ORIGIN iframe whose content has not loaded yet,
+/// creates its realm eagerly (a real browser exposes a same-origin frame's window synchronously,
+/// as about:blank, the moment the element exists). Returns the window, or null for a cross-origin
+/// frame not yet loaded (its facade appears only once its content arrives).
+fn ensure_frame_window(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let n = arg_num(args, 0);
+    if !n.is_finite() || n < 0.0 {
+        return Ok(JsValue::null());
+    }
+    let id = n as u64;
+    if super::frame_window(id).is_some() {
+        return Ok(JsValue::from(id as f64));
+    }
+    let Some((src, page, opaque_sandbox)) = with_host(|doc, state| {
+        let element = doc.get_node(NodeId::from_u64(id)).and_then(|node| node.element_data());
+        let src = element.and_then(|el| el.attr(local_name!("src")).map(str::to_string));
+        let opaque = element.and_then(|el| el.attr(local_name!("sandbox"))).is_some_and(|value| !value.split_ascii_whitespace().any(|token| token == "allow-same-origin"));
+        (src, state.url.clone(), opaque)
+    }) else {
+        return Ok(JsValue::null());
+    };
+    if opaque_sandbox { return Ok(JsValue::null()); }
+    let page_origin = page.origin().ascii_serialization();
+    let (origin, url) = match src.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => match page.join(s) {
+            Ok(u) => (u.origin().ascii_serialization(), u.to_string()),
+            Err(_) => return Ok(JsValue::null()),
+        },
+        // No src yet is about:blank, which inherits the embedding document's origin.
+        _ => (page_origin.clone(), "about:blank".to_string()),
+    };
+    if origin != page_origin {
+        return Ok(JsValue::null());
+    }
+    match super::create_frame_realm(ctx, id, &origin, &url) {
+        Ok(_) => Ok(JsValue::from(id as f64)),
+        Err(_) => Ok(JsValue::null()),
+    }
+}
+
+fn checked_window_args(args: &[JsValue]) -> Option<(u64, u64, u64)> {
+    let values = [arg_num(args, 0), arg_num(args, 1), arg_num(args, 2)];
+    values.iter().all(|v| v.is_finite() && *v >= 0.0 && v.fract() == 0.0 && *v <= 9_007_199_254_740_991.0)
+        .then_some((values[0] as u64, values[1] as u64, values[2] as u64))
+}
+
+fn window_access(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(checked_window_args(args).and_then(|(target, source, epoch)| super::checked_frame_window(target, source, epoch)).is_some()))
+}
+
+fn window_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let window = checked_window_args(args).and_then(|(target, source, epoch)| super::checked_frame_window(target, source, epoch))
+        .ok_or_else(|| JsNativeError::error().with_message("SecurityError: cross-origin window access"))?;
+    let key = args.get_or_undefined(3).to_property_key(ctx)?;
+    window.get(key, ctx)
+}
+
+fn window_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let window = checked_window_args(args).and_then(|(target, source, epoch)| super::checked_frame_window(target, source, epoch))
+        .ok_or_else(|| JsNativeError::error().with_message("SecurityError: cross-origin window access"))?;
+    let key = args.get_or_undefined(3).to_property_key(ctx)?;
+    window.set(key, args.get_or_undefined(4).clone(), true, ctx)?;
+    Ok(JsValue::undefined())
+}
+
+// Queue a serialized message. The sender's identity is captured in its realm-local bridge;
+// old realm capabilities are revoked on navigation by the epoch check. No JS object is shared.
+fn post_message(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some((target, source, epoch)) = checked_window_args(args) else {
+        return Err(JsNativeError::typ().with_message("Invalid window identity").into());
+    };
+    let wire = arg_str(args, 3, ctx)?;
+    let requested = arg_str(args, 4, ctx)?;
+    let target_origin = match requested.as_str() {
+        "*" => requested.clone(),
+        "/" => super::frame_origin(source).unwrap_or_default(),
+        _ => Url::parse(&requested).map_err(|_| JsNativeError::syntax().with_message("Invalid postMessage target origin"))?.origin().ascii_serialization(),
+    };
+    if requested == "/" && target_origin == "null" && source != target { return Ok(JsValue::undefined()); }
+    super::queue_frame_message(target, source, epoch, wire, target_origin);
+    Ok(JsValue::undefined())
 }

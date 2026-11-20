@@ -68,12 +68,13 @@ impl Browser {
         self.engine.resize(css_width, css_height, dpr);
     }
 
-    /// Diagnostic content-negotiation profile; must be selected before the first navigation.
+    /// Diagnostic identity (user agent, request fields, HTTP/2 framing); must be selected
+    /// before the first navigation.
     #[wasm_bindgen(js_name = setIdentity)]
     pub fn set_identity(&mut self, profile: &str) -> Result<(), JsValue> {
         let identity = crate::identity::Identity::parse(profile).map_err(JsValue::from_str)?;
         self.engine.set_identity(profile).map_err(JsValue::from_str)?;
-        *self.client.user_agent.borrow_mut() = identity.user_agent().into();
+        self.client.set_identity(identity);
         Ok(())
     }
 

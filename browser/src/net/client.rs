@@ -9,8 +9,9 @@ use super::wisp::{Mux, WispStream};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::{poll_fn, Future};
-use std::io::{Read, Write};
-use std::pin::pin;
+use std::pin::{pin, Pin};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Poll, Waker};
@@ -51,109 +52,58 @@ enum Stream {
     Wisp(WispStream),
 }
 
-impl Stream {
-    async fn read(&mut self) -> Result<Option<Vec<u8>>, String> {
-        match self {
-            Stream::Tor(s) => s.read().await,
-            Stream::Wisp(s) => s.read().await,
+impl futures::io::AsyncRead for Stream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tor(s) => futures::io::AsyncRead::poll_read(Pin::new(s), cx, buf),
+            Self::Wisp(s) => futures::io::AsyncRead::poll_read(Pin::new(s), cx, buf),
         }
     }
-    async fn write(&mut self, data: &[u8]) -> Result<(), String> {
-        match self {
-            Stream::Tor(s) => s.write(data).await,
-            Stream::Wisp(s) => s.write(data).await,
+}
+impl futures::io::AsyncWrite for Stream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tor(s) => futures::io::AsyncWrite::poll_write(Pin::new(s), cx, buf),
+            Self::Wisp(s) => futures::io::AsyncWrite::poll_write(Pin::new(s), cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tor(s) => futures::io::AsyncWrite::poll_flush(Pin::new(s), cx),
+            Self::Wisp(s) => futures::io::AsyncWrite::poll_flush(Pin::new(s), cx),
+        }
+    }
+    fn poll_close(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tor(s) => futures::io::AsyncWrite::poll_close(Pin::new(s), cx),
+            Self::Wisp(s) => futures::io::AsyncWrite::poll_close(Pin::new(s), cx),
         }
     }
 }
 
-struct TlsConn {
-    tls: rustls::ClientConnection,
-    io: Stream,
-    pending: Vec<u8>,
-    eof: bool,
-}
-
-impl TlsConn {
-    async fn connect(io: Stream, host: &str, config: Arc<rustls::ClientConfig>) -> Result<Self, String> {
-        let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| format!("Invalid TLS server name {host}"))?;
-        let tls = rustls::ClientConnection::new(config, name).map_err(|e| format!("TLS setup failed: {e}"))?;
-        let mut conn = TlsConn { tls, io, pending: vec![], eof: false };
-        while conn.tls.is_handshaking() {
-            conn.flush().await?;
-            if conn.tls.is_handshaking() && conn.tls.wants_read() && !conn.fill().await? {
-                return Err(format!("{host} closed the connection during the TLS handshake"));
-            }
-        }
-        conn.flush().await?;
-        Ok(conn)
-    }
-
-    async fn flush(&mut self) -> Result<(), String> {
-        while self.tls.wants_write() {
-            let mut buf = Vec::new();
-            self.tls.write_tls(&mut buf).map_err(|e| e.to_string())?;
-            self.io.write(&buf).await?;
-        }
-        Ok(())
-    }
-
-    /// Feed more ciphertext into rustls. Returns false at end of stream.
-    async fn fill(&mut self) -> Result<bool, String> {
-        if self.pending.is_empty() {
-            match self.io.read().await? {
-                Some(data) => self.pending = data,
-                None => {
-                    self.eof = true;
-                    return Ok(false);
-                }
-            }
-        }
-        let mut reader = &self.pending[..];
-        let mut consumed = 0;
-        while !reader.is_empty() {
-            match self.tls.read_tls(&mut reader) {
-                Ok(0) => break,
-                Ok(n) => consumed += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Other => break, // plaintext buffer full
-                Err(e) => return Err(format!("TLS read failed: {e}")),
-            }
-            self.tls.process_new_packets().map_err(|e| format!("TLS error: {e}"))?;
-        }
-        self.pending.drain(..consumed);
-        Ok(true)
-    }
-
-    async fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
-        self.tls.writer().write_all(data).map_err(|e| e.to_string())?;
-        self.flush().await
-    }
-
-    async fn read(&mut self) -> Result<Option<Vec<u8>>, String> {
-        loop {
-            let mut buf = vec![0u8; 32 * 1024];
-            match self.tls.reader().read(&mut buf) {
-                Ok(0) => return Ok(None),
-                Ok(n) => {
-                    buf.truncate(n);
-                    return Ok(Some(buf));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if self.eof || !self.fill().await? {
-                        return Ok(None);
-                    }
-                    self.flush().await?;
-                }
-                // Many servers close without close_notify; treat it as the end of the body.
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(format!("TLS read failed: {e}")),
-            }
-        }
-    }
-}
-
+type Socket = tokio_util::compat::Compat<Stream>;
 enum Io {
-    Plain(Stream),
-    Tls(Box<TlsConn>),
+    Plain(Socket),
+    Tls(Box<tokio_rustls::client::TlsStream<Socket>>),
+}
+impl Io {
+    fn is_h2(&self) -> bool { matches!(self, Self::Tls(t) if t.get_ref().1.alpn_protocol() == Some(b"h2")) }
+}
+impl AsyncRead for Io {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() { Self::Plain(s) => Pin::new(s).poll_read(cx, buf), Self::Tls(s) => Pin::new(&mut **s).poll_read(cx, buf) }
+    }
+}
+impl AsyncWrite for Io {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() { Self::Plain(s) => Pin::new(s).poll_write(cx, buf), Self::Tls(s) => Pin::new(&mut **s).poll_write(cx, buf) }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() { Self::Plain(s) => Pin::new(s).poll_flush(cx), Self::Tls(s) => Pin::new(&mut **s).poll_flush(cx) }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() { Self::Plain(s) => Pin::new(s).poll_shutdown(cx), Self::Tls(s) => Pin::new(&mut **s).poll_shutdown(cx) }
+    }
 }
 
 struct Conn {
@@ -166,16 +116,17 @@ impl Conn {
         if !self.buf.is_empty() {
             return Ok(Some(std::mem::take(&mut self.buf)));
         }
-        match &mut self.io {
-            Io::Plain(s) => s.read().await,
-            Io::Tls(t) => t.read().await,
+        let mut buf = vec![0; 32 * 1024];
+        match tokio::io::AsyncReadExt::read(&mut self.io, &mut buf).await {
+            Ok(0) => Ok(None),
+            Ok(n) => { buf.truncate(n); Ok(Some(buf)) },
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => Err(e.to_string()),
         }
     }
     async fn write(&mut self, data: &[u8]) -> Result<(), String> {
-        match &mut self.io {
-            Io::Plain(s) => s.write(data).await,
-            Io::Tls(t) => t.write_all(data).await,
-        }
+        tokio::io::AsyncWriteExt::write_all(&mut self.io, data).await.map_err(|e| e.to_string())?;
+        tokio::io::AsyncWriteExt::flush(&mut self.io).await.map_err(|e| e.to_string())
     }
 }
 
@@ -190,11 +141,15 @@ pub struct Client {
     tls: std::cell::RefCell<Arc<rustls::ClientConfig>>,
     pub jar: RefCell<cookie_store::CookieStore>,
     pool: RefCell<HashMap<String, Vec<Conn>>>,
+    h2_pool: RefCell<HashMap<String, super::http2::Session>>,
+    connecting: RefCell<HashMap<String, Rc<futures::lock::Mutex<()>>>>,
     active: RefCell<HashMap<String, usize>>,
     /// Per host: (priority, arrival, waker); lowest priority value is served first, FIFO within.
     waiters: RefCell<HashMap<String, Vec<(u8, u64, Waker)>>>,
     seq: Cell<u64>,
     pub user_agent: RefCell<String>,
+    /// Selects request fields and HTTP/2 framing (see net::headers).
+    pub identity: Cell<crate::identity::Identity>,
     pub accept_language: RefCell<String>,
     pub cookies_changed: Cell<bool>,
     pub log: RefCell<Vec<LogEntry>>,
@@ -205,6 +160,7 @@ impl Client {
     pub fn set_tls_profile(&self, profile: &str) -> Result<(), &'static str> {
         *self.tls.borrow_mut() = super::tls::config(profile)?;
         self.pool.borrow_mut().clear();
+        self.h2_pool.borrow_mut().clear();
         Ok(())
     }
 
@@ -219,10 +175,13 @@ impl Client {
             tls: RefCell::new(super::tls::config("default").expect("default TLS profile")),
             jar: RefCell::new(jar),
             pool: RefCell::default(),
+            h2_pool: RefCell::default(),
+            connecting: RefCell::default(),
             active: RefCell::default(),
             waiters: RefCell::default(),
             seq: Cell::new(0),
             user_agent: RefCell::new(crate::identity::Identity::default().user_agent().into()),
+            identity: Cell::default(),
             accept_language: RefCell::new("en-US,en;q=0.9".into()),
             cookies_changed: Cell::new(false),
             log: RefCell::default(),
@@ -234,6 +193,17 @@ impl Client {
         if self.route.borrow().url() != Route::new(url).url() {
             *self.route.borrow_mut() = Route::new(url);
             self.pool.borrow_mut().clear();
+            self.h2_pool.borrow_mut().clear();
+        }
+    }
+
+    /// Select the identity used for request fields and HTTP/2 framing. Open connections are
+    /// dropped so one connection never mixes framings.
+    pub fn set_identity(&self, identity: crate::identity::Identity) {
+        *self.user_agent.borrow_mut() = identity.user_agent().into();
+        if self.identity.replace(identity) != identity {
+            self.pool.borrow_mut().clear();
+            self.h2_pool.borrow_mut().clear();
         }
     }
 
@@ -428,68 +398,7 @@ impl Client {
     }
 
     fn request_headers(&self, req: &FetchRequest, cookie: Option<String>, cors_origin: Option<&str>) -> Vec<(String, String)> {
-        let mut headers: Vec<(String, String)> = Vec::new();
-        let has = |name: &str| req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
-        headers.push(("User-Agent".into(), self.user_agent.borrow().clone()));
-        if !has("accept") {
-            let accept = match req.dest {
-                "document" => "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "style" => "text/css,*/*;q=0.1",
-                "image" => "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-                _ => "*/*",
-            };
-            headers.push(("Accept".into(), accept.into()));
-        }
-        if !has("accept-language") {
-            headers.push(("Accept-Language".into(), self.accept_language.borrow().clone()));
-        }
-        headers.push(("Accept-Encoding".into(), "gzip, deflate, br".into()));
-        for (k, v) in &req.headers {
-            if !policy::forbidden_request_header(k) || req.mode != Mode::Cors && k.starts_with("Access-Control-Request") {
-                headers.push((k.clone(), v.clone()));
-            }
-        }
-        if let Some(cookie) = cookie {
-            headers.push(("Cookie".into(), cookie));
-        }
-        // Referer: origin only when crossing sites (strict-origin-when-cross-origin)
-        if let Some(initiator) = &req.initiator {
-            let downgrade = initiator.scheme() == "https" && req.url.scheme() == "http";
-            if !downgrade && matches!(initiator.scheme(), "http" | "https") {
-                let referer = if policy::same_origin(initiator, &req.url) {
-                    let mut r = initiator.clone();
-                    r.set_fragment(None);
-                    let _ = r.set_username("");
-                    let _ = r.set_password(None);
-                    r.to_string()
-                } else {
-                    format!("{}/", initiator.origin().ascii_serialization())
-                };
-                headers.push(("Referer".into(), referer));
-            }
-        }
-        let origin = cors_origin.map(str::to_string).or_else(|| {
-            (!matches!(req.method.as_str(), "GET" | "HEAD")).then(|| req.initiator.as_ref().map(|u| u.origin().ascii_serialization()).unwrap_or_else(|| "null".into()))
-        });
-        if let Some(origin) = origin {
-            headers.push(("Origin".into(), origin));
-        }
-        let site = match &req.initiator {
-            None => "none",
-            Some(i) if policy::same_origin(i, &req.url) => "same-origin",
-            Some(i) if policy::same_site(i, &req.url) => "same-site",
-            Some(_) => "cross-site",
-        };
-        headers.push(("Sec-Fetch-Site".into(), site.into()));
-        headers.push(("Sec-Fetch-Mode".into(), match req.mode { Mode::Navigate => "navigate", Mode::NoCors => "no-cors", Mode::Cors => "cors" }.into()));
-        headers.push(("Sec-Fetch-Dest".into(), req.dest.into()));
-        if req.mode == Mode::Navigate {
-            if req.user_activated {
-                headers.push(("Sec-Fetch-User".into(), "?1".into()));
-            }
-            headers.push(("Upgrade-Insecure-Requests".into(), "1".into()));
-        }
-        headers
+        super::headers::request_headers(req, self.identity.get(), &self.user_agent.borrow(), &self.accept_language.borrow(), cookie, cors_origin)
     }
 
     async fn send(&self, req: &FetchRequest, cookie: Option<String>, cors_origin: Option<&str>) -> Result<(ResponseHead, Vec<u8>), String> {
@@ -518,19 +427,44 @@ impl Client {
 
         let _slot = self.acquire(&key, req.dest).await;
         for attempt in 0..2 {
-            let pooled = if attempt == 0 { self.pool.borrow_mut().get_mut(&key).and_then(Vec::pop) } else { None };
-            let reused = pooled.is_some();
-            let mut conn = match pooled {
-                Some(c) => c,
-                None => self.open(&host, port, tls, &first_party).await?,
+            // Serialize connection establishment per origin/first-party, then multiplex streams.
+            let lock = self.connecting.borrow_mut().entry(key.clone()).or_default().clone();
+            let guard = lock.lock().await;
+            let existing = self.h2_pool.borrow().get(&key).cloned();
+            let mut h1 = None;
+            let mut reused = false;
+            let h2 = if let Some(session) = existing { Some(session) } else {
+                let pooled = if attempt == 0 { self.pool.borrow_mut().get_mut(&key).and_then(Vec::pop) } else { None };
+                reused = pooled.is_some();
+                let conn = match pooled { Some(c) => c, None => self.open(&host, port, tls, &first_party).await? };
+                if conn.io.is_h2() {
+                    let handshake = super::http2::connect(conn.io, self.identity.get().is_firefox());
+                    let (session, driver) = with_timeout(handshake, 20_000).await.ok_or("HTTP/2 handshake timed out")??;
+                    wasm_bindgen_futures::spawn_local(driver);
+                    self.h2_pool.borrow_mut().insert(key.clone(), session.clone());
+                    Some(session)
+                } else { h1 = Some(conn); None }
             };
-            let exchange = self.exchange(&mut conn, &bytes, &req.method);
-            match with_timeout(exchange, TIMEOUT_MS).await {
+            drop(guard);
+            if let Some(session) = h2 {
+                let framing = super::headers::h2_framing(self.identity.get(), req.dest);
+                let result = with_timeout(session.request(req, &headers, framing), TIMEOUT_MS).await;
+                match result {
+                    Some(Ok(response)) => return Ok(response),
+                    Some(Err(super::http2::Error::BeforeSend(_))) if attempt == 0 => {
+                        let mut pool = self.h2_pool.borrow_mut();
+                        if pool.get(&key).is_some_and(|current| current.same_connection(&session)) { pool.remove(&key); }
+                        continue;
+                    },
+                    Some(Err(e)) => return Err(e.to_string()),
+                    None => return Err(format!("{host} did not respond within {} seconds", TIMEOUT_MS / 1000)),
+                }
+            }
+            let mut conn = h1.unwrap();
+            match with_timeout(self.exchange(&mut conn, &bytes, &req.method), TIMEOUT_MS).await {
                 None => return Err(format!("{host} did not respond within {} seconds", TIMEOUT_MS / 1000)),
                 Some(Ok((head, body, reusable))) => {
-                    if reusable {
-                        self.pool.borrow_mut().entry(key.clone()).or_default().push(conn);
-                    }
+                    if reusable { self.pool.borrow_mut().entry(key.clone()).or_default().push(conn); }
                     return Ok((head, body));
                 }
                 Some(Err(ExchangeError::Stale(_))) if reused => continue,
@@ -553,15 +487,17 @@ impl Client {
             },
             Route::Wisp(m) => Stream::Wisp(m.connect(host, port).await?),
         };
+        let socket = stream.compat();
         let io = if tls {
             let config = self.tls.borrow().clone();
-            match with_timeout(TlsConn::connect(stream, host, config), 20_000).await {
-                Some(r) => Io::Tls(Box::new(r?)),
+            let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| "Invalid TLS server name")?;
+            let connector = tokio_rustls::TlsConnector::from(config);
+            match with_timeout(connector.connect(name, socket), 20_000).await {
+                Some(Ok(stream)) => Io::Tls(Box::new(stream)),
+                Some(Err(e)) => return Err(format!("TLS handshake with {host} failed: {e}")),
                 None => return Err(format!("The TLS handshake with {host} timed out")),
             }
-        } else {
-            Io::Plain(stream)
-        };
+        } else { Io::Plain(socket) };
         Ok(Conn { io, buf: vec![] })
     }
 

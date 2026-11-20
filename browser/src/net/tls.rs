@@ -29,8 +29,8 @@ pub fn config(profile: &str) -> Result<Arc<rustls::ClientConfig>, &'static str> 
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions().expect("TLS versions")
         .with_root_certificates(roots).with_no_client_auth();
-    // Advertising h2 before implementing it would break connections that select it.
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // The client selects its transport using the negotiated ALPN.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
 
@@ -79,7 +79,7 @@ mod tests {
         let mut a = suites(&default); a.sort();
         let mut b = suites(&firefox); b.sort();
         assert_eq!(a, b);
-        assert_eq!(firefox.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert_eq!(firefox.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
         let name = rustls::pki_types::ServerName::try_from("example.com").unwrap();
         let mut conn = rustls::ClientConnection::new(firefox, name).unwrap();
         let mut wire = Vec::new();

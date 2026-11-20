@@ -84,6 +84,51 @@ fn runs_scripts_in_order_and_mutates_the_dom() {
 }
 
 #[test]
+fn inserted_inline_scripts_execute_before_insertion_returns_once_per_element() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", r#"<script id=outer>
+      window.order = ['before'];
+      const s = document.createElement('script');
+      s.id = 'inner';
+      s.text = "order.push('inline:' + document.currentScript.id); window.readyNow = true; let insertedLexical = 42";
+      document.head.appendChild(s);
+      order.push('after:' + readyNow + ':' + document.currentScript.id);
+      s.remove(); document.head.appendChild(s);
+      const detached = document.createElement('div');
+      const nested = document.createElement('script'); nested.textContent = "order.push('nested')";
+      detached.appendChild(nested);
+      order.push('detached'); document.body.appendChild(detached);
+      const fails = document.createElement('script'); fails.text = "throw Error('expected inline error')";
+      document.head.insertBefore(fails, s); order.push('continued');
+    </script>"#);
+    t.open("https://a.test/");
+    assert_eq!(t.eval("order.join(',')"), "\"before,inline:inner,after:true:outer,detached,nested,continued\"");
+    assert_eq!(t.eval("document.currentScript"), "null");
+    assert_eq!(t.eval("insertedLexical"), "42");
+}
+
+#[test]
+fn navigation_timing_is_numeric_and_tracks_document_events() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", r#"<script>
+      window.nav = performance.getEntriesByType('navigation')[0];
+      window.earlyLoad = nav.loadEventEnd;
+      document.addEventListener('DOMContentLoaded', () => {
+        window.duringDcl = nav.domContentLoadedEventStart;
+        window.endDuringDcl = nav.domContentLoadedEventEnd;
+      });
+      window.addEventListener('load', () => window.duringLoad = nav.loadEventStart);
+    </script>"#);
+    t.open("https://a.test/");
+    assert_eq!(t.eval("nav instanceof PerformanceNavigationTiming && nav instanceof PerformanceResourceTiming && nav instanceof PerformanceEntry"), "true");
+    assert_eq!(t.eval("earlyLoad === 0 && endDuringDcl === 0"), "true");
+    assert_eq!(t.eval("['fetchStart','domainLookupStart','domainLookupEnd','connectStart','connectEnd','requestStart','responseStart','responseEnd','domInteractive','domComplete','loadEventStart','loadEventEnd'].every(k => Number.isFinite(Math.round(nav[k])))"), "true");
+    assert_eq!(t.eval("nav.domInteractive <= duringDcl && duringDcl <= nav.domContentLoadedEventEnd && nav.domContentLoadedEventEnd <= nav.domComplete && nav.domComplete <= duringLoad && duringLoad <= nav.loadEventEnd"), "true");
+    assert_eq!(t.eval("nav.duration === nav.loadEventEnd && performance.getEntries()[0] === nav && performance.getEntriesByName(location.href, 'navigation')[0] === nav && performance.getEntriesByName(location.href, 'mark').length === 0"), "true");
+    assert_eq!(t.eval("JSON.parse(JSON.stringify(nav)).entryType"), "\"navigation\"");
+}
+
+#[test]
 fn dom_apis_behave_like_a_browser() {
     let mut t = h();
     t.site.add("https://a.test/", "text/html", "<div id=root class='a b'><span>one</span><span>two</span></div>");
@@ -421,6 +466,179 @@ fn typing_inserts_each_character_once() {
     t.engine.key("up", "Backspace", "Backspace", 0, false);
     t.settle();
     assert_eq!(t.eval("document.getElementById('i').value + ':' + keys"), "\"h:hiBackspace\"");
+}
+
+// A cross-origin child frame posting to its parent, as Google's sign-in does to probe
+// third-party cookies: the parent must receive the message with the child's origin and with
+// event.source identical to the iframe's contentWindow.
+#[test]
+fn cross_origin_iframe_posts_message_to_parent() {
+    let mut t = h();
+    t.site.add("https://accounts.google.test/", "text/html", r#"<!doctype html><body><script>
+        window.__got = null;
+        window.addEventListener('message', (e) => { window.__got = { data: e.data, origin: e.origin, sameSource: e.source === frame.contentWindow, isWindow: e.source === frame.contentWindow }; });
+        var frame = document.createElement('iframe');
+        document.body.appendChild(frame);
+        frame.src = 'https://checkcookie.youtube.test/check';
+    </script></body>"#);
+    t.site.add("https://checkcookie.youtube.test/check", "text/html", r#"<!doctype html><script>
+        if (window.parent && window.parent.postMessage) window.parent.postMessage('youtube:0', 'https://accounts.google.test');
+    </script>"#);
+    t.open("https://accounts.google.test/");
+    assert_eq!(t.eval("window.__got && window.__got.data"), "\"youtube:0\"", "{:?}", t.console());
+    assert_eq!(t.eval("window.__got.origin"), "\"https://checkcookie.youtube.test\"");
+    assert_eq!(t.eval("window.__got.sameSource"), "true", "event.source must be the iframe's contentWindow");
+    // The child's realm is its own global: its window is not the parent's.
+    assert_eq!(t.eval("frame.contentWindow === window"), "false");
+}
+
+#[test]
+fn cross_origin_frames_cannot_reach_parent_globals_or_host_capabilities() {
+    let mut t = h();
+    t.site.add("https://parent.test/", "text/html", r#"<body><script>
+      window.privateValue = 'parent-secret'; window.result = null;
+      addEventListener('message', e => result = e.data);
+      var frame = document.createElement('iframe'); frame.src = 'https://child.test/f'; document.body.appendChild(frame);
+    </script>"#);
+    t.site.add("https://child.test/f", "text/html", r#"<script>
+      const result = {hostHidden: typeof __h === 'undefined', denied: [], localFunction: false};
+      for (const key of ['document', 'localStorage', 'privateValue', 'eval', '__h', 'constructor']) {
+        try { void parent[key]; result.denied.push('allowed:' + key); }
+        catch (e) { result.denied.push(e.name); }
+      }
+      result.localFunction = parent.postMessage.constructor('return typeof privateValue')() === 'undefined';
+      result.nullPrototype = Object.getPrototypeOf(parent) === null;
+      try { Object.getOwnPropertyDescriptor(parent, 'document'); result.descriptor = 'allowed'; }
+      catch (e) { result.descriptor = e.name; }
+      parent.postMessage(result, 'https://parent.test');
+    </script>"#);
+    t.open("https://parent.test/");
+    assert_eq!(t.eval("result && result.hostHidden && result.localFunction && result.nullPrototype && result.descriptor === 'SecurityError' && result.denied.length === 6 && result.denied.every(x => x === 'SecurityError')"), "true", "{:?}", t.console());
+    assert_eq!(t.eval("(() => { try { return frame.contentWindow.document; } catch (e) { return e.name; } })()"), "\"SecurityError\"");
+}
+
+#[test]
+fn iframe_messages_are_queued_and_copied_in_the_receivers_realm() {
+    let mut t = h();
+    t.site.add("https://parent.test/", "text/html", r#"<body><script>
+      window.reply = null; addEventListener('message', e => reply = e.data);
+      var frame = document.createElement('iframe'); frame.src = 'https://child.test/f'; document.body.appendChild(frame);
+    </script>"#);
+    t.site.add("https://child.test/f", "text/html", r#"<script>
+      addEventListener('message', e => {
+        const local = Object.getPrototypeOf(e.data) === Object.prototype;
+        e.source.postMessage({value:e.data.nested.value, local}, e.origin);
+        e.data.nested.value = 99;
+      });
+    </script>"#);
+    t.open("https://parent.test/");
+    assert_eq!(t.eval("(() => { window.payload = {nested:{value:1}}; frame.contentWindow.postMessage(payload, 'https://child.test'); payload.nested.value = 2; return reply === null; })()"), "true");
+    t.settle();
+    assert_eq!(t.eval("reply && reply.value === 1 && reply.local && payload.nested.value === 2"), "true", "{:?}", t.console());
+    assert_eq!(t.eval("(() => { try { frame.contentWindow.postMessage({fn(){}}, '*'); } catch (e) { return e.name; } })()"), "\"DataCloneError\"");
+    assert_eq!(t.eval("(() => { try { frame.contentWindow.postMessage('x', 'not an origin'); } catch (e) { return e.name; } })()"), "\"SyntaxError\"");
+}
+
+#[test]
+fn iframe_navigation_keeps_proxy_identity_and_revokes_old_realm_capabilities() {
+    let mut t = h();
+    t.site.add("https://parent.test/", "text/html", r#"<body><script>
+      window.messages = [];
+      addEventListener('message', e => messages.push(e.data + ':' + e.origin));
+      var frame = document.createElement('iframe'); frame.src = '/first'; document.body.appendChild(frame);
+    </script>"#);
+    t.site.add("https://parent.test/first", "text/html", r#"<script>
+      window.canary = 'first'; window.oldSend = () => parent.postMessage('old', '*');
+    </script>"#);
+    t.site.add("https://child.test/second", "text/html", r#"<script>parent.postMessage('new', 'https://parent.test')</script>"#);
+    t.open("https://parent.test/");
+    assert_eq!(t.eval("window.cached = frame.contentWindow; window.oldSend = cached.oldSend; cached.canary"), "\"first\"");
+    t.eval("frame.src = 'https://child.test/second'");
+    t.settle();
+    assert_eq!(t.eval("cached === frame.contentWindow"), "true");
+    assert_eq!(t.eval("(() => { try { return cached.canary; } catch(e) { return e.name; } })()"), "\"SecurityError\"");
+    t.eval("oldSend()");
+    assert_eq!(t.eval("messages.join(',')"), "\"new:https://child.test\"");
+}
+
+#[test]
+fn iframe_sandbox_disables_scripts_and_keeps_script_enabled_frames_opaque() {
+    let mut t = h();
+    t.site.add("https://parent.test/", "text/html", r#"<body><script>
+      window.privateValue = 'parent-secret'; window.messages = [];
+      addEventListener('message', e => messages.push(e.data + ':' + e.origin));
+    </script><iframe sandbox="allow-scripts" src="/opaque"></iframe><iframe sandbox src="/disabled"></iframe>"#);
+    t.site.add("https://parent.test/opaque", "text/html", r#"<script>
+      try { parent.privateValue; parent.postMessage('leaked', '*'); }
+      catch (e) { parent.postMessage(e.name, '*'); }
+    </script>"#);
+    t.site.add("https://parent.test/disabled", "text/html", "<script>parent.postMessage('forbidden', '*')</script>");
+    t.open("https://parent.test/");
+    assert_eq!(t.eval("messages.join(',')"), "\"SecurityError:null\"", "{:?}", t.console());
+}
+
+// Both directions: the parent posts into the child frame, the child's listener receives it with
+// the parent as source, and replies; the parent then sees the reply from the child.
+#[test]
+fn iframe_postmessage_is_bidirectional() {
+    let mut t = h();
+    t.site.add("https://host.test/", "text/html", r#"<!doctype html><body><script>
+        window.__reply = null;
+        window.addEventListener('message', (e) => { if (e.data && e.data.pong) window.__reply = { data: e.data.pong, origin: e.origin, fromChild: e.source === frame.contentWindow }; });
+        var frame = document.createElement('iframe');
+        document.body.appendChild(frame);
+        frame.src = 'https://widget.test/w';
+    </script></body>"#);
+    t.site.add("https://widget.test/w", "text/html", r#"<!doctype html><script>
+        window.addEventListener('message', (e) => {
+            // Reply to the sender using its origin, proving parent->child delivery and source.
+            if (e.source && e.source.postMessage) e.source.postMessage({ pong: e.data, parentOrigin: e.origin, parentIsTop: e.source === window.top }, e.origin);
+        });
+    </script>"#);
+    t.open("https://host.test/");
+    // Give the child time to attach and register its listener, then post into it.
+    t.settle();
+    t.eval("frame.contentWindow.postMessage('ping', 'https://widget.test')");
+    assert_eq!(t.eval("window.__reply && window.__reply.data"), "\"ping\"", "{:?}", t.console());
+    assert_eq!(t.eval("window.__reply.origin"), "\"https://widget.test\"");
+    assert_eq!(t.eval("window.__reply.fromChild"), "true");
+}
+
+// A same-origin iframe exposes its window synchronously (as a real browser does, about:blank),
+// before its content has loaded; a cross-origin one does not until it loads.
+#[test]
+fn same_origin_iframe_window_is_available_synchronously() {
+    let mut t = h();
+    t.site.add("https://app.test/", "text/html", "<!doctype html><body></body>");
+    t.open("https://app.test/");
+    // Same-origin frame: contentWindow is a usable window immediately after the element exists,
+    // before any network load.
+    assert_eq!(t.eval(r#"(() => { const f = document.createElement('iframe'); f.src = '/relay'; document.body.appendChild(f); const w = f.contentWindow; return w && typeof w.postMessage; })()"#), "\"function\"", "{:?}", t.console());
+    // A src-less (about:blank) same-origin frame too.
+    assert_eq!(t.eval(r#"(() => { const f = document.createElement('iframe'); document.body.appendChild(f); return f.contentWindow ? 'win' : 'null'; })()"#), "\"win\"");
+    // Cross-origin frame: no window until it actually loads.
+    assert_eq!(t.eval(r#"(() => { const f = document.createElement('iframe'); f.src = 'https://other.test/x'; document.body.appendChild(f); return f.contentWindow === null ? 'null' : 'win'; })()"#), "\"null\"");
+}
+
+// targetOrigin must match the receiver's origin (or be "*"): a mismatched origin is dropped.
+#[test]
+fn iframe_postmessage_respects_target_origin() {
+    let mut t = h();
+    t.site.add("https://parent.test/", "text/html", r#"<!doctype html><body><script>
+        window.__count = 0;
+        window.addEventListener('message', () => { window.__count++; });
+        var frame = document.createElement('iframe');
+        document.body.appendChild(frame);
+        frame.src = 'https://child.test/f';
+    </script></body>"#);
+    t.site.add("https://child.test/f", "text/html", r#"<!doctype html><script>
+        window.parent.postMessage('wrong', 'https://evil.test');
+        window.parent.postMessage('right', 'https://parent.test');
+        window.parent.postMessage('any', '*');
+    </script>"#);
+    t.open("https://parent.test/");
+    // Only the matching-origin and "*" posts are delivered.
+    assert_eq!(t.eval("window.__count"), "2", "{:?}", t.console());
 }
 
 #[test]

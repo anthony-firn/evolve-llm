@@ -212,6 +212,7 @@ pub fn decode_content(encoding: Option<&str>, body: Vec<u8>) -> Result<Vec<u8>, 
             "deflate" => read_all(flate2::read::ZlibDecoder::new(&data[..]))
                 .or_else(|_| read_all(flate2::read::DeflateDecoder::new(&data[..])))?,
             "br" => read_all(brotli_decompressor::Decompressor::new(&data[..], 4096))?,
+            "zstd" => read_all(ruzstd::decoding::StreamingDecoder::new(&data[..]).map_err(|e| format!("Could not decode the response body: {e}"))?)?,
             other => return Err(format!("Unsupported content encoding {other}")),
         };
     }
@@ -313,6 +314,19 @@ mod tests {
         assert!(!text.contains("Bad"));
         assert!(!text.contains("X-Ok"));
         assert!(text.ends_with("\r\n\r\na=1"));
+    }
+
+    #[test]
+    fn decodes_zstd_bodies() {
+        // `zstd -19` output, with a repeat match and a content checksum
+        let body = vec![
+            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x68, 0x15, 0x01, 0x00, 0xe0, 0x45, 0x76, 0x6f, 0x6c, 0x76, 0x65, 0x20, 0x64, 0x65, 0x63,
+            0x6f, 0x64, 0x65, 0x73, 0x20, 0x7a, 0x73, 0x74, 0x64, 0x20, 0x62, 0x6f, 0x64, 0x69, 0x65, 0x73, 0x2e, 0x20, 0x01, 0x00,
+            0x7c, 0x38, 0x9d, 0x97, 0x41, 0x52, 0x2f,
+        ];
+        let text = decode_content(Some("zstd"), body.clone()).unwrap();
+        assert_eq!(text, b"Evolve decodes zstd bodies. Evolve decodes zstd bodies.");
+        assert!(decode_content(Some("zstd"), body[..20].to_vec()).is_err());
     }
 
     #[test]

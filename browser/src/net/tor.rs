@@ -80,6 +80,25 @@ impl TorStream {
     }
 }
 
+// Poll-based I/O lets rustls and HTTP/2 interleave reads and writes without cancelling
+// in-flight TLS operations when the other direction becomes ready.
+impl futures::io::AsyncRead for TorStream {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut [u8]) -> std::task::Poll<std::io::Result<usize>> {
+        futures::io::AsyncRead::poll_read(std::pin::Pin::new(&mut self.inner), cx, buf)
+    }
+}
+impl futures::io::AsyncWrite for TorStream {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        futures::io::AsyncWrite::poll_write(std::pin::Pin::new(&mut self.inner), cx, buf)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        futures::io::AsyncWrite::poll_flush(std::pin::Pin::new(&mut self.inner), cx)
+    }
+    fn poll_close(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        futures::io::AsyncWrite::poll_close(std::pin::Pin::new(&mut self.inner), cx)
+    }
+}
+
 fn status(state: &str, detail: impl Into<String>) {
     host::emit(OutEvent::Network { route: "tor".into(), state: state.into(), detail: detail.into() });
 }

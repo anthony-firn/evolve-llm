@@ -1,6 +1,7 @@
-//! Fixed diagnostic identities. These change content negotiation, not the browser engine.
+//! Fixed diagnostic identities. These change content negotiation and request framing, not
+//! the browser engine.
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Identity {
     #[default]
     Legacy,
@@ -20,6 +21,11 @@ impl Identity {
             "evolve" => Ok(Self::Evolve),
             _ => Err("Unknown browser identity profile"),
         }
+    }
+
+    /// Firefox identities also use Firefox's request fields and HTTP/2 framing.
+    pub fn is_firefox(self) -> bool {
+        matches!(self, Self::FirefoxEsr | Self::Firefox)
     }
 
     pub fn user_agent(self) -> &'static str {

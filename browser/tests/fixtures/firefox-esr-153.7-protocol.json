@@ -1,0 +1,3555 @@
+{
+  "schema_version": 1,
+  "browser": "Mozilla Firefox ESR 153.7.0, Linux x86_64",
+  "source": "Native Firefox over Tor, synthetic identifier, no password or verification code",
+  "notes": [
+    "Session-specific values are excluded by an allowlist.",
+    "When using the extractor's TLS-only PCAP, TCP/IP metadata is reconstructed; use the original PCAP for transport timing.",
+    "Connection numbers and packet sizes are observations, not requirements for future sessions."
+  ],
+  "tls": {
+    "hellos": [
+      {
+        "connection": 0,
+        "host": "accounts.google.com",
+        "side": "client",
+        "handshake_bytes": 1893,
+        "legacy_version": 771,
+        "record_version": 769,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865,
+          4867,
+          4866,
+          49195,
+          49199,
+          52393,
+          52392,
+          49196,
+          49200,
+          49162,
+          49171,
+          49172,
+          156,
+          157,
+          47,
+          53
+        ],
+        "extensions": [
+          {
+            "id": 0,
+            "length": 24
+          },
+          {
+            "id": 23,
+            "length": 0
+          },
+          {
+            "id": 65281,
+            "length": 1
+          },
+          {
+            "id": 10,
+            "length": 16,
+            "groups": [
+              4588,
+              29,
+              23,
+              24,
+              25,
+              256,
+              257
+            ]
+          },
+          {
+            "id": 11,
+            "length": 2,
+            "point_formats": [
+              0
+            ]
+          },
+          {
+            "id": 35,
+            "length": 0
+          },
+          {
+            "id": 16,
+            "length": 14,
+            "alpn": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          {
+            "id": 5,
+            "length": 5
+          },
+          {
+            "id": 34,
+            "length": 10,
+            "delegated_credential_algorithms": [
+              1027,
+              1283,
+              1539,
+              515
+            ]
+          },
+          {
+            "id": 18,
+            "length": 0
+          },
+          {
+            "id": 51,
+            "length": 1327,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1216
+              },
+              {
+                "group": 29,
+                "bytes": 32
+              },
+              {
+                "group": 23,
+                "bytes": 65
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 5,
+            "versions": [
+              772,
+              771
+            ]
+          },
+          {
+            "id": 13,
+            "length": 24,
+            "signature_algorithms": [
+              1027,
+              1283,
+              1539,
+              2052,
+              2053,
+              2054,
+              1025,
+              1281,
+              1537,
+              515,
+              513
+            ]
+          },
+          {
+            "id": 45,
+            "length": 2,
+            "psk_modes": [
+              1
+            ]
+          },
+          {
+            "id": 28,
+            "length": 2,
+            "record_size_limit": [
+              16385
+            ]
+          },
+          {
+            "id": 27,
+            "length": 7,
+            "certificate_compression_algorithms": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "id": 65037,
+            "length": 281
+          }
+        ]
+      },
+      {
+        "connection": 1,
+        "host": "accounts.google.com",
+        "side": "client",
+        "handshake_bytes": 1893,
+        "legacy_version": 771,
+        "record_version": 769,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865,
+          4867,
+          4866,
+          49195,
+          49199,
+          52393,
+          52392,
+          49196,
+          49200,
+          49162,
+          49171,
+          49172,
+          156,
+          157,
+          47,
+          53
+        ],
+        "extensions": [
+          {
+            "id": 0,
+            "length": 24
+          },
+          {
+            "id": 23,
+            "length": 0
+          },
+          {
+            "id": 65281,
+            "length": 1
+          },
+          {
+            "id": 10,
+            "length": 16,
+            "groups": [
+              4588,
+              29,
+              23,
+              24,
+              25,
+              256,
+              257
+            ]
+          },
+          {
+            "id": 11,
+            "length": 2,
+            "point_formats": [
+              0
+            ]
+          },
+          {
+            "id": 35,
+            "length": 0
+          },
+          {
+            "id": 16,
+            "length": 14,
+            "alpn": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          {
+            "id": 5,
+            "length": 5
+          },
+          {
+            "id": 34,
+            "length": 10,
+            "delegated_credential_algorithms": [
+              1027,
+              1283,
+              1539,
+              515
+            ]
+          },
+          {
+            "id": 18,
+            "length": 0
+          },
+          {
+            "id": 51,
+            "length": 1327,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1216
+              },
+              {
+                "group": 29,
+                "bytes": 32
+              },
+              {
+                "group": 23,
+                "bytes": 65
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 5,
+            "versions": [
+              772,
+              771
+            ]
+          },
+          {
+            "id": 13,
+            "length": 24,
+            "signature_algorithms": [
+              1027,
+              1283,
+              1539,
+              2052,
+              2053,
+              2054,
+              1025,
+              1281,
+              1537,
+              515,
+              513
+            ]
+          },
+          {
+            "id": 45,
+            "length": 2,
+            "psk_modes": [
+              1
+            ]
+          },
+          {
+            "id": 28,
+            "length": 2,
+            "record_size_limit": [
+              16385
+            ]
+          },
+          {
+            "id": 27,
+            "length": 7,
+            "certificate_compression_algorithms": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "id": 65037,
+            "length": 281
+          }
+        ]
+      },
+      {
+        "connection": 0,
+        "host": "accounts.google.com",
+        "side": "server",
+        "handshake_bytes": 1206,
+        "legacy_version": 771,
+        "record_version": 771,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865
+        ],
+        "extensions": [
+          {
+            "id": 51,
+            "length": 1124,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1120
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 2,
+            "versions": [
+              772
+            ]
+          }
+        ]
+      },
+      {
+        "connection": 1,
+        "host": "accounts.google.com",
+        "side": "server",
+        "handshake_bytes": 1206,
+        "legacy_version": 771,
+        "record_version": 771,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865
+        ],
+        "extensions": [
+          {
+            "id": 51,
+            "length": 1124,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1120
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 2,
+            "versions": [
+              772
+            ]
+          }
+        ]
+      },
+      {
+        "connection": 8,
+        "host": "accounts.youtube.com",
+        "side": "client",
+        "handshake_bytes": 1894,
+        "legacy_version": 771,
+        "record_version": 769,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865,
+          4867,
+          4866,
+          49195,
+          49199,
+          52393,
+          52392,
+          49196,
+          49200,
+          49162,
+          49171,
+          49172,
+          156,
+          157,
+          47,
+          53
+        ],
+        "extensions": [
+          {
+            "id": 0,
+            "length": 25
+          },
+          {
+            "id": 23,
+            "length": 0
+          },
+          {
+            "id": 65281,
+            "length": 1
+          },
+          {
+            "id": 10,
+            "length": 16,
+            "groups": [
+              4588,
+              29,
+              23,
+              24,
+              25,
+              256,
+              257
+            ]
+          },
+          {
+            "id": 11,
+            "length": 2,
+            "point_formats": [
+              0
+            ]
+          },
+          {
+            "id": 35,
+            "length": 0
+          },
+          {
+            "id": 16,
+            "length": 14,
+            "alpn": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          {
+            "id": 5,
+            "length": 5
+          },
+          {
+            "id": 34,
+            "length": 10,
+            "delegated_credential_algorithms": [
+              1027,
+              1283,
+              1539,
+              515
+            ]
+          },
+          {
+            "id": 18,
+            "length": 0
+          },
+          {
+            "id": 51,
+            "length": 1327,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1216
+              },
+              {
+                "group": 29,
+                "bytes": 32
+              },
+              {
+                "group": 23,
+                "bytes": 65
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 5,
+            "versions": [
+              772,
+              771
+            ]
+          },
+          {
+            "id": 13,
+            "length": 24,
+            "signature_algorithms": [
+              1027,
+              1283,
+              1539,
+              2052,
+              2053,
+              2054,
+              1025,
+              1281,
+              1537,
+              515,
+              513
+            ]
+          },
+          {
+            "id": 45,
+            "length": 2,
+            "psk_modes": [
+              1
+            ]
+          },
+          {
+            "id": 28,
+            "length": 2,
+            "record_size_limit": [
+              16385
+            ]
+          },
+          {
+            "id": 27,
+            "length": 7,
+            "certificate_compression_algorithms": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "id": 65037,
+            "length": 281
+          }
+        ]
+      },
+      {
+        "connection": 9,
+        "host": "www.google.com",
+        "side": "client",
+        "handshake_bytes": 1888,
+        "legacy_version": 771,
+        "record_version": 769,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865,
+          4867,
+          4866,
+          49195,
+          49199,
+          52393,
+          52392,
+          49196,
+          49200,
+          49162,
+          49171,
+          49172,
+          156,
+          157,
+          47,
+          53
+        ],
+        "extensions": [
+          {
+            "id": 0,
+            "length": 19
+          },
+          {
+            "id": 23,
+            "length": 0
+          },
+          {
+            "id": 65281,
+            "length": 1
+          },
+          {
+            "id": 10,
+            "length": 16,
+            "groups": [
+              4588,
+              29,
+              23,
+              24,
+              25,
+              256,
+              257
+            ]
+          },
+          {
+            "id": 11,
+            "length": 2,
+            "point_formats": [
+              0
+            ]
+          },
+          {
+            "id": 35,
+            "length": 0
+          },
+          {
+            "id": 16,
+            "length": 14,
+            "alpn": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          {
+            "id": 5,
+            "length": 5
+          },
+          {
+            "id": 34,
+            "length": 10,
+            "delegated_credential_algorithms": [
+              1027,
+              1283,
+              1539,
+              515
+            ]
+          },
+          {
+            "id": 18,
+            "length": 0
+          },
+          {
+            "id": 51,
+            "length": 1327,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1216
+              },
+              {
+                "group": 29,
+                "bytes": 32
+              },
+              {
+                "group": 23,
+                "bytes": 65
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 5,
+            "versions": [
+              772,
+              771
+            ]
+          },
+          {
+            "id": 13,
+            "length": 24,
+            "signature_algorithms": [
+              1027,
+              1283,
+              1539,
+              2052,
+              2053,
+              2054,
+              1025,
+              1281,
+              1537,
+              515,
+              513
+            ]
+          },
+          {
+            "id": 45,
+            "length": 2,
+            "psk_modes": [
+              1
+            ]
+          },
+          {
+            "id": 28,
+            "length": 2,
+            "record_size_limit": [
+              16385
+            ]
+          },
+          {
+            "id": 27,
+            "length": 7,
+            "certificate_compression_algorithms": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "id": 65037,
+            "length": 281
+          }
+        ]
+      },
+      {
+        "connection": 10,
+        "host": "accounts.youtube.com",
+        "side": "client",
+        "handshake_bytes": 1894,
+        "legacy_version": 771,
+        "record_version": 769,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865,
+          4867,
+          4866,
+          49195,
+          49199,
+          52393,
+          52392,
+          49196,
+          49200,
+          49162,
+          49171,
+          49172,
+          156,
+          157,
+          47,
+          53
+        ],
+        "extensions": [
+          {
+            "id": 0,
+            "length": 25
+          },
+          {
+            "id": 23,
+            "length": 0
+          },
+          {
+            "id": 65281,
+            "length": 1
+          },
+          {
+            "id": 10,
+            "length": 16,
+            "groups": [
+              4588,
+              29,
+              23,
+              24,
+              25,
+              256,
+              257
+            ]
+          },
+          {
+            "id": 11,
+            "length": 2,
+            "point_formats": [
+              0
+            ]
+          },
+          {
+            "id": 35,
+            "length": 0
+          },
+          {
+            "id": 16,
+            "length": 14,
+            "alpn": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          {
+            "id": 5,
+            "length": 5
+          },
+          {
+            "id": 34,
+            "length": 10,
+            "delegated_credential_algorithms": [
+              1027,
+              1283,
+              1539,
+              515
+            ]
+          },
+          {
+            "id": 18,
+            "length": 0
+          },
+          {
+            "id": 51,
+            "length": 1327,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1216
+              },
+              {
+                "group": 29,
+                "bytes": 32
+              },
+              {
+                "group": 23,
+                "bytes": 65
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 5,
+            "versions": [
+              772,
+              771
+            ]
+          },
+          {
+            "id": 13,
+            "length": 24,
+            "signature_algorithms": [
+              1027,
+              1283,
+              1539,
+              2052,
+              2053,
+              2054,
+              1025,
+              1281,
+              1537,
+              515,
+              513
+            ]
+          },
+          {
+            "id": 45,
+            "length": 2,
+            "psk_modes": [
+              1
+            ]
+          },
+          {
+            "id": 28,
+            "length": 2,
+            "record_size_limit": [
+              16385
+            ]
+          },
+          {
+            "id": 27,
+            "length": 7,
+            "certificate_compression_algorithms": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "id": 65037,
+            "length": 281
+          }
+        ]
+      },
+      {
+        "connection": 11,
+        "host": "www.google.com",
+        "side": "client",
+        "handshake_bytes": 1888,
+        "legacy_version": 771,
+        "record_version": 769,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865,
+          4867,
+          4866,
+          49195,
+          49199,
+          52393,
+          52392,
+          49196,
+          49200,
+          49162,
+          49171,
+          49172,
+          156,
+          157,
+          47,
+          53
+        ],
+        "extensions": [
+          {
+            "id": 0,
+            "length": 19
+          },
+          {
+            "id": 23,
+            "length": 0
+          },
+          {
+            "id": 65281,
+            "length": 1
+          },
+          {
+            "id": 10,
+            "length": 16,
+            "groups": [
+              4588,
+              29,
+              23,
+              24,
+              25,
+              256,
+              257
+            ]
+          },
+          {
+            "id": 11,
+            "length": 2,
+            "point_formats": [
+              0
+            ]
+          },
+          {
+            "id": 35,
+            "length": 0
+          },
+          {
+            "id": 16,
+            "length": 14,
+            "alpn": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          {
+            "id": 5,
+            "length": 5
+          },
+          {
+            "id": 34,
+            "length": 10,
+            "delegated_credential_algorithms": [
+              1027,
+              1283,
+              1539,
+              515
+            ]
+          },
+          {
+            "id": 18,
+            "length": 0
+          },
+          {
+            "id": 51,
+            "length": 1327,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1216
+              },
+              {
+                "group": 29,
+                "bytes": 32
+              },
+              {
+                "group": 23,
+                "bytes": 65
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 5,
+            "versions": [
+              772,
+              771
+            ]
+          },
+          {
+            "id": 13,
+            "length": 24,
+            "signature_algorithms": [
+              1027,
+              1283,
+              1539,
+              2052,
+              2053,
+              2054,
+              1025,
+              1281,
+              1537,
+              515,
+              513
+            ]
+          },
+          {
+            "id": 45,
+            "length": 2,
+            "psk_modes": [
+              1
+            ]
+          },
+          {
+            "id": 28,
+            "length": 2,
+            "record_size_limit": [
+              16385
+            ]
+          },
+          {
+            "id": 27,
+            "length": 7,
+            "certificate_compression_algorithms": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "id": 65037,
+            "length": 281
+          }
+        ]
+      },
+      {
+        "connection": 8,
+        "host": "accounts.youtube.com",
+        "side": "server",
+        "handshake_bytes": 1206,
+        "legacy_version": 771,
+        "record_version": 771,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865
+        ],
+        "extensions": [
+          {
+            "id": 51,
+            "length": 1124,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1120
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 2,
+            "versions": [
+              772
+            ]
+          }
+        ]
+      },
+      {
+        "connection": 9,
+        "host": "www.google.com",
+        "side": "server",
+        "handshake_bytes": 1206,
+        "legacy_version": 771,
+        "record_version": 771,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865
+        ],
+        "extensions": [
+          {
+            "id": 51,
+            "length": 1124,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1120
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 2,
+            "versions": [
+              772
+            ]
+          }
+        ]
+      },
+      {
+        "connection": 11,
+        "host": "www.google.com",
+        "side": "server",
+        "handshake_bytes": 1206,
+        "legacy_version": 771,
+        "record_version": 771,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865
+        ],
+        "extensions": [
+          {
+            "id": 51,
+            "length": 1124,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1120
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 2,
+            "versions": [
+              772
+            ]
+          }
+        ]
+      },
+      {
+        "connection": 10,
+        "host": "accounts.youtube.com",
+        "side": "server",
+        "handshake_bytes": 1206,
+        "legacy_version": 771,
+        "record_version": 771,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865
+        ],
+        "extensions": [
+          {
+            "id": 51,
+            "length": 1124,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1120
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 2,
+            "versions": [
+              772
+            ]
+          }
+        ]
+      },
+      {
+        "connection": 18,
+        "host": "accounts.google.com",
+        "side": "client",
+        "handshake_bytes": 2460,
+        "legacy_version": 771,
+        "record_version": 769,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865,
+          4867,
+          4866,
+          49195,
+          49199,
+          52393,
+          52392,
+          49196,
+          49200,
+          49162,
+          49171,
+          49172,
+          156,
+          157,
+          47,
+          53
+        ],
+        "extensions": [
+          {
+            "id": 0,
+            "length": 24
+          },
+          {
+            "id": 23,
+            "length": 0
+          },
+          {
+            "id": 65281,
+            "length": 1
+          },
+          {
+            "id": 10,
+            "length": 16,
+            "groups": [
+              4588,
+              29,
+              23,
+              24,
+              25,
+              256,
+              257
+            ]
+          },
+          {
+            "id": 11,
+            "length": 2,
+            "point_formats": [
+              0
+            ]
+          },
+          {
+            "id": 16,
+            "length": 14,
+            "alpn": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          {
+            "id": 5,
+            "length": 5
+          },
+          {
+            "id": 34,
+            "length": 10,
+            "delegated_credential_algorithms": [
+              1027,
+              1283,
+              1539,
+              515
+            ]
+          },
+          {
+            "id": 18,
+            "length": 0
+          },
+          {
+            "id": 51,
+            "length": 1327,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1216
+              },
+              {
+                "group": 29,
+                "bytes": 32
+              },
+              {
+                "group": 23,
+                "bytes": 65
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 5,
+            "versions": [
+              772,
+              771
+            ]
+          },
+          {
+            "id": 13,
+            "length": 24,
+            "signature_algorithms": [
+              1027,
+              1283,
+              1539,
+              2052,
+              2053,
+              2054,
+              1025,
+              1281,
+              1537,
+              515,
+              513
+            ]
+          },
+          {
+            "id": 45,
+            "length": 2,
+            "psk_modes": [
+              1
+            ]
+          },
+          {
+            "id": 28,
+            "length": 2,
+            "record_size_limit": [
+              16385
+            ]
+          },
+          {
+            "id": 27,
+            "length": 7,
+            "certificate_compression_algorithms": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "id": 65037,
+            "length": 569
+          },
+          {
+            "id": 41,
+            "length": 279,
+            "identity_lengths": [
+              236
+            ],
+            "selected_identity": []
+          }
+        ]
+      },
+      {
+        "connection": 19,
+        "host": "accounts.google.com",
+        "side": "client",
+        "handshake_bytes": 2460,
+        "legacy_version": 771,
+        "record_version": 769,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865,
+          4867,
+          4866,
+          49195,
+          49199,
+          52393,
+          52392,
+          49196,
+          49200,
+          49162,
+          49171,
+          49172,
+          156,
+          157,
+          47,
+          53
+        ],
+        "extensions": [
+          {
+            "id": 0,
+            "length": 24
+          },
+          {
+            "id": 23,
+            "length": 0
+          },
+          {
+            "id": 65281,
+            "length": 1
+          },
+          {
+            "id": 10,
+            "length": 16,
+            "groups": [
+              4588,
+              29,
+              23,
+              24,
+              25,
+              256,
+              257
+            ]
+          },
+          {
+            "id": 11,
+            "length": 2,
+            "point_formats": [
+              0
+            ]
+          },
+          {
+            "id": 16,
+            "length": 14,
+            "alpn": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          {
+            "id": 5,
+            "length": 5
+          },
+          {
+            "id": 34,
+            "length": 10,
+            "delegated_credential_algorithms": [
+              1027,
+              1283,
+              1539,
+              515
+            ]
+          },
+          {
+            "id": 18,
+            "length": 0
+          },
+          {
+            "id": 51,
+            "length": 1327,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1216
+              },
+              {
+                "group": 29,
+                "bytes": 32
+              },
+              {
+                "group": 23,
+                "bytes": 65
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 5,
+            "versions": [
+              772,
+              771
+            ]
+          },
+          {
+            "id": 13,
+            "length": 24,
+            "signature_algorithms": [
+              1027,
+              1283,
+              1539,
+              2052,
+              2053,
+              2054,
+              1025,
+              1281,
+              1537,
+              515,
+              513
+            ]
+          },
+          {
+            "id": 45,
+            "length": 2,
+            "psk_modes": [
+              1
+            ]
+          },
+          {
+            "id": 28,
+            "length": 2,
+            "record_size_limit": [
+              16385
+            ]
+          },
+          {
+            "id": 27,
+            "length": 7,
+            "certificate_compression_algorithms": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "id": 65037,
+            "length": 569
+          },
+          {
+            "id": 41,
+            "length": 279,
+            "identity_lengths": [
+              236
+            ],
+            "selected_identity": []
+          }
+        ]
+      },
+      {
+        "connection": 18,
+        "host": "accounts.google.com",
+        "side": "server",
+        "handshake_bytes": 1212,
+        "legacy_version": 771,
+        "record_version": 771,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865
+        ],
+        "extensions": [
+          {
+            "id": 41,
+            "length": 2,
+            "identity_lengths": [],
+            "selected_identity": [
+              0
+            ]
+          },
+          {
+            "id": 51,
+            "length": 1124,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1120
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 2,
+            "versions": [
+              772
+            ]
+          }
+        ]
+      },
+      {
+        "connection": 19,
+        "host": "accounts.google.com",
+        "side": "server",
+        "handshake_bytes": 1212,
+        "legacy_version": 771,
+        "record_version": 771,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865
+        ],
+        "extensions": [
+          {
+            "id": 41,
+            "length": 2,
+            "identity_lengths": [],
+            "selected_identity": [
+              0
+            ]
+          },
+          {
+            "id": 51,
+            "length": 1124,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1120
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 2,
+            "versions": [
+              772
+            ]
+          }
+        ]
+      },
+      {
+        "connection": 20,
+        "host": "accounts.youtube.com",
+        "side": "client",
+        "handshake_bytes": 2461,
+        "legacy_version": 771,
+        "record_version": 769,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865,
+          4867,
+          4866,
+          49195,
+          49199,
+          52393,
+          52392,
+          49196,
+          49200,
+          49162,
+          49171,
+          49172,
+          156,
+          157,
+          47,
+          53
+        ],
+        "extensions": [
+          {
+            "id": 0,
+            "length": 25
+          },
+          {
+            "id": 23,
+            "length": 0
+          },
+          {
+            "id": 65281,
+            "length": 1
+          },
+          {
+            "id": 10,
+            "length": 16,
+            "groups": [
+              4588,
+              29,
+              23,
+              24,
+              25,
+              256,
+              257
+            ]
+          },
+          {
+            "id": 11,
+            "length": 2,
+            "point_formats": [
+              0
+            ]
+          },
+          {
+            "id": 16,
+            "length": 14,
+            "alpn": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          {
+            "id": 5,
+            "length": 5
+          },
+          {
+            "id": 34,
+            "length": 10,
+            "delegated_credential_algorithms": [
+              1027,
+              1283,
+              1539,
+              515
+            ]
+          },
+          {
+            "id": 18,
+            "length": 0
+          },
+          {
+            "id": 51,
+            "length": 1327,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1216
+              },
+              {
+                "group": 29,
+                "bytes": 32
+              },
+              {
+                "group": 23,
+                "bytes": 65
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 5,
+            "versions": [
+              772,
+              771
+            ]
+          },
+          {
+            "id": 13,
+            "length": 24,
+            "signature_algorithms": [
+              1027,
+              1283,
+              1539,
+              2052,
+              2053,
+              2054,
+              1025,
+              1281,
+              1537,
+              515,
+              513
+            ]
+          },
+          {
+            "id": 45,
+            "length": 2,
+            "psk_modes": [
+              1
+            ]
+          },
+          {
+            "id": 28,
+            "length": 2,
+            "record_size_limit": [
+              16385
+            ]
+          },
+          {
+            "id": 27,
+            "length": 7,
+            "certificate_compression_algorithms": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "id": 65037,
+            "length": 569
+          },
+          {
+            "id": 41,
+            "length": 279,
+            "identity_lengths": [
+              236
+            ],
+            "selected_identity": []
+          }
+        ]
+      },
+      {
+        "connection": 21,
+        "host": "accounts.youtube.com",
+        "side": "client",
+        "handshake_bytes": 2461,
+        "legacy_version": 771,
+        "record_version": 769,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865,
+          4867,
+          4866,
+          49195,
+          49199,
+          52393,
+          52392,
+          49196,
+          49200,
+          49162,
+          49171,
+          49172,
+          156,
+          157,
+          47,
+          53
+        ],
+        "extensions": [
+          {
+            "id": 0,
+            "length": 25
+          },
+          {
+            "id": 23,
+            "length": 0
+          },
+          {
+            "id": 65281,
+            "length": 1
+          },
+          {
+            "id": 10,
+            "length": 16,
+            "groups": [
+              4588,
+              29,
+              23,
+              24,
+              25,
+              256,
+              257
+            ]
+          },
+          {
+            "id": 11,
+            "length": 2,
+            "point_formats": [
+              0
+            ]
+          },
+          {
+            "id": 16,
+            "length": 14,
+            "alpn": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          {
+            "id": 5,
+            "length": 5
+          },
+          {
+            "id": 34,
+            "length": 10,
+            "delegated_credential_algorithms": [
+              1027,
+              1283,
+              1539,
+              515
+            ]
+          },
+          {
+            "id": 18,
+            "length": 0
+          },
+          {
+            "id": 51,
+            "length": 1327,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1216
+              },
+              {
+                "group": 29,
+                "bytes": 32
+              },
+              {
+                "group": 23,
+                "bytes": 65
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 5,
+            "versions": [
+              772,
+              771
+            ]
+          },
+          {
+            "id": 13,
+            "length": 24,
+            "signature_algorithms": [
+              1027,
+              1283,
+              1539,
+              2052,
+              2053,
+              2054,
+              1025,
+              1281,
+              1537,
+              515,
+              513
+            ]
+          },
+          {
+            "id": 45,
+            "length": 2,
+            "psk_modes": [
+              1
+            ]
+          },
+          {
+            "id": 28,
+            "length": 2,
+            "record_size_limit": [
+              16385
+            ]
+          },
+          {
+            "id": 27,
+            "length": 7,
+            "certificate_compression_algorithms": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "id": 65037,
+            "length": 569
+          },
+          {
+            "id": 41,
+            "length": 279,
+            "identity_lengths": [
+              236
+            ],
+            "selected_identity": []
+          }
+        ]
+      },
+      {
+        "connection": 20,
+        "host": "accounts.youtube.com",
+        "side": "server",
+        "handshake_bytes": 1212,
+        "legacy_version": 771,
+        "record_version": 771,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865
+        ],
+        "extensions": [
+          {
+            "id": 41,
+            "length": 2,
+            "identity_lengths": [],
+            "selected_identity": [
+              0
+            ]
+          },
+          {
+            "id": 51,
+            "length": 1124,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1120
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 2,
+            "versions": [
+              772
+            ]
+          }
+        ]
+      },
+      {
+        "connection": 21,
+        "host": "accounts.youtube.com",
+        "side": "server",
+        "handshake_bytes": 1212,
+        "legacy_version": 771,
+        "record_version": 771,
+        "session_id_bytes": 32,
+        "cipher_suites": [
+          4865
+        ],
+        "extensions": [
+          {
+            "id": 41,
+            "length": 2,
+            "identity_lengths": [],
+            "selected_identity": [
+              0
+            ]
+          },
+          {
+            "id": 51,
+            "length": 1124,
+            "shares": [
+              {
+                "group": 4588,
+                "bytes": 1120
+              }
+            ]
+          },
+          {
+            "id": 43,
+            "length": 2,
+            "versions": [
+              772
+            ]
+          }
+        ]
+      }
+    ],
+    "negotiated_alpn": [
+      "h2"
+    ]
+  },
+  "http2": {
+    "connection_preface_observed": true,
+    "client_settings": [
+      {
+        "connection": 0,
+        "settings": [
+          {
+            "id": 1,
+            "value": 65536
+          },
+          {
+            "id": 2,
+            "value": 0
+          },
+          {
+            "id": 4,
+            "value": 131072
+          },
+          {
+            "id": 5,
+            "value": 16384
+          }
+        ]
+      },
+      {
+        "connection": 1,
+        "settings": [
+          {
+            "id": 1,
+            "value": 65536
+          },
+          {
+            "id": 2,
+            "value": 0
+          },
+          {
+            "id": 4,
+            "value": 131072
+          },
+          {
+            "id": 5,
+            "value": 16384
+          }
+        ]
+      },
+      {
+        "connection": 8,
+        "settings": [
+          {
+            "id": 1,
+            "value": 65536
+          },
+          {
+            "id": 2,
+            "value": 0
+          },
+          {
+            "id": 4,
+            "value": 131072
+          },
+          {
+            "id": 5,
+            "value": 16384
+          }
+        ]
+      },
+      {
+        "connection": 11,
+        "settings": [
+          {
+            "id": 1,
+            "value": 65536
+          },
+          {
+            "id": 2,
+            "value": 0
+          },
+          {
+            "id": 4,
+            "value": 131072
+          },
+          {
+            "id": 5,
+            "value": 16384
+          }
+        ]
+      },
+      {
+        "connection": 9,
+        "settings": [
+          {
+            "id": 1,
+            "value": 65536
+          },
+          {
+            "id": 2,
+            "value": 0
+          },
+          {
+            "id": 4,
+            "value": 131072
+          },
+          {
+            "id": 5,
+            "value": 16384
+          }
+        ]
+      },
+      {
+        "connection": 10,
+        "settings": [
+          {
+            "id": 1,
+            "value": 65536
+          },
+          {
+            "id": 2,
+            "value": 0
+          },
+          {
+            "id": 4,
+            "value": 131072
+          },
+          {
+            "id": 5,
+            "value": 16384
+          }
+        ]
+      },
+      {
+        "connection": 18,
+        "settings": [
+          {
+            "id": 1,
+            "value": 65536
+          },
+          {
+            "id": 2,
+            "value": 0
+          },
+          {
+            "id": 4,
+            "value": 131072
+          },
+          {
+            "id": 5,
+            "value": 16384
+          }
+        ]
+      },
+      {
+        "connection": 19,
+        "settings": [
+          {
+            "id": 1,
+            "value": 65536
+          },
+          {
+            "id": 2,
+            "value": 0
+          },
+          {
+            "id": 4,
+            "value": 131072
+          },
+          {
+            "id": 5,
+            "value": 16384
+          }
+        ]
+      },
+      {
+        "connection": 20,
+        "settings": [
+          {
+            "id": 1,
+            "value": 65536
+          },
+          {
+            "id": 2,
+            "value": 0
+          },
+          {
+            "id": 4,
+            "value": 131072
+          },
+          {
+            "id": 5,
+            "value": 16384
+          }
+        ]
+      },
+      {
+        "connection": 21,
+        "settings": [
+          {
+            "id": 1,
+            "value": 65536
+          },
+          {
+            "id": 2,
+            "value": 0
+          },
+          {
+            "id": 4,
+            "value": 131072
+          },
+          {
+            "id": 5,
+            "value": 16384
+          }
+        ]
+      }
+    ],
+    "initial_connection_window_increments": [
+      12517377
+    ],
+    "startup_frames": [
+      {
+        "connection": 0,
+        "frames": [
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 24,
+            "flags": 0
+          },
+          {
+            "type": 8,
+            "stream_id": 0,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 1,
+            "stream_id": 3,
+            "length": 293,
+            "flags": 37
+          },
+          {
+            "type": 8,
+            "stream_id": 3,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 0,
+            "flags": 1
+          }
+        ]
+      },
+      {
+        "connection": 1,
+        "frames": [
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 24,
+            "flags": 0
+          },
+          {
+            "type": 8,
+            "stream_id": 0,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 7,
+            "stream_id": 0,
+            "length": 8,
+            "flags": 0
+          }
+        ]
+      },
+      {
+        "connection": 8,
+        "frames": [
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 24,
+            "flags": 0
+          },
+          {
+            "type": 8,
+            "stream_id": 0,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 1,
+            "stream_id": 3,
+            "length": 382,
+            "flags": 37
+          },
+          {
+            "type": 8,
+            "stream_id": 3,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 0,
+            "flags": 1
+          }
+        ]
+      },
+      {
+        "connection": 11,
+        "frames": [
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 24,
+            "flags": 0
+          },
+          {
+            "type": 8,
+            "stream_id": 0,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 0,
+            "flags": 1
+          },
+          {
+            "type": 6,
+            "stream_id": 0,
+            "length": 8,
+            "flags": 0
+          },
+          {
+            "type": 7,
+            "stream_id": 0,
+            "length": 8,
+            "flags": 0
+          }
+        ]
+      },
+      {
+        "connection": 9,
+        "frames": [
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 24,
+            "flags": 0
+          },
+          {
+            "type": 8,
+            "stream_id": 0,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 1,
+            "stream_id": 3,
+            "length": 273,
+            "flags": 37
+          },
+          {
+            "type": 8,
+            "stream_id": 3,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 0,
+            "flags": 1
+          }
+        ]
+      },
+      {
+        "connection": 10,
+        "frames": [
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 24,
+            "flags": 0
+          },
+          {
+            "type": 8,
+            "stream_id": 0,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 7,
+            "stream_id": 0,
+            "length": 8,
+            "flags": 0
+          }
+        ]
+      },
+      {
+        "connection": 18,
+        "frames": [
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 24,
+            "flags": 0
+          },
+          {
+            "type": 8,
+            "stream_id": 0,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 1,
+            "stream_id": 3,
+            "length": 963,
+            "flags": 37
+          },
+          {
+            "type": 8,
+            "stream_id": 3,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 0,
+            "flags": 1
+          }
+        ]
+      },
+      {
+        "connection": 19,
+        "frames": [
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 24,
+            "flags": 0
+          },
+          {
+            "type": 8,
+            "stream_id": 0,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 7,
+            "stream_id": 0,
+            "length": 8,
+            "flags": 0
+          }
+        ]
+      },
+      {
+        "connection": 20,
+        "frames": [
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 24,
+            "flags": 0
+          },
+          {
+            "type": 8,
+            "stream_id": 0,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 1,
+            "stream_id": 3,
+            "length": 381,
+            "flags": 37
+          },
+          {
+            "type": 8,
+            "stream_id": 3,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 0,
+            "flags": 1
+          }
+        ]
+      },
+      {
+        "connection": 21,
+        "frames": [
+          {
+            "type": 4,
+            "stream_id": 0,
+            "length": 24,
+            "flags": 0
+          },
+          {
+            "type": 8,
+            "stream_id": 0,
+            "length": 4,
+            "flags": 0
+          },
+          {
+            "type": 7,
+            "stream_id": 0,
+            "length": 8,
+            "flags": 0
+          }
+        ]
+      }
+    ],
+    "frame_counts": [
+      {
+        "side": "client",
+        "type": 0,
+        "count": 11
+      },
+      {
+        "side": "client",
+        "type": 1,
+        "count": 21
+      },
+      {
+        "side": "client",
+        "type": 4,
+        "count": 16
+      },
+      {
+        "side": "client",
+        "type": 6,
+        "count": 18
+      },
+      {
+        "side": "client",
+        "type": 7,
+        "count": 8
+      },
+      {
+        "side": "client",
+        "type": 8,
+        "count": 31
+      },
+      {
+        "side": "server",
+        "type": 0,
+        "count": 143
+      },
+      {
+        "side": "server",
+        "type": 1,
+        "count": 21
+      },
+      {
+        "side": "server",
+        "type": 4,
+        "count": 12
+      },
+      {
+        "side": "server",
+        "type": 6,
+        "count": 19
+      },
+      {
+        "side": "server",
+        "type": 8,
+        "count": 6
+      }
+    ]
+  },
+  "requests": [
+    {
+      "connection": 0,
+      "stream_id": 3,
+      "host": "accounts.google.com",
+      "method": "GET",
+      "path": "/ServiceLogin",
+      "query_keys": [
+        "hl"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "upgrade-insecure-requests",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "upgrade-insecure-requests": "1",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
+        "priority": "u=0, i",
+        "te": "trailers"
+      },
+      "cookie_fields": 0,
+      "response_status": 302,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 0,
+      "stream_id": 5,
+      "host": "accounts.google.com",
+      "method": "GET",
+      "path": "/v3/signin/identifier",
+      "query_keys": [
+        "dsh",
+        "flowEntry",
+        "flowName",
+        "hl"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "cookie",
+        "upgrade-insecure-requests",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "upgrade-insecure-requests": "1",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
+        "priority": "u=0, i",
+        "te": "trailers"
+      },
+      "cookie_fields": 1,
+      "response_status": 200,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 0,
+      "stream_id": 7,
+      "host": "accounts.google.com",
+      "method": "GET",
+      "path": "/favicon.ico",
+      "query_keys": [],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "image",
+        "sec-fetch-mode": "no-cors",
+        "sec-fetch-site": "same-origin",
+        "te": "trailers"
+      },
+      "cookie_fields": 1,
+      "response_status": 301,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 0,
+      "stream_id": 9,
+      "host": "accounts.google.com",
+      "method": "GET",
+      "path": "/_/bscframe",
+      "query_keys": [],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "cookie",
+        "upgrade-insecure-requests",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "upgrade-insecure-requests": "1",
+        "sec-fetch-dest": "iframe",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 1,
+      "response_status": 200,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 0,
+      "stream_id": 11,
+      "host": "accounts.google.com",
+      "method": "POST",
+      "path": "/v3/signin/_/AccountsSignInUi/data/batchexecute",
+      "query_keys": [
+        "_reqid",
+        "bl",
+        "dsh",
+        "f.sid",
+        "hl",
+        "rpcids",
+        "rt",
+        "source-path"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "content-type",
+        "x-goog-ext-278367001-jspb",
+        "x-goog-ext-391502476-jspb",
+        "x-same-domain",
+        "content-length",
+        "origin",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 1,
+      "response_status": 200,
+      "form_fields": [
+        "at",
+        "f.req"
+      ],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 0,
+      "stream_id": 13,
+      "host": "accounts.google.com",
+      "method": "GET",
+      "path": "/generate_204",
+      "query_keys": [],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "image",
+        "sec-fetch-mode": "no-cors",
+        "sec-fetch-site": "same-origin",
+        "te": "trailers"
+      },
+      "cookie_fields": 1,
+      "response_status": 204,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 8,
+      "stream_id": 3,
+      "host": "accounts.youtube.com",
+      "method": "GET",
+      "path": "/accounts/CheckConnection",
+      "query_keys": [
+        "pmpo",
+        "timestamp",
+        "v"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "sec-fetch-storage-access",
+        "upgrade-insecure-requests",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "upgrade-insecure-requests": "1",
+        "sec-fetch-dest": "iframe",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "cross-site",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 0,
+      "response_status": 200,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 0,
+      "stream_id": 15,
+      "host": "accounts.google.com",
+      "method": "POST",
+      "path": "/v3/signin/_/AccountsSignInUi/browserinfo",
+      "query_keys": [
+        "_reqid",
+        "bl",
+        "dsh",
+        "f.sid",
+        "hl",
+        "rt"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "content-type",
+        "x-same-domain",
+        "content-length",
+        "origin",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 1,
+      "response_status": 200,
+      "form_fields": [
+        "at",
+        "f.req"
+      ],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 9,
+      "stream_id": 3,
+      "host": "www.google.com",
+      "method": "GET",
+      "path": "/favicon.ico",
+      "query_keys": [],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "image",
+        "sec-fetch-mode": "no-cors",
+        "sec-fetch-site": "same-site",
+        "te": "trailers"
+      },
+      "cookie_fields": 0,
+      "response_status": 200,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 0,
+      "stream_id": 17,
+      "host": "accounts.google.com",
+      "method": "POST",
+      "path": "/v3/signin/_/AccountsSignInUi/web-reports",
+      "query_keys": [
+        "context"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "content-type",
+        "content-length",
+        "origin",
+        "cookie",
+        "cookie",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 3,
+      "response_status": 204,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 0,
+      "stream_id": 19,
+      "host": "accounts.google.com",
+      "method": "POST",
+      "path": "/v3/signin/_/AccountsSignInUi/data/batchexecute",
+      "query_keys": [
+        "_reqid",
+        "bl",
+        "dsh",
+        "f.sid",
+        "hl",
+        "rpcids",
+        "rt",
+        "source-path"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "content-type",
+        "x-goog-ext-278367001-jspb",
+        "x-goog-ext-391502476-jspb",
+        "x-same-domain",
+        "content-length",
+        "origin",
+        "cookie",
+        "cookie",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 3,
+      "response_status": 200,
+      "form_fields": [
+        "at",
+        "f.req"
+      ],
+      "contains_synthetic_identifier": true
+    },
+    {
+      "connection": 0,
+      "stream_id": 21,
+      "host": "accounts.google.com",
+      "method": "POST",
+      "path": "/v3/signin/_/AccountsSignInUi/web-reports",
+      "query_keys": [
+        "context"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "content-type",
+        "content-length",
+        "origin",
+        "cookie",
+        "cookie",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 3,
+      "response_status": 204,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 0,
+      "stream_id": 23,
+      "host": "accounts.google.com",
+      "method": "GET",
+      "path": "/v3/signin/_/AccountsSignInUi/gen204/",
+      "query_keys": [
+        "rtembps",
+        "rttms",
+        "tmambps"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "cookie",
+        "cookie",
+        "cookie",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "image",
+        "sec-fetch-mode": "no-cors",
+        "sec-fetch-site": "same-origin",
+        "te": "trailers"
+      },
+      "cookie_fields": 4,
+      "response_status": 204,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 0,
+      "stream_id": 25,
+      "host": "accounts.google.com",
+      "method": "POST",
+      "path": "/v3/signin/_/AccountsSignInUi/browserinfo",
+      "query_keys": [
+        "_reqid",
+        "bl",
+        "dsh",
+        "f.sid",
+        "hl",
+        "rt"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "content-type",
+        "x-same-domain",
+        "content-length",
+        "origin",
+        "cookie",
+        "cookie",
+        "cookie",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 4,
+      "response_status": 200,
+      "form_fields": [
+        "at",
+        "f.req"
+      ],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 18,
+      "stream_id": 3,
+      "host": "accounts.google.com",
+      "method": "GET",
+      "path": "/ServiceLogin",
+      "query_keys": [
+        "hl"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "cookie",
+        "cookie",
+        "cookie",
+        "cookie",
+        "upgrade-insecure-requests",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "upgrade-insecure-requests": "1",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
+        "priority": "u=0, i",
+        "te": "trailers"
+      },
+      "cookie_fields": 4,
+      "response_status": 302,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 18,
+      "stream_id": 5,
+      "host": "accounts.google.com",
+      "method": "GET",
+      "path": "/v3/signin/identifier",
+      "query_keys": [
+        "dsh",
+        "flowEntry",
+        "flowName",
+        "hl"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "cookie",
+        "cookie",
+        "cookie",
+        "cookie",
+        "upgrade-insecure-requests",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "upgrade-insecure-requests": "1",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
+        "priority": "u=0, i",
+        "te": "trailers"
+      },
+      "cookie_fields": 4,
+      "response_status": 200,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 18,
+      "stream_id": 7,
+      "host": "accounts.google.com",
+      "method": "GET",
+      "path": "/_/bscframe",
+      "query_keys": [],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "cookie",
+        "cookie",
+        "cookie",
+        "cookie",
+        "upgrade-insecure-requests",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "upgrade-insecure-requests": "1",
+        "sec-fetch-dest": "iframe",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 4,
+      "response_status": 200,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 18,
+      "stream_id": 9,
+      "host": "accounts.google.com",
+      "method": "POST",
+      "path": "/v3/signin/_/AccountsSignInUi/data/batchexecute",
+      "query_keys": [
+        "_reqid",
+        "bl",
+        "dsh",
+        "f.sid",
+        "hl",
+        "rpcids",
+        "rt",
+        "source-path"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "content-type",
+        "x-goog-ext-278367001-jspb",
+        "x-goog-ext-391502476-jspb",
+        "x-same-domain",
+        "content-length",
+        "origin",
+        "cookie",
+        "cookie",
+        "cookie",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 4,
+      "response_status": 200,
+      "form_fields": [
+        "at",
+        "f.req"
+      ],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 18,
+      "stream_id": 11,
+      "host": "accounts.google.com",
+      "method": "GET",
+      "path": "/generate_204",
+      "query_keys": [],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "cookie",
+        "cookie",
+        "cookie",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "image",
+        "sec-fetch-mode": "no-cors",
+        "sec-fetch-site": "same-origin",
+        "te": "trailers"
+      },
+      "cookie_fields": 4,
+      "response_status": 204,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 20,
+      "stream_id": 3,
+      "host": "accounts.youtube.com",
+      "method": "GET",
+      "path": "/accounts/CheckConnection",
+      "query_keys": [
+        "pmpo",
+        "timestamp",
+        "v"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "sec-fetch-storage-access",
+        "upgrade-insecure-requests",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "upgrade-insecure-requests": "1",
+        "sec-fetch-dest": "iframe",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "cross-site",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 0,
+      "response_status": 200,
+      "form_fields": [],
+      "contains_synthetic_identifier": false
+    },
+    {
+      "connection": 18,
+      "stream_id": 13,
+      "host": "accounts.google.com",
+      "method": "POST",
+      "path": "/v3/signin/_/AccountsSignInUi/browserinfo",
+      "query_keys": [
+        "_reqid",
+        "bl",
+        "dsh",
+        "f.sid",
+        "hl",
+        "rt"
+      ],
+      "header_order": [
+        ":method",
+        ":path",
+        ":authority",
+        ":scheme",
+        "user-agent",
+        "accept",
+        "accept-language",
+        "accept-encoding",
+        "referer",
+        "content-type",
+        "x-same-domain",
+        "content-length",
+        "origin",
+        "cookie",
+        "cookie",
+        "cookie",
+        "cookie",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "priority",
+        "te"
+      ],
+      "public_headers": {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=4",
+        "te": "trailers"
+      },
+      "cookie_fields": 4,
+      "response_status": 200,
+      "form_fields": [
+        "at",
+        "f.req"
+      ],
+      "contains_synthetic_identifier": false
+    }
+  ]
+}
