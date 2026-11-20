@@ -492,6 +492,91 @@ fn cross_origin_iframe_posts_message_to_parent() {
     assert_eq!(t.eval("frame.contentWindow === window"), "false");
 }
 
+#[test]
+fn cross_origin_frames_cannot_reach_parent_globals_or_host_capabilities() {
+    let mut t = h();
+    t.site.add("https://parent.test/", "text/html", r#"<body><script>
+      window.privateValue = 'parent-secret'; window.result = null;
+      addEventListener('message', e => result = e.data);
+      var frame = document.createElement('iframe'); frame.src = 'https://child.test/f'; document.body.appendChild(frame);
+    </script>"#);
+    t.site.add("https://child.test/f", "text/html", r#"<script>
+      const result = {hostHidden: typeof __h === 'undefined', denied: [], localFunction: false};
+      for (const key of ['document', 'localStorage', 'privateValue', 'eval', '__h', 'constructor']) {
+        try { void parent[key]; result.denied.push('allowed:' + key); }
+        catch (e) { result.denied.push(e.name); }
+      }
+      result.localFunction = parent.postMessage.constructor('return typeof privateValue')() === 'undefined';
+      result.nullPrototype = Object.getPrototypeOf(parent) === null;
+      try { Object.getOwnPropertyDescriptor(parent, 'document'); result.descriptor = 'allowed'; }
+      catch (e) { result.descriptor = e.name; }
+      parent.postMessage(result, 'https://parent.test');
+    </script>"#);
+    t.open("https://parent.test/");
+    assert_eq!(t.eval("result && result.hostHidden && result.localFunction && result.nullPrototype && result.descriptor === 'SecurityError' && result.denied.length === 6 && result.denied.every(x => x === 'SecurityError')"), "true", "{:?}", t.console());
+    assert_eq!(t.eval("(() => { try { return frame.contentWindow.document; } catch (e) { return e.name; } })()"), "\"SecurityError\"");
+}
+
+#[test]
+fn iframe_messages_are_queued_and_copied_in_the_receivers_realm() {
+    let mut t = h();
+    t.site.add("https://parent.test/", "text/html", r#"<body><script>
+      window.reply = null; addEventListener('message', e => reply = e.data);
+      var frame = document.createElement('iframe'); frame.src = 'https://child.test/f'; document.body.appendChild(frame);
+    </script>"#);
+    t.site.add("https://child.test/f", "text/html", r#"<script>
+      addEventListener('message', e => {
+        const local = Object.getPrototypeOf(e.data) === Object.prototype;
+        e.source.postMessage({value:e.data.nested.value, local}, e.origin);
+        e.data.nested.value = 99;
+      });
+    </script>"#);
+    t.open("https://parent.test/");
+    assert_eq!(t.eval("(() => { window.payload = {nested:{value:1}}; frame.contentWindow.postMessage(payload, 'https://child.test'); payload.nested.value = 2; return reply === null; })()"), "true");
+    t.settle();
+    assert_eq!(t.eval("reply && reply.value === 1 && reply.local && payload.nested.value === 2"), "true", "{:?}", t.console());
+    assert_eq!(t.eval("(() => { try { frame.contentWindow.postMessage({fn(){}}, '*'); } catch (e) { return e.name; } })()"), "\"DataCloneError\"");
+    assert_eq!(t.eval("(() => { try { frame.contentWindow.postMessage('x', 'not an origin'); } catch (e) { return e.name; } })()"), "\"SyntaxError\"");
+}
+
+#[test]
+fn iframe_navigation_keeps_proxy_identity_and_revokes_old_realm_capabilities() {
+    let mut t = h();
+    t.site.add("https://parent.test/", "text/html", r#"<body><script>
+      window.messages = [];
+      addEventListener('message', e => messages.push(e.data + ':' + e.origin));
+      var frame = document.createElement('iframe'); frame.src = '/first'; document.body.appendChild(frame);
+    </script>"#);
+    t.site.add("https://parent.test/first", "text/html", r#"<script>
+      window.canary = 'first'; window.oldSend = () => parent.postMessage('old', '*');
+    </script>"#);
+    t.site.add("https://child.test/second", "text/html", r#"<script>parent.postMessage('new', 'https://parent.test')</script>"#);
+    t.open("https://parent.test/");
+    assert_eq!(t.eval("window.cached = frame.contentWindow; window.oldSend = cached.oldSend; cached.canary"), "\"first\"");
+    t.eval("frame.src = 'https://child.test/second'");
+    t.settle();
+    assert_eq!(t.eval("cached === frame.contentWindow"), "true");
+    assert_eq!(t.eval("(() => { try { return cached.canary; } catch(e) { return e.name; } })()"), "\"SecurityError\"");
+    t.eval("oldSend()");
+    assert_eq!(t.eval("messages.join(',')"), "\"new:https://child.test\"");
+}
+
+#[test]
+fn iframe_sandbox_disables_scripts_and_keeps_script_enabled_frames_opaque() {
+    let mut t = h();
+    t.site.add("https://parent.test/", "text/html", r#"<body><script>
+      window.privateValue = 'parent-secret'; window.messages = [];
+      addEventListener('message', e => messages.push(e.data + ':' + e.origin));
+    </script><iframe sandbox="allow-scripts" src="/opaque"></iframe><iframe sandbox src="/disabled"></iframe>"#);
+    t.site.add("https://parent.test/opaque", "text/html", r#"<script>
+      try { parent.privateValue; parent.postMessage('leaked', '*'); }
+      catch (e) { parent.postMessage(e.name, '*'); }
+    </script>"#);
+    t.site.add("https://parent.test/disabled", "text/html", "<script>parent.postMessage('forbidden', '*')</script>");
+    t.open("https://parent.test/");
+    assert_eq!(t.eval("messages.join(',')"), "\"SecurityError:null\"", "{:?}", t.console());
+}
+
 // Both directions: the parent posts into the child frame, the child's listener receives it with
 // the parent as source, and replies; the parent then sees the reply from the child.
 #[test]

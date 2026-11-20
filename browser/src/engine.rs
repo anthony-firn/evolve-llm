@@ -18,7 +18,7 @@ use blitz_traits::shell::{ColorScheme, Viewport};
 use boa_engine::JsValue;
 use keyboard_types::{Code, Key, Location, Modifiers, NamedKey};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -70,7 +70,7 @@ pub struct Page {
     dom_loaded_at: f64,
     last_frame_time: f64,
     /// iframe nodes whose sub-document scripts have already been run in their realm.
-    framed: HashSet<NodeId>,
+    framed: HashMap<NodeId, usize>,
 }
 
 struct PendingNav {
@@ -486,7 +486,7 @@ impl Engine {
             load_fired: false,
             dom_loaded_at: 0.0,
             last_frame_time: 0.0,
-            framed: HashSet::new(),
+            framed: HashMap::new(),
         };
         if page.js.is_some() {
             collect_parser_scripts(&mut page);
@@ -633,6 +633,7 @@ impl Engine {
         if page.state.animation_frame {
             next = next.min((16.0 - (now - page.last_frame_time)).max(0.0));
         }
+        if page.js.as_ref().is_some_and(|js| js.frame_messages_pending()) { next = 0.0; }
         if page.doc.is_animating() {
             next = next.min(16.0);
         }
@@ -1021,16 +1022,11 @@ fn run_iframe_scripts(page: &mut Page) {
     }
     let frame_ids: Vec<NodeId> = page.doc.sub_document_node_ids();
     for node_id in frame_ids {
-        if page.framed.contains(&node_id) {
-            continue;
-        }
-        let Some((origin, url, scripts)) = collect_frame_scripts(&page.doc, node_id) else {
+        let Some((document_id, origin, url, scripts)) = collect_frame_scripts(&page.doc, node_id) else {
             continue;
         };
-        page.framed.insert(node_id);
-        if scripts.is_empty() {
-            continue;
-        }
+        if page.framed.get(&node_id) == Some(&document_id) { continue; }
+        page.framed.insert(node_id, document_id);
         let js = page.js.as_ref().unwrap();
         let _s = js::enter(&mut page.doc, &mut page.state);
         if let Err(e) = js.run_frame(node_id.as_u64(), &origin, &url, &scripts) {
@@ -1041,13 +1037,22 @@ fn run_iframe_scripts(page: &mut Page) {
 }
 
 /// Collects an iframe sub-document's origin, URL and inline classic script sources.
-fn collect_frame_scripts(doc: &BaseDocument, node_id: NodeId) -> Option<(String, String, Vec<String>)> {
-    let guard = doc.get_node(node_id)?.element_data()?.sub_doc_data()?.inner();
+fn collect_frame_scripts(doc: &BaseDocument, node_id: NodeId) -> Option<(usize, String, String, Vec<String>)> {
+    let frame = doc.get_node(node_id)?.element_data()?;
+    let sandbox = frame.attr(local_name!("sandbox"));
+    let permits = |flag| sandbox.is_none_or(|value| value.split_ascii_whitespace().any(|token| token == flag));
+    let guard = frame.sub_doc_data()?.inner();
     let sub: &BaseDocument = &guard;
     let url = sub.base_url().clone();
-    let origin = url.origin().ascii_serialization();
+    let origin = if !permits("allow-same-origin") {
+        "null".to_string()
+    } else if url.scheme() == "about" || frame.attr(local_name!("srcdoc")).is_some() {
+        doc.base_url().origin().ascii_serialization()
+    } else {
+        url.origin().ascii_serialization()
+    };
     let mut scripts = Vec::new();
-    let script_ids = sub.query_selector_all("script").map(|v| v.to_vec()).unwrap_or_default();
+    let script_ids = if permits("allow-scripts") { sub.query_selector_all("script").map(|v| v.to_vec()).unwrap_or_default() } else { vec![] };
     for sid in script_ids {
         let Some(node) = sub.get_node(sid) else { continue };
         let ty = node.attr(local_name!("type")).unwrap_or("").trim().to_ascii_lowercase();
@@ -1061,7 +1066,7 @@ fn collect_frame_scripts(doc: &BaseDocument, node_id: NodeId) -> Option<(String,
             scripts.push(code);
         }
     }
-    Some((origin, url.to_string(), scripts))
+    Some((sub.id(), origin, url.to_string(), scripts))
 }
 
 fn collect_parser_scripts(page: &mut Page) {

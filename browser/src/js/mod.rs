@@ -25,16 +25,16 @@ use std::task::{Wake, Waker};
 use url::Url;
 
 pub const PRELUDE: &str = include_str!("prelude.js");
+const WINDOW_BRIDGE: &str = include_str!("window_bridge.js");
 pub const FRAME_PRELUDE: &str = include_str!("frame.js");
 
-/// Per-page registry of iframe JS realms, so cross-frame `postMessage` delivers to the right
-/// window with the right `event.source`/`event.origin`. Keyed by the parent document's iframe
+/// Private per-page registry of iframe realms and queued posted messages. Raw globals stay
+/// in the host; page scripts receive realm-local, origin-checked facades. Keyed by the iframe
 /// node id; the top window is id 0 (no real iframe is node 0).
 #[derive(Default)]
 struct FrameTable {
-    /// The window whose script is currently executing (0 = top), so a `postMessage` knows its
-    /// source. It is also set to the target window while that window's handlers run.
-    current: Cell<u64>,
+    next_epoch: Cell<u64>,
+    messages: RefCell<VecDeque<FrameMessage>>,
     top: RefCell<Option<FrameEntry>>,
     frames: RefCell<HashMap<u64, FrameEntry>>,
 }
@@ -45,6 +45,41 @@ struct FrameEntry {
     realm: Option<Realm>,
     window: JsObject,
     origin: String,
+    url: String,
+    epoch: u64,
+    deliver: Option<JsObject>,
+}
+
+struct FrameMessage {
+    target: u64,
+    target_epoch: u64,
+    source: u64,
+    source_epoch: u64,
+    source_origin: String,
+    wire: String,
+    target_origin: String,
+}
+
+fn frame_entry(id: u64) -> Option<FrameEntry> {
+    FRAMES.with(|f| if id == 0 { f.top.borrow().clone() } else { f.frames.borrow().get(&id).cloned() })
+}
+
+pub(crate) fn checked_frame_window(target: u64, source: u64, epoch: u64) -> Option<JsObject> {
+    let sender = frame_entry(source)?;
+    let receiver = frame_entry(target)?;
+    (sender.epoch == epoch && (target == source || sender.origin != "null" && sender.origin == receiver.origin)).then_some(receiver.window)
+}
+
+pub(crate) fn queue_frame_message(target: u64, source: u64, epoch: u64, wire: String, target_origin: String) {
+    let Some(sender) = frame_entry(source).filter(|e| e.epoch == epoch) else { return };
+    let Some(receiver) = frame_entry(target) else { return };
+    let allowed = target_origin == "*" || target_origin == receiver.origin;
+    if !allowed { return; }
+    FRAMES.with(|f| f.messages.borrow_mut().push_back(FrameMessage {
+        target, target_epoch: receiver.epoch, source, source_epoch: epoch,
+        source_origin: sender.origin, wire, target_origin,
+    }));
+    host::wake();
 }
 
 thread_local! {
@@ -55,23 +90,14 @@ thread_local! {
 /// window objects belong to it.
 pub(crate) fn frames_clear() {
     FRAMES.with(|f| {
-        f.current.set(0);
+        f.next_epoch.set(0);
+        f.messages.borrow_mut().clear();
         *f.top.borrow_mut() = None;
         f.frames.borrow_mut().clear();
     });
 }
 
-/// The window object and origin a message posted right now should carry as its source.
-pub(crate) fn frame_source() -> Option<(JsObject, String)> {
-    FRAMES.with(|f| {
-        let id = f.current.get();
-        let entry = if id == 0 { f.top.borrow().clone() } else { f.frames.borrow().get(&id).cloned() };
-        entry.map(|e| (e.window, e.origin))
-    })
-}
-
-/// The origin of the window a message is being posted to (by its `__frameId`), for the
-/// `targetOrigin` check.
+/// The registered origin of a window, used for postMessage targetOrigin checks.
 pub(crate) fn frame_origin(id: u64) -> Option<String> {
     FRAMES.with(|f| {
         if id == 0 { f.top.borrow().as_ref().map(|e| e.origin.clone()) } else { f.frames.borrow().get(&id).map(|e| e.origin.clone()) }
@@ -81,15 +107,6 @@ pub(crate) fn frame_origin(id: u64) -> Option<String> {
 /// The window object for an iframe node, for `iframe.contentWindow`.
 pub(crate) fn frame_window(id: u64) -> Option<JsObject> {
     FRAMES.with(|f| f.frames.borrow().get(&id).map(|e| e.window.clone()))
-}
-
-/// Runs `body` with the current source window temporarily set to `id` (a window's handlers run
-/// as that window), so a `postMessage` sent from within them has the right source.
-pub(crate) fn frame_with_current<R>(id: u64, body: impl FnOnce() -> R) -> R {
-    let prev = FRAMES.with(|f| f.current.replace(id));
-    let r = body();
-    FRAMES.with(|f| f.current.set(prev));
-    r
 }
 
 /// Per-page state the host API reads and writes while script runs.
@@ -373,7 +390,7 @@ impl JsRuntime {
 
     /// Install the DOM and web APIs. Must run inside `enter(doc, state)`.
     pub fn install_prelude(&self) -> Result<(), String> {
-        self.eval_script(PRELUDE, "evolve:prelude").map(|_| ()).map_err(|e| format!("Prelude failed: {e}"))
+        self.eval_script(&PRELUDE.replace("/*__WINDOW_BRIDGE__*/", WINDOW_BRIDGE), "evolve:prelude").map(|_| ()).map_err(|e| format!("Prelude failed: {e}"))
     }
 
     /// Run a classic script, then a microtask checkpoint.
@@ -453,6 +470,20 @@ impl JsRuntime {
     /// Poll module loading. Returns errors from modules that failed.
     pub fn poll(&self) -> Vec<String> {
         let mut errors: Vec<String> = self.executor.errors.borrow_mut().drain(..).collect();
+        // Posted messages are tasks, never synchronous calls across a realm boundary.
+        let messages: Vec<_> = FRAMES.with(|f| f.messages.borrow_mut().drain(..).collect());
+        for message in messages {
+            let Some(target) = frame_entry(message.target).filter(|e| e.epoch == message.target_epoch) else { continue };
+            if frame_entry(message.source).is_none_or(|e| e.epoch != message.source_epoch) { continue; }
+            if message.target_origin != "*" && message.target_origin != target.origin { continue; }
+            let Some(deliver) = target.deliver.filter(|o| o.is_callable()) else { continue };
+            let mut ctx = self.cell.borrow_mut();
+            let previous = target.realm.map(|realm| ctx.enter_realm(realm));
+            let result = deliver.call(&JsValue::from(target.window), &[js_str(&message.wire), js_str(&message.source_origin), JsValue::from(message.source as f64)], &mut ctx);
+            if let Err(error) = result { errors.push(error.to_string()); }
+            let _ = ctx.run_jobs();
+            if let Some(previous) = previous { ctx.enter_realm(previous); }
+        }
         if self.executor.has_async() {
             let fresh: Vec<_> = self.executor.new_async.borrow_mut().drain(..).collect();
             for job in fresh {
@@ -487,6 +518,10 @@ impl JsRuntime {
         errors
     }
 
+    pub fn frame_messages_pending(&self) -> bool {
+        FRAMES.with(|f| !f.messages.borrow().is_empty())
+    }
+
     pub fn modules_pending(&self) -> bool {
         !self.pending_modules.borrow().is_empty() || self.executor.has_async()
     }
@@ -495,25 +530,30 @@ impl JsRuntime {
     /// Call once after `install_prelude`, with the document's origin.
     pub fn record_top_window(&self, origin: &str) {
         frames_clear();
-        let window = self.cell.borrow_mut().global_object();
-        FRAMES.with(|f| *f.top.borrow_mut() = Some(FrameEntry { realm: None, window, origin: origin.to_string() }));
+        let mut ctx = self.cell.borrow_mut();
+        let window = ctx.global_object();
+        let deliver = window.get(JsString::from("__deliverMessage"), &mut ctx).ok().and_then(|v| v.as_object());
+        let realm = Some(ctx.realm().clone());
+        FRAMES.with(|f| *f.top.borrow_mut() = Some(FrameEntry { realm, window, origin: origin.to_string(), url: String::new(), epoch: 0, deliver }));
     }
 
     /// Runs an iframe's classic scripts in its own realm (fresh global, shared heap) so the
-    /// frame's `window` is a distinct object the parent can reach as `iframe.contentWindow`, and
-    /// `postMessage` across the boundary carries the right source and origin. `node_id` is the
+    /// frame has a distinct global behind its contentWindow facade. Queued postMessage
+    /// delivery reconstructs values and window references in the receiving realm. `node_id` is the
     /// iframe's node id in the parent document (used as the frame id). The realm may already exist
     /// (created eagerly on a synchronous `contentWindow` access); its scripts then run in it.
     /// Returns the first error.
     pub fn run_frame(&self, node_id: u64, origin: &str, url: &str, scripts: &[String]) -> Result<(), String> {
         let mut guard = self.cell.borrow_mut();
         let ctx: &mut Context = &mut guard;
+        // A newly attached document gets a fresh realm even on same-URL reloads. WindowProxy
+        // identity remains stable; old source capabilities and queued messages lose their epoch.
+        FRAMES.with(|f| f.frames.borrow_mut().remove(&node_id));
         create_frame_realm(ctx, node_id, origin, url)?;
         let Some(realm) = FRAMES.with(|f| f.frames.borrow().get(&node_id).and_then(|e| e.realm.clone())) else {
             return Ok(());
         };
         let prev = ctx.enter_realm(realm);
-        FRAMES.with(|f| f.current.set(node_id));
         let mut first_err = None;
         for code in scripts {
             if let Err(e) = ctx.eval(Source::from_bytes(code.as_bytes()).with_path(Path::new("evolve:frame-script"))) {
@@ -521,7 +561,6 @@ impl JsRuntime {
             }
             let _ = ctx.run_jobs();
         }
-        FRAMES.with(|f| f.current.set(0));
         ctx.enter_realm(prev);
         match first_err { Some(e) => Err(e), None => Ok(()) }
     }
@@ -532,31 +571,29 @@ impl JsRuntime {
 /// it. No scripts run here. Used both eagerly (synchronous same-origin `contentWindow` access,
 /// matching a real browser's immediate about:blank window) and when the sub-document loads.
 pub(crate) fn create_frame_realm(ctx: &mut Context, node_id: u64, origin: &str, url: &str) -> Result<JsObject, String> {
-    if let Some(window) = FRAMES.with(|f| f.frames.borrow().get(&node_id).map(|e| e.window.clone())) {
-        return Ok(window);
+    if let Some(entry) = frame_entry(node_id) {
+        if entry.origin == origin && entry.url == url { return Ok(entry.window); }
     }
+    let epoch = FRAMES.with(|f| { let epoch = f.next_epoch.get() + 1; f.next_epoch.set(epoch); epoch });
     let realm = ctx.create_realm().map_err(|e| e.to_string())?;
     let prev = ctx.enter_realm(realm.clone());
     let result = (|| -> Result<JsObject, String> {
-        host_api::install(ctx).map_err(|e| e.to_string())?;
-        let top = FRAMES.with(|f| f.top.borrow().as_ref().map(|e| e.window.clone()));
+        host_api::install_frame(ctx).map_err(|e| e.to_string())?;
         let attr = Attribute::all();
         ctx.register_global_property(JsString::from("__frameId_value"), JsValue::from(node_id as f64), attr).map_err(|e| e.to_string())?;
+        ctx.register_global_property(JsString::from("__frameEpoch_value"), JsValue::from(epoch as f64), attr).map_err(|e| e.to_string())?;
         ctx.register_global_property(JsString::from("__frameOrigin"), js_str(origin), attr).map_err(|e| e.to_string())?;
         ctx.register_global_property(JsString::from("__frameUrl"), js_str(url), attr).map_err(|e| e.to_string())?;
-        if let Some(top) = top {
-            ctx.register_global_property(JsString::from("__parentWindow"), JsValue::from(top.clone()), attr).map_err(|e| e.to_string())?;
-            ctx.register_global_property(JsString::from("__topWindow"), JsValue::from(top), attr).map_err(|e| e.to_string())?;
-        }
-        ctx.eval(Source::from_bytes(FRAME_PRELUDE.as_bytes()).with_path(Path::new("evolve:frame"))).map_err(|e| e.to_string())?;
+        ctx.eval(Source::from_bytes(FRAME_PRELUDE.replace("/*__WINDOW_BRIDGE__*/", WINDOW_BRIDGE).as_bytes()).with_path(Path::new("evolve:frame"))).map_err(|e| e.to_string())?;
         Ok(ctx.global_object())
     })();
     let window = match result {
         Ok(w) => w,
         Err(e) => { ctx.enter_realm(prev); return Err(e); }
     };
+    let deliver = window.get(JsString::from("__deliverMessage"), ctx).ok().and_then(|v| v.as_object());
     ctx.enter_realm(prev);
-    FRAMES.with(|f| f.frames.borrow_mut().insert(node_id, FrameEntry { realm: Some(realm), window: window.clone(), origin: origin.to_string() }));
+    FRAMES.with(|f| f.frames.borrow_mut().insert(node_id, FrameEntry { realm: Some(realm), window: window.clone(), origin: origin.to_string(), url: url.to_string(), epoch, deliver }));
     Ok(window)
 }
 

@@ -195,19 +195,21 @@ The modern Google page rendered and responded to empty-field validation in 17.2 
 2026-11-19 UTC run. No Google-specific CSS override or new browser-identity spoof was needed:
 the fixes are the parser's scripting flag, ordered dynamic scripts and constructed stylesheets.
 
-**Google account authentication is currently unsupported in this panel.** A later nonempty
-identifier test reproduced a stalled modern form. Google's basic form completed the identifier
-request, but an owner-authorized real-account attempt returned “This browser or app may not be
-secure” before a password prompt. No password or verification code was entered. This follows
-Google's [supported-browser guidance](https://support.google.com/accounts/answer/7675428?hl=en).
-Tracing caught initialization promises on 2026-11-19 found two additional platform defects:
-missing numeric navigation-timing fields produced an `int32` validation error, and dynamically
-inserted inline classic scripts ran after insertion returned. Inline scripts now run during
-insertion with normal global Script semantics and `document.currentScript` restoration;
-external scripts and modules continue through the loading queue. Navigation timing exposes
-numeric fields and records DOM/load lifecycle events. Uninstrumented transport timings remain
-zero; they are not fabricated from a reference browser. These fixes have regression coverage;
-Google authentication still requires a separate live identifier/password-prompt check.
+**Google account authentication is currently unsupported in this panel.** The modern form
+now initializes its browser-check iframe and completes the nonempty identifier request, then
+returns “This browser or app may not be secure” for the synthetic identifier. The same rejection
+was observed over Tor and a direct local relay, and with default and Firefox-order TLS profiles.
+No password or verification code was entered. This follows Google's
+[supported-browser guidance](https://support.google.com/accounts/answer/7675428?hl=en).
+
+Tracing caught initialization promises exposed missing numeric navigation-timing fields and
+incorrectly deferred inline classic scripts. Fixing those revealed parser stack exhaustion in
+WASM, previously hidden by automatic worker recovery. The WASM stack now reserves 16 MiB.
+The offline `tests/browser_script_depth_test.py` regression passes at 128 nested calls, where
+the previous 1 MiB build trapped. Deeper nesting can still exhaust the host's call stack
+(320 calls did in this run); this is not a claim of arbitrary nesting support. The live comparison
+tool records worker crashes separately from site failures. Transport timing phases not yet
+instrumented remain zero; reference-browser timings are not fabricated.
 
 The notice on ordinary Google sign-in and rejection pages offers **Open Google in new tab**.
 It starts a separate sign-in in the visitor's regular browser, retaining only the service,
@@ -284,7 +286,12 @@ Google authentication client.
   (cookies and storage survive). Reload or navigate again.
 - **Missing web APIs:** canvas 2D and WebGL, audio and video playback, Web Workers, page
   WebSockets, IndexedDB, Service Workers and WebAuthn. Shadow DOM is approximated in the light
-  DOM. Embedded-frame scripts do not run, and `iframe.contentWindow` is not implemented.
+  DOM. Minimal child realms run inline classic scripts and exchange queued messages. External,
+  module and nested-frame scripts remain unsupported. Cross-origin window facades deny access
+  to DOM, storage and evaluation capabilities. Message values are copied into the receiver's
+  realm; JSON-compatible records/arrays and primitives are supported, while cycles and other
+  structured-clone object types are rejected with `DataCloneError`. Transferables are unsupported.
+  The child document remains a minimal stub, with full DOM, cookie and storage integration incomplete.
   `Intl` is a small built-in subset (no ICU data).
 - **HTTP/1.1 only**, six connections per host, with stylesheets and documents first. Pages with
   hundreds of scripts load slowly, more so over Tor, where each connection is a Tor stream with

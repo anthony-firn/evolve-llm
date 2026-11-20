@@ -1,22 +1,18 @@
-// A minimal window realm for an <iframe> sub-document. It runs as a classic script in the
-// iframe's own Boa realm, so top-level `this` and bare globals resolve to this frame's global
-// (its window), while object identity is shared with the parent realm — so the parent's
-// `iframe.contentWindow` is the very object a message from here carries as `event.source`.
-//
-// This is deliberately small: enough for cross-frame messaging (Google's sign-in checks third-
-// party cookies by having a child frame postMessage the parent). It is NOT a full DOM; frames
-// that need to render their own document are out of scope here.
+// Minimal iframe realm for classic inline scripts and origin-checked messaging.
+// The host interface has no embedding-document capabilities. Cross-origin windows are
+// realm-local facades; only serialized message values cross the boundary.
 (function () {
   'use strict';
   const G = globalThis;
   const H = G.__h;
-  const parentWindow = G.__parentWindow || G;
-  const topWindow = G.__topWindow || parentWindow;
+  delete G.__h;
+  class DOMException extends Error { constructor(message, name) { super(message); this.name = name; } }
+  G.DOMException = DOMException;
+  /*__WINDOW_BRIDGE__*/
+  const parentWindow = windowProxy(0);
+  const topWindow = parentWindow;
   const origin = String(G.__frameOrigin || '');
   const href = String(G.__frameUrl || '');
-  // The node id can exceed 2^31 (Blitz packs a generation into the high bits), so keep it as a
-  // full Number rather than a bitwise-truncated int32.
-  const frameId = Number(G.__frameId_value) || 0;
   for (const k of ['__parentWindow', '__topWindow', '__frameOrigin', '__frameUrl', '__frameId_value']) { try { delete G[k]; } catch (e) {} }
 
   const listeners = new Map();
@@ -47,7 +43,7 @@
   G.opener = null; G.frameElement = null; G.closed = false; G.length = 0; G.name = ''; G.origin = origin;
   G.location = location;
   G.addEventListener = add; G.removeEventListener = rm; G.dispatchEvent = dispatch;
-  G.postMessage = function (data, targetOrigin) { H.postMessage(this == null ? G : this, data, String(targetOrigin == null ? '' : targetOrigin)); };
+  G.postMessage = function (data, targetOrigin) { postToWindow(sourceFrame, data, targetOrigin); };
   // Timers run as microtasks: the delay is ignored, which suffices for the handshakes frames use.
   G.setTimeout = function (fn) { if (typeof fn === 'function') Promise.resolve().then(() => { try { fn(); } catch (e) { H.log('error', 'Uncaught ' + (e && e.stack || e)); } }); return 0; };
   G.setInterval = function () { return 0; };
@@ -73,10 +69,6 @@
   G.btoa = (s) => { s = String(s); let o = ''; for (let i = 0; i < s.length;) { const a = s.charCodeAt(i++), b = i < s.length ? s.charCodeAt(i++) : NaN, c = i < s.length ? s.charCodeAt(i++) : NaN; const n = (a << 16) | ((b || 0) << 8) | (c || 0); o += B64[(n >> 18) & 63] + B64[(n >> 12) & 63] + (isNaN(b) ? '=' : B64[(n >> 6) & 63]) + (isNaN(c) ? '=' : B64[n & 63]); } return o; };
   G.atob = (s) => { s = String(s).replace(/[^A-Za-z0-9+/]/g, ''); let o = ''; for (let i = 0; i < s.length;) { const n = (B64.indexOf(s[i++]) << 18) | (B64.indexOf(s[i++]) << 12) | (B64.indexOf(s[i++]) << 6) | B64.indexOf(s[i++]); o += String.fromCharCode((n >> 16) & 255); if (s[i - 2] !== undefined) o += String.fromCharCode((n >> 8) & 255); if (s[i - 1] !== undefined) o += String.fromCharCode(n & 255); } return o; };
 
-  // Delivery entry point called by the host when a message is posted to this frame.
-  // Delivered synchronously by the host (which marks this frame as the incumbent for the
-  // duration), so a reply posted from a handler carries this frame as its source. The engine's
-  // job queue does not pump frame microtasks between turns, so we must not defer here.
-  Object.defineProperty(G, '__deliverMessage', { value: (data, origin, source) => { dispatch(new MessageEvent('message', { data, origin, source })); }, enumerable: false });
-  Object.defineProperty(G, '__frameId', { value: frameId, enumerable: false });
+  // Called by the host's posted-message task in this realm, after sender/target epoch checks.
+  Object.defineProperty(G, '__deliverMessage', { value: (wire, origin, source) => { dispatch(new MessageEvent('message', { data: decodeWindowMessage(wire), origin, source: windowProxy(source) })); }, enumerable: false });
 })();

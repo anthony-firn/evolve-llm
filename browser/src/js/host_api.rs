@@ -14,7 +14,11 @@ use url::Url;
 
 type HostFn = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
 
-pub fn install(ctx: &mut Context) -> JsResult<()> {
+pub fn install(ctx: &mut Context) -> JsResult<()> { install_functions(ctx, false) }
+
+pub fn install_frame(ctx: &mut Context) -> JsResult<()> { install_functions(ctx, true) }
+
+fn install_functions(ctx: &mut Context, frame: bool) -> JsResult<()> {
     let fns: &[(&str, HostFn, usize)] = &[
         ("identity", identity, 0),
         ("info", info, 1),
@@ -76,7 +80,10 @@ pub fn install(ctx: &mut Context) -> JsResult<()> {
         ("dialog", dialog, 2),
         ("frameWindow", frame_window, 1),
         ("ensureFrameWindow", ensure_frame_window, 1),
-        ("postMessage", post_message, 3),
+        ("postMessage", post_message, 5),
+        ("windowAccess", window_access, 3),
+        ("windowGet", window_get, 4),
+        ("windowSet", window_set, 5),
         ("now", now, 0),
         ("random", random, 1),
         ("encode", encode, 1),
@@ -95,6 +102,9 @@ pub fn install(ctx: &mut Context) -> JsResult<()> {
     ];
     let mut obj = ObjectInitializer::new(ctx);
     for (name, f, arity) in fns {
+        // Child realms have no capabilities for the embedding document's DOM, cookies,
+        // storage or network. The remaining functions enforce origin/epoch checks.
+        if frame && !matches!(*name, "identity" | "log" | "postMessage" | "windowAccess" | "windowGet" | "windowSet") { continue; }
         obj.function(NativeFunction::from_fn_ptr(*f), JsString::from(*name), *arity);
     }
     let obj = obj.build();
@@ -1219,35 +1229,38 @@ fn sheets(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     })
 }
 
-/// `__h.frameWindow(nodeId)` — the window object for an iframe node, or null. Backs
-/// `iframe.contentWindow`, so a parent can hold the same object a message carries as `source`.
+/// Return an existing frame's id, never its raw global. The realm-local WindowProxy cache
+/// gives contentWindow and message.source stable identity while enforcing origin checks.
 fn frame_window(_: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
     let id = arg_num(args, 0);
     if !id.is_finite() || id < 0.0 {
         return Ok(JsValue::null());
     }
-    Ok(super::frame_window(id as u64).map(JsValue::from).unwrap_or(JsValue::null()))
+    Ok(if super::frame_window(id as u64).is_some() { JsValue::from(id) } else { JsValue::null() })
 }
 
 /// `__h.ensureFrameWindow(nodeId)` — for a SAME-ORIGIN iframe whose content has not loaded yet,
-/// creates its window eagerly (a real browser exposes a same-origin frame's window synchronously,
+/// creates its realm eagerly (a real browser exposes a same-origin frame's window synchronously,
 /// as about:blank, the moment the element exists). Returns the window, or null for a cross-origin
-/// frame not yet loaded (its window appears only once its content arrives).
+/// frame not yet loaded (its facade appears only once its content arrives).
 fn ensure_frame_window(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let n = arg_num(args, 0);
     if !n.is_finite() || n < 0.0 {
         return Ok(JsValue::null());
     }
     let id = n as u64;
-    if let Some(window) = super::frame_window(id) {
-        return Ok(JsValue::from(window));
+    if super::frame_window(id).is_some() {
+        return Ok(JsValue::from(id as f64));
     }
-    let Some((src, page)) = with_host(|doc, state| {
-        let src = doc.get_node(NodeId::from_u64(id)).and_then(|node| node.element_data()).and_then(|el| el.attr(local_name!("src")).map(str::to_string));
-        (src, state.url.clone())
+    let Some((src, page, opaque_sandbox)) = with_host(|doc, state| {
+        let element = doc.get_node(NodeId::from_u64(id)).and_then(|node| node.element_data());
+        let src = element.and_then(|el| el.attr(local_name!("src")).map(str::to_string));
+        let opaque = element.and_then(|el| el.attr(local_name!("sandbox"))).is_some_and(|value| !value.split_ascii_whitespace().any(|token| token == "allow-same-origin"));
+        (src, state.url.clone(), opaque)
     }) else {
         return Ok(JsValue::null());
     };
+    if opaque_sandbox { return Ok(JsValue::null()); }
     let page_origin = page.origin().ascii_serialization();
     let (origin, url) = match src.as_deref().map(str::trim) {
         Some(s) if !s.is_empty() => match page.join(s) {
@@ -1261,47 +1274,50 @@ fn ensure_frame_window(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRe
         return Ok(JsValue::null());
     }
     match super::create_frame_realm(ctx, id, &origin, &url) {
-        Ok(window) => Ok(JsValue::from(window)),
+        Ok(_) => Ok(JsValue::from(id as f64)),
         Err(_) => Ok(JsValue::null()),
     }
 }
 
-/// `__h.postMessage(targetWindow, data, targetOrigin)` — delivers a message to another frame
-/// (or the top window) with the posting frame as `event.source` and its origin as `event.origin`,
-/// honouring `targetOrigin` ("*" or an exact origin match). The posting frame is whichever one is
-/// currently executing, tracked natively so identity holds across realms.
+fn checked_window_args(args: &[JsValue]) -> Option<(u64, u64, u64)> {
+    let values = [arg_num(args, 0), arg_num(args, 1), arg_num(args, 2)];
+    values.iter().all(|v| v.is_finite() && *v >= 0.0 && v.fract() == 0.0 && *v <= 9_007_199_254_740_991.0)
+        .then_some((values[0] as u64, values[1] as u64, values[2] as u64))
+}
+
+fn window_access(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(checked_window_args(args).and_then(|(target, source, epoch)| super::checked_frame_window(target, source, epoch)).is_some()))
+}
+
+fn window_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let window = checked_window_args(args).and_then(|(target, source, epoch)| super::checked_frame_window(target, source, epoch))
+        .ok_or_else(|| JsNativeError::error().with_message("SecurityError: cross-origin window access"))?;
+    let key = args.get_or_undefined(3).to_property_key(ctx)?;
+    window.get(key, ctx)
+}
+
+fn window_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let window = checked_window_args(args).and_then(|(target, source, epoch)| super::checked_frame_window(target, source, epoch))
+        .ok_or_else(|| JsNativeError::error().with_message("SecurityError: cross-origin window access"))?;
+    let key = args.get_or_undefined(3).to_property_key(ctx)?;
+    window.set(key, args.get_or_undefined(4).clone(), true, ctx)?;
+    Ok(JsValue::undefined())
+}
+
+// Queue a serialized message. The sender's identity is captured in its realm-local bridge;
+// old realm capabilities are revoked on navigation by the epoch check. No JS object is shared.
 fn post_message(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let Some(target) = args.get_or_undefined(0).as_object() else {
-        return Err(JsNativeError::typ().with_message("postMessage target is not a window").into());
+    let Some((target, source, epoch)) = checked_window_args(args) else {
+        return Err(JsNativeError::typ().with_message("Invalid window identity").into());
     };
-    let data = args.get_or_undefined(1).clone();
-    let target_origin = arg_str(args, 2, ctx)?;
-    // Which window is the target (0 = top), from its hidden frame id.
-    let target_id = target.get(JsString::from("__frameId"), ctx)?.as_number().unwrap_or(f64::NAN);
-    if !target_id.is_finite() || target_id < 0.0 {
-        return Ok(JsValue::undefined());
-    }
-    let target_id = target_id as u64;
-    let Some(target_actual_origin) = super::frame_origin(target_id) else {
-        return Ok(JsValue::undefined());
+    let wire = arg_str(args, 3, ctx)?;
+    let requested = arg_str(args, 4, ctx)?;
+    let target_origin = match requested.as_str() {
+        "*" => requested.clone(),
+        "/" => super::frame_origin(source).unwrap_or_default(),
+        _ => Url::parse(&requested).map_err(|_| JsNativeError::syntax().with_message("Invalid postMessage target origin"))?.origin().ascii_serialization(),
     };
-    let (source_window, source_origin) = super::frame_source().map(|(w, o)| (JsValue::from(w), o)).unwrap_or((JsValue::null(), String::new()));
-    // targetOrigin gate: "*" matches anything, "/" means the sender's own origin, else exact.
-    let allowed = match target_origin.as_str() {
-        "*" => true,
-        "/" => source_origin == target_actual_origin,
-        other => other == target_actual_origin,
-    };
-    if !allowed {
-        return Ok(JsValue::undefined());
-    }
-    let deliver = target.get(JsString::from("__deliverMessage"), ctx)?;
-    let Some(deliver) = deliver.as_callable() else {
-        return Ok(JsValue::undefined());
-    };
-    let target_val = JsValue::from(target);
-    let origin_val = js_str(&source_origin);
-    // The target's handlers run as the target window, so a reply they post has the right source.
-    super::frame_with_current(target_id, || deliver.call(&target_val, &[data, origin_val, source_window], ctx))?;
+    if requested == "/" && target_origin == "null" && source != target { return Ok(JsValue::undefined()); }
+    super::queue_frame_message(target, source, epoch, wire, target_origin);
     Ok(JsValue::undefined())
 }

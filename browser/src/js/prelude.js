@@ -43,6 +43,8 @@
     get code() { return { IndexSizeError: 1, HierarchyRequestError: 3, NotFoundError: 8, NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12, SecurityError: 18, NetworkError: 19, AbortError: 20, QuotaExceededError: 22, TimeoutError: 23 }[this.name] || 0; }
   }
 
+  /*__WINDOW_BRIDGE__*/
+
   // ---------------------------------------------------------------- Events
   class Event {
     constructor(type, init = {}) {
@@ -894,7 +896,7 @@
   reflect(C.HTMLIFrameElement, [['src', 'src', 'url'], 'srcdoc', 'name', 'allow', ['allowFullscreen', 'allowfullscreen', 'bool'], 'width', 'height', 'loading', ['referrerPolicy', 'referrerpolicy', 'string']]);
   // contentWindow is the frame's realm window (shared heap, so identity holds for event.source);
   // contentDocument stays null (cross-origin frames expose no document here).
-  getters(C.HTMLIFrameElement.prototype, { contentWindow() { return H.frameWindow(this[ID]) || H.ensureFrameWindow(this[ID]) || null; }, contentDocument() { return null; }, sandbox() { return new DOMTokenList(this, 'sandbox'); } });
+  getters(C.HTMLIFrameElement.prototype, { contentWindow() { return windowProxy(H.frameWindow(this[ID]) ?? H.ensureFrameWindow(this[ID])); }, contentDocument() { return null; }, sandbox() { return new DOMTokenList(this, 'sandbox'); } });
   reflect(C.HTMLCanvasElement, [['width', 'width', 'int', 300], ['height', 'height', 'int', 150]]);
   Object.assign(C.HTMLCanvasElement.prototype, { getContext() { return null; }, toDataURL() { return 'data:,'; }, toBlob(cb) { setTimeout(() => cb(null), 0); }, captureStream() { return null; }, transferControlToOffscreen() { throw new DOMException('Not supported', 'NotSupportedError'); } });
   reflect(C.HTMLMediaElement, [['src', 'src', 'url'], ['autoplay', 'autoplay', 'bool'], ['loop', 'loop', 'bool'], ['controls', 'controls', 'bool'], ['muted', 'muted', 'bool'], 'preload', ['crossOrigin', 'crossorigin', 'string'], ['playsInline', 'playsinline', 'bool'], 'poster']);
@@ -1951,7 +1953,7 @@
     prompt: (m, d) => { H.dialog('prompt', m === undefined ? '' : String(m)); return d === undefined ? null : String(d); },
     print() {}, stop() {}, focus() {}, blur() {}, close() {}, moveTo() {}, moveBy() {}, resizeTo() {}, resizeBy() {}, captureEvents() {}, releaseEvents() {},
     open(url, target) { if (url) H.navigate(new URL(String(url), document.baseURI).href, false); return G; },
-    postMessage(data, targetOrigin) { H.postMessage(this == null ? G : this, data, String(targetOrigin == null ? '' : targetOrigin)); },
+    postMessage(data, targetOrigin) { postToWindow(sourceFrame, data, targetOrigin); },
     getSelection: () => selection,
     scroll(x, y) { if (typeof x === 'object' && x) H.scrollTo(x.left === undefined ? NaN : x.left, x.top === undefined ? NaN : x.top); else H.scrollTo(x, y); },
     scrollTo(x, y) { G.scroll(x, y); },
@@ -1980,7 +1982,7 @@
   // Cross-frame messaging: the top window is frame 0; the host delivers posted messages here.
   // Source is carried in the event, so delivering on a later turn keeps event.source correct.
   Object.defineProperty(G, '__frameId', { value: 0, enumerable: false, configurable: true });
-  Object.defineProperty(G, '__deliverMessage', { value: (data, origin, source) => { setTimeout(() => dispatchTo(G, new MessageEvent('message', { data, origin, source })), 0); }, enumerable: false, configurable: true });
+  Object.defineProperty(G, '__deliverMessage', { value: (wire, origin, source) => { dispatchTo(G, new MessageEvent('message', { data: decodeWindowMessage(wire), origin, source: windowProxy(source) })); }, enumerable: false, configurable: true });
   let currentEvent;
 
   // ---------------------------------------------------------------- Engine entry points
