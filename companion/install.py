@@ -19,6 +19,7 @@ Description=Evolve Local (full machine, local approval, root via Polkit)
 Type=simple
 ExecStart=/usr/bin/python3 "{root / 'local.py'}" --root / --full-machine --no-open
 Restart=no
+ExecStopPost=/usr/bin/rm -f %t/evolve-local-%U.url
 KillMode=control-group
 TimeoutStopSec=5
 ''')

@@ -309,8 +309,11 @@ def main():
         import webbrowser
         webbrowser.open(url)
     print(f'Evolve Local on 127.0.0.1:{PORT}; project: {root}; pairing link: {runtime}', flush=True)
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     try:
         server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
         connector.stop()
         runtime.unlink(missing_ok=True)
