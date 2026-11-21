@@ -82,7 +82,6 @@ class Connector:
             if self.root_process:
                 if p.stdin and not p.stdin.closed:
                     p.stdin.close()
-                return
             try:
                 os.killpg(p.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
