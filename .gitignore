@@ -13,3 +13,5 @@ node_modules
 /web/browser-pkg/
 /web/browser-fonts/
 /web/browser-tor/
+
+/web/local-pi-agent.bundle.mjs

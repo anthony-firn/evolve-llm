@@ -64,7 +64,7 @@ export function mountLocalComputer({ready, turn, lease, modelName}) {
       if (useModel) {
         if (!ready()) throw new Error('Load a coding model and wait for Ready first.');
         release = lease();
-        const {createPiTask} = await import('./pi-agent.bundle.mjs');
+        const {createPiTask} = await import('./local-pi-agent.bundle.mjs');
         agent = createPiTask({turn, workspace: {request}, native: true, network: {options: () => ({enabled: false})}, modelName: modelName(),
           onEvent: e => { if (e.type === 'tool') record(e.name + ' ' + JSON.stringify(e.args)); else if (e.type === 'tool-result') record(JSON.stringify(e.result)); else if (e.type === 'answer') record(e.text || e.error || ''); }});
         const abort = () => agent?.abort(); signal.addEventListener('abort', abort, {once: true});
