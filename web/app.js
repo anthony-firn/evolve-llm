@@ -801,8 +801,29 @@ function regenerate() {
 
 function runResponse(){
   const question=state.messages.at(-1)?.content||'';
-  if(wantsDevelopment(question,$('chat-mode').value,state.developmentActive))runDevelopment(question);
+  if(localComputer.connected && $('chat-mode').value !== 'chat')runLocalResponse(question);
+  else if(wantsDevelopment(question,$('chat-mode').value,state.developmentActive))runDevelopment(question);
   else runGeneration();
+}
+
+async function runLocalResponse(question) {
+  const context=state.messages.slice(0,-1).filter(m=>!m.error).slice(-6).map(m=>`${m.role}: ${m.content}`).join('\n').slice(-6000);
+  const m={role:'assistant',content:'Pi is working on this computer…',development:true,localComputer:true,started:performance.now()};
+  const activity=el('pre'),details=el('details',{},el('summary',{text:'Local computer activity'}),activity);
+  m.developmentView={root:details,dispose:()=>details.remove()};
+  state.live=m;state.messages.push(m);setPhase('preparing');renderMessages();
+  $('scroll').scrollTop=$('scroll').scrollHeight;
+  try {
+    const result=await localComputer.runTask(question,{context,onEvent:e=>{
+      if(e.type==='tool')activity.textContent=(activity.textContent+'\n'+e.name+' '+JSON.stringify(e.args)).slice(-65536);
+      else if(e.type==='tool-result')activity.textContent=(activity.textContent+'\n'+JSON.stringify(e.result)).slice(-65536);
+      else if(e.type==='answer'){m.content=stripToolCalls(e.text||'').trim()||'Pi is working on this computer…';scheduleLiveRender();}
+    }});
+    const last=result.messages.filter(m=>m.role==='assistant').at(-1);
+    m.content=stripToolCalls((last?.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('\n')).trim()||'Task ended. Review the local computer activity for results.';
+    m.stats=`Local computer · ${result.calls} tool calls · ${result.errors} tool errors`;
+  } catch(error) {m.content='The local computer task stopped: '+String(error.message||error);}
+  finally {state.live=null;setPhase(state.loaded?'ready':'idle');renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;$('status-line').textContent=localComputer.connected?'Computer connected · Auto and Build can use local tools; Chat has no computer tools.':'Local computer disconnected.';}
 }
 
 async function runDevelopment(question){
@@ -993,7 +1014,7 @@ $('composer').addEventListener('submit', (e) => {
   autosize();
   send(text);
 });
-function stopCurrent(){if(state.live?.development){state.live.cancelRequested=true;workbench?.cancel();}else worker.postMessage({type:'stop'});}
+function stopCurrent(){if(state.live?.development){state.live.cancelRequested=true;if(state.live.localComputer)localComputer.cancel();else workbench?.cancel();}else worker.postMessage({type:'stop'});}
 $('stop').addEventListener('click',stopCurrent);
 $('web-toggle').addEventListener('click', () => {
   state.settings.internet = !state.settings.internet;
@@ -1218,7 +1239,8 @@ worker.postMessage({ type: 'hello', gpu: state.settings.gpu });
 // Local tools are opt-in and use the existing loaded model.
 import { mountLocalComputer } from './local-computer.mjs';
 const localComputer = mountLocalComputer({
-  ready:()=>state.phase==='ready'&&Boolean(state.loaded), turn:agentTurn,
+  ready:()=>['ready','preparing'].includes(state.phase)&&Boolean(state.loaded), turn:agentTurn,
+  onConnectionChange:connected=>{$('status-line').textContent=connected?'Computer connected · main chat can use local tools in Auto and Build.':'Local computer disconnected.';},
   modelName:()=>state.loaded?.label||'Local model',
-  lease:()=>{if(state.phase!=='ready'||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?'ready':'idle');}};}
+  lease:()=>{if(!['ready','preparing'].includes(state.phase)||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?(state.live?.development?'preparing':'ready'):'idle');}};}
 });

@@ -8,6 +8,11 @@ Install once from this checkout with `python3 companion/install.py`. Open **Evol
 Local** from the application launcher. It starts the user service and opens the
 live site with a private pairing link. Allow the browser's local-device connection
 prompt. Load a tool-capable coding model, then use **Local computer → Ask Pi**.
+**Main chat** uses the connected computer in Auto and Build modes, with tool
+activity shown in each reply and Stop cancelling the active operation. Follow-up
+messages include recent conversation context. Chat mode has no computer tools.
+Disconnect to return Auto/Build to the browser workspace.
+
 **Run command** works without a model. Select **Run direct command as root** only
 for operations that require administrator rights.
 
@@ -48,6 +53,7 @@ put secrets, hardlinks to sensitive files, or untrusted mount points in that fol
 
 Validate with `python3 -m unittest discover -s companion -p test_local.py`,
 `python3 companion/browser_test.py` (connector must be stopped), and
+`python3 companion/main_chat_test.py` (connector stopped), and
 `node --test tests/pi-agent.test.mjs`. The browser fixture uses real transport and
 Pi with a scripted model, a temporary folder, and test-only approvals; it never
 authenticates as root. Actual desktop/Polkit approval is tested manually.
