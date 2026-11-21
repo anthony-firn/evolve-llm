@@ -203,3 +203,23 @@ test('a phone drives the computer\'s worker: messages relay both ways, files and
   await settle();
   assert.deepEqual(states.at(-1), ['connected', 'Tiny']);
 });
+
+
+test('phone startup waits for the host listener and repeats hello after reconnecting', async () => {
+  const { RemoteWorker } = await import('../web/devices.mjs');
+  const phone = new RemoteWorker();
+  const sent = [];
+  const first = { open: true, send: async msg => sent.push(msg.m) };
+  phone.postMessage({type:'hello',gpu:'high-performance'});
+  phone.attach(first);
+  phone.postMessage({type:'cache'});
+  assert.deepEqual(sent, [], 'channel opening is not proof the host can receive messages');
+  first.onMessage({t:'host',loaded:null});
+  assert.deepEqual(sent.map(m=>m.type), ['hello','cache']);
+  phone.detach(first);
+  const next = { open: true, send: async msg => sent.push(msg.m) };
+  phone.attach(next);
+  assert.equal(sent.length,2);
+  next.onMessage({t:'host',loaded:null});
+  assert.deepEqual(sent.map(m=>m.type),['hello','cache','hello'], 'reconnection refreshes GPU and cached models');
+});

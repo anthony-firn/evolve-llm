@@ -195,7 +195,10 @@ JSON; the computer's worker messages come back. Everything else runs on the phon
 and its workspace, so files Pi writes are on the phone. The computer refuses messages that only
 its own page may send (swarm and helper requests), keeps its swarm bookkeeping to itself, and
 refuses files from the phone. It remembers the model the phone last loaded and says so when the
-phone reconnects, so reopening the bookmark continues where it was. Both ends hold a screen wake
+phone reconnects, so reopening the bookmark continues where it was. The phone waits for the
+host's ready announcement before sending queued worker messages, and repeats its initial GPU/cache
+request on each connection. This avoids losing startup messages when the data channel opens before
+the host has installed its handler. Both ends hold a screen wake
 lock while working, because a phone that locks its screen suspends the page and drops the
 connection.
 
