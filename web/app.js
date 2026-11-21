@@ -1214,3 +1214,11 @@ worker.postMessage({ type: 'hello', gpu: state.settings.gpu });
   $('pair-stop').addEventListener('click', stopPairing);
   $('pair-copy').addEventListener('click', () => navigator.clipboard?.writeText($('pair-link').value).catch(() => {}));
 }
+
+// Local tools are opt-in and use the existing loaded model.
+import { mountLocalComputer } from './local-computer.mjs';
+const localComputer = mountLocalComputer({
+  ready:()=>state.phase==='ready'&&Boolean(state.loaded), turn:agentTurn,
+  modelName:()=>state.loaded?.label||'Local model',
+  lease:()=>{if(state.phase!=='ready'||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?'ready':'idle');}};}
+});
