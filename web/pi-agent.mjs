@@ -310,11 +310,15 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
   let turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, pendingChangeError=false, previewPath=null;const failedCommands=new Map(), seen=new Set(), noted=new Set();
   // A final reply while a step the request asked for has not happened (small models stop with
   // "Next steps: commit, push…" or say it is done): git status and gh pr view name the next one.
-  const unfinished=async signal=>{
+  const unfinished=async(signal,reply='')=>{
     if(declined||nudges>=2)return null;
     // A question that asks for sources, answered from memory: search first (once).
     if(network.options().enabled&&webCalls===0&&nudges===0&&wantsSources(currentPrompt))
       return {why:'This question asks for sources, and you have not searched yet.',cmd:'web_search with a short query, then open_url on the best result, and cite its link'};
+    // Sources asked for and pages read, but no link in the answer (small models cite a title):
+    // give the addresses of the pages actually opened, so no link is made up.
+    if(wantsSources(currentPrompt)&&opened.length&&!/https?:\/\//.test(reply))
+      return {why:'The request asks for sources, and your answer has no link.',say:`Give your answer again with the link of the page it came from. Pages you opened: ${opened.slice(-3).join(' ')}`};
     if(!linux||!asked?.commit)return null;
     const st=await workspace.request('exec',{command:'git status'},{signal}).catch(()=>null);
     if(!st||st.code)return null;
@@ -322,7 +326,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(asked.push&&/is ahead of/.test(st.stdout||''))return {why:'Your commits are not pushed yet.',cmd:'git push'};
     if(asked.pr&&pushed){const v=await workspace.request('exec',{command:'gh pr view'},{signal}).catch(()=>null);if(v&&v.code)return {why:'The pull request is not open yet.',cmd:'gh pr create --title "Title" --body "What and why"'};}
     return null;
-  };let ghRepo=null, stuck=null, asked=null, declined=false, nudges=0, pushed=false, webCalls=0, currentPrompt='';
+  };let ghRepo=null, stuck=null, asked=null, declined=false, nudges=0, pushed=false, webCalls=0, currentPrompt='', opened=[];
   const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction}):null;
   const limits=linux?LINUX_LIMITS:browserTools?BROWSER_LIMITS:LIMITS;
   const declarations=(linux?[
@@ -395,7 +399,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       if(['write','edit'].includes(name)){changes++;if(/\.html?$/i.test(args.path))previewPath=args.path;}
     }
     else if(['preview','browser_test'].includes(name)){if(!preview)throw new Error('Preview is unavailable.');if(name==='preview'&&pendingChangeError)throw new Error('A file change failed. Read the file and correct the failed write or edit before final preview.');result=await preview(args.path,{signal,smoke:name==='browser_test'});if(name==='preview'&&result.ok===true)completedPreview=true;}
-    else{result=await network.run(name,args,signal);webCalls++;}
+    else{result=await network.run(name,args,signal);webCalls++;if(name==='open_url')for(const src of result.sources||[])if(src.url&&!opened.includes(src.url))opened.push(src.url);}
     const full=name==='read'?`File: ${args.path}\n${result.text}`:name==='bash'&&linux?shellText(result):JSON.stringify(result);
     const body=full.length<=limits.result?full:full.slice(0,limits.result)+(name==='read'?`\n… (${full.length-limits.result} more characters not shown. To find a line, run: grep -n "SOME WORDS" ${args.path}; edit needs only the exact text to replace.)`:'\n… (output cut)');
     return {content:[{type:'text',text:body}],details:{sandbox:true},isError:result.ok===false||Boolean(result.code)||(['web_search','open_url'].includes(name)&&!result.sources?.length)};
@@ -448,11 +452,11 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
             const empty=!parsed.length&&!stripToolCalls(result.text).replace(/<think>[\s\S]*?(<\/think>|$)/g,'').trim()&&context.messages.at(-1)?.role==='toolResult';
             const failure=attempted&&!parsed.length?'invalid or incomplete tool call':empty?'empty reply':null;
             if(!failure){
-              const next=!parsed.length&&!attempted?await unfinished(options?.signal):null;
+              const next=!parsed.length&&!attempted?await unfinished(options?.signal,stripToolCalls(result.text)):null;
               if(!next)break;
               nudges++;
-              onEvent({type:'retry',attempt:nudges,message:`Not finished; asking the model to continue (${next.cmd.split(' -')[0]}).`,output:''});
-              messages=[...original,{role:'user',content:`Not finished yet: ${next.why} Make that tool call now: ${next.cmd}. Say a step is done only after its command succeeded.`}];
+              onEvent({type:'retry',attempt:nudges,message:`Not finished; asking the model to continue (${next.say?'add the source link':next.cmd.split(' -')[0]}).`,output:''});
+              messages=[...original,{role:'user',content:next.say?`Not finished yet: ${next.why} ${next.say}`:`Not finished yet: ${next.why} Make that tool call now: ${next.cmd}. Say a step is done only after its command succeeded.`}];
               continue;
             }
             if(repairs>=limits.repairs)throw new Error(failure==='empty reply'?'The model kept replying with nothing after its tool results.':'The model kept returning invalid or incomplete tool calls. No tools from the invalid replies were executed.');
@@ -478,5 +482,5 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
-  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;pushed=false;webCalls=0;currentPrompt=String(prompt);const pre=linux?await preamble(prompt,workspace,linux.cwd,linux.building?.()||null):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
+  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;pushed=false;webCalls=0;opened=[];currentPrompt=String(prompt);const pre=linux?await preamble(prompt,workspace,linux.cwd,linux.building?.()||null):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
 }

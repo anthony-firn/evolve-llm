@@ -445,3 +445,17 @@ test('grep finding nothing is said plainly, with the file that has the text',asy
  assert.match(results[0],/grep found no "def add" in test_calc\.py\. It is in calc\.py\./);
  assert.doesNotMatch(results[0],/stopped at the first error/);
 });
+
+test('an answer without a link, when sources were asked for, is sent back with the pages opened',async()=>{
+ const prompts=[];let n=0;
+ const network={options:()=>({enabled:true}),run:async(name)=>name==='open_url'?{text:'Lit in 1887.',sources:[{title:'Lighthouse',url:'https://en.wikipedia.org/wiki/Lighthouse'}]}:{text:'',sources:[]}};
+ const task=createPiTask({workspace:{request:async()=>({})},network,turn:async(messages)=>{
+  n++;prompts.push(JSON.stringify(messages.at(-1)));
+  if(n===1)return{text:'<tool_call>'+JSON.stringify({name:'open_url',arguments:{url:'https://en.wikipedia.org/wiki/Lighthouse'}})+'</tool_call>',reason:'end'};
+  if(n===2)return{text:'It was first lit in 1887. Source: Lighthouse (Wikipedia)',reason:'end'};
+  return{text:'It was first lit in 1887. Source: https://en.wikipedia.org/wiki/Lighthouse',reason:'end'};
+ }});
+ await task.run('When was the lighthouse first lit? Cite a link.');
+ assert.equal(n,3);
+ assert.match(prompts[2],/your answer has no link\. Give your answer again with the link of the page it came from\. Pages you opened: https:\/\/en\.wikipedia\.org\/wiki\/Lighthouse/);
+});
