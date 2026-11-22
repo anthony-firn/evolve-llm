@@ -47,8 +47,20 @@ impl Speculation {
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 
+/// An image in a prompt: the vision encoder's embeddings (`rows x cols` tokens of the language
+/// model's width, raster order) and its deepstack features (one set per early layer, if any).
+pub struct ImageInput {
+    pub embeddings: Vec<f32>,
+    pub rows: usize,
+    pub cols: usize,
+    pub deepstack: Vec<Vec<f32>>,
+}
+
 pub struct Session {
     pub engine: Engine,
+    /// The cache slot of the first image token in the cache, if any: rotary positions of later
+    /// tokens are offset from their slots (Qwen-VL), until the cache drops it.
+    image_from: Option<usize>,
     pub tok: Tokenizer,
     pub template: ChatTemplate,
     pub sampler: Sampler,
@@ -84,6 +96,7 @@ impl Session {
             snapshot: None,
             pending: None,
             spec: Speculation::default(),
+            image_from: None,
         };
         s.spec.on = s.engine.streaming();
         #[cfg(not(target_arch = "wasm32"))]
@@ -124,6 +137,7 @@ impl Session {
     }
 
     pub fn reset(&mut self) {
+        self.forget_images(0);
         self.cached.clear();
         self.logits.clear();
         self.snapshot = None;
@@ -167,6 +181,7 @@ impl Session {
             };
         }
         self.cached.truncate(common);
+        self.forget_images(common);
         let rest = &tokens[common..];
         self.logits = self.engine.forward(rest, common).await?;
         self.cached.extend_from_slice(rest);
@@ -178,6 +193,79 @@ impl Session {
             reused: common,
             computed: rest.len(),
         })
+    }
+
+    /// Positions return to the cache slots once the cache no longer holds an image.
+    fn forget_images(&mut self, kept: usize) {
+        if self.image_from.is_some_and(|i| i >= kept) {
+            self.image_from = None;
+            self.engine.set_rope_delta(0);
+        }
+    }
+
+    /// Bring the cache to `tokens`, where each run of `pad` tokens takes the next image's
+    /// embeddings (rows x cols tokens). Text keeps one position per token; an image's tokens are
+    /// at (start, start + row, start + col) in (time, height, width), and the text after it
+    /// resumes at start + max(rows, cols) (Qwen2-VL and Qwen3-VL multimodal rotary positions).
+    pub async fn prefill_images(&mut self, tokens: &[u32], pad: u32, images: &[ImageInput]) -> Result<Prefill, String> {
+        let first = tokens.iter().position(|&t| t == pad).ok_or("the prompt has no image tokens")?;
+        let wanted: usize = images.iter().map(|i| i.rows * i.cols).sum();
+        if tokens.iter().filter(|&&t| t == pad).count() != wanted {
+            return Err(format!("the prompt has {} image tokens; the images need {wanted}", tokens.iter().filter(|&&t| t == pad).count()));
+        }
+        if tokens.len() >= self.engine.context_length() {
+            return Err(format!("the prompt has {} tokens; the context holds {}", tokens.len(), self.engine.context_length()));
+        }
+        if self.engine.is_recurrent() {
+            return Err("images with recurrent models are not supported yet".into());
+        }
+        self.pending = None;
+        // Reuse the text before the first image only: another image has the same placeholder ids.
+        let common = self.cached.iter().zip(tokens).take_while(|(a, b)| a == b).count().min(first);
+        self.cached.truncate(common);
+        self.forget_images(common);
+        let rest = &tokens[common..];
+        let d = self.engine.cfg.n_embd;
+        let layers = images.iter().map(|i| i.deepstack.len()).max().unwrap_or(0);
+        let mut hidden = Vec::with_capacity(rest.len() * d);
+        let mut positions = Vec::with_capacity(rest.len());
+        let mut deep = vec![vec![0f32; rest.len() * d]; layers];
+        let (mut pos, mut i, mut img) = (common as u32, 0usize, 0usize);
+        while i < rest.len() {
+            if rest[i] != pad {
+                let j = rest[i..].iter().position(|&t| t == pad).map_or(rest.len(), |k| i + k);
+                hidden.extend(self.engine.embed_tokens(&rest[i..j])?);
+                for _ in i..j {
+                    positions.push([pos, pos, pos]);
+                    pos += 1;
+                }
+                i = j;
+                continue;
+            }
+            let im = images.get(img).ok_or("more image placeholders than images")?;
+            let n = im.rows * im.cols;
+            if im.embeddings.len() != n * d {
+                return Err(format!("image {img} has embeddings of the wrong width (the model takes {d})"));
+            }
+            hidden.extend_from_slice(&im.embeddings);
+            for r in 0..im.rows {
+                for c in 0..im.cols {
+                    positions.push([pos, pos + r as u32, pos + c as u32]);
+                }
+            }
+            for (l, f) in im.deepstack.iter().enumerate() {
+                deep[l][i * d..(i + n) * d].copy_from_slice(f);
+            }
+            pos += im.rows.max(im.cols) as u32;
+            i += n;
+            img += 1;
+        }
+        self.logits = self.engine.forward_hidden_positioned(&hidden, rest.len(), common, &positions, &deep).await?;
+        self.cached.extend_from_slice(rest);
+        self.image_from = Some(common + rest[..].iter().position(|&t| t == pad).unwrap_or(0));
+        // Tokens from here on: rotary position = cache slot + this offset.
+        self.engine.set_rope_delta(pos as i32 - self.cached.len() as i32);
+        Ok(Prefill { reused: common, computed: rest.len() })
     }
 
     /// Sample the next token and, unless it ends the turn, advance the model past it.

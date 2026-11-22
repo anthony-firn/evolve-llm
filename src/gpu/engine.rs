@@ -2108,13 +2108,14 @@ impl Engine {
         }
     }
 
-    fn encode_chunk(&self, n_tokens: usize, with_head: bool) -> wgpu::CommandBuffer {
+    /// A chunk's ops from `from` (after the embedding when the hidden states are given).
+    fn encode_chunk(&self, from: usize, n_tokens: usize, with_head: bool) -> wgpu::CommandBuffer {
         let st = self.state.as_ref().unwrap();
         if !with_head {
-            return self.encode_range(0..st.head_start, n_tokens, false);
+            return self.encode_range(from..st.head_start, n_tokens, false);
         }
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
-        self.record(&mut enc, 0..st.head_start, n_tokens);
+        self.record(&mut enc, from..st.head_start, n_tokens);
         self.record_head(&mut enc, n_tokens);
         enc.finish()
     }
@@ -2364,8 +2365,9 @@ impl Engine {
     /// For a stage that runs layers after another device's: read the hidden state that device
     /// handed on (`n` tokens from `pos0`) and return the one after this stage's last layer.
     pub async fn forward_hidden(&self, hidden: &[f32], n: usize, pos0: usize) -> Result<Vec<f32>, String> {
-        if self.stage.embed {
-            return Err("this device reads tokens, not hidden states".into());
+        // A whole model takes them too (a prompt with images), unless it streams its weights.
+        if self.stage.embed && self.placement.streaming {
+            return Err("a model read from storage as it runs takes tokens, not hidden states".into());
         }
         if n == 0 || hidden.len() != n * self.hidden_width(self.stage.first) {
             return Err(format!("expected the hidden state of {n} tokens before layer {}", self.stage.first));
@@ -2551,7 +2553,9 @@ impl Engine {
                 Feed::Tokens(t) => self.gpu.queue.write_buffer(&st.tokens, 0, &words(t)),
                 Feed::Hidden(h, _) => self.write_hidden(h, n, k_in, &st.x, 0, 0),
             }
-            let cmd = self.encode_chunk(n, last && !hand_on);
+            // Given hidden states (an image's embeddings among the text's) replace the embedding.
+            let from = if self.stage.embed && matches!(input, Feed::Hidden(..)) { st.embed_end } else { 0 };
+            let cmd = self.encode_chunk(from, n, last && !hand_on);
             self.gpu.queue.submit([cmd]);
             if hand_on {
                 let h = self.read_hidden(n, k_out, &st.x, 0, 0).await?;
@@ -2747,6 +2751,11 @@ impl Engine {
     }
 
     /// Embedding rows of `tokens`, dequantized on the CPU.
+    /// Token embeddings, read on the CPU (to put text next to image embeddings in a prompt).
+    pub fn embed_tokens(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        self.embed_cpu(tokens)
+    }
+
     fn embed_cpu(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
         let tp = self.tensor("token_embd.weight").clone();
         let k = self.cfg.n_embd;
