@@ -155,39 +155,9 @@ impl Vision {
         self.weights.get(name).map(|v| v.as_slice()).ok_or_else(|| format!("missing tensor {name}"))
     }
 
-    /// RGB bytes (row-major, 3 per pixel) to normalized patches. Width and height must be
-    /// multiples of `cfg.unit()` (28 for Qwen2.5-VL); resize before.
+    /// RGB bytes (row-major, 3 per pixel) to normalized patches (see `patches_for`).
     pub fn patches(&self, rgb: &[u8], width: usize, height: usize) -> Result<Patches, String> {
-        let (p, u) = (self.cfg.patch, self.cfg.unit());
-        if !width.is_multiple_of(u) || !height.is_multiple_of(u) || width == 0 || height == 0 {
-            return Err(format!("image is {width}x{height}; both sides must be multiples of {u}"));
-        }
-        if rgb.len() != width * height * 3 {
-            return Err("RGB data does not match the image size".into());
-        }
-        let (gh, gw) = (height / p, width / p);
-        let row = 3 * TEMPORAL * p * p;
-        let mut data = Vec::with_capacity(gh * gw * row);
-        for bh in 0..gh / MERGE {
-            for bw in 0..gw / MERGE {
-                for mh in 0..MERGE {
-                    for mw in 0..MERGE {
-                        let (y0, x0) = ((bh * MERGE + mh) * p, (bw * MERGE + mw) * p);
-                        for c in 0..3 {
-                            for _frame in 0..TEMPORAL {
-                                for y in 0..p {
-                                    for x in 0..p {
-                                        let v = rgb[((y0 + y) * width + x0 + x) * 3 + c] as f32 / 255.0;
-                                        data.push((v - self.cfg.mean[c]) / self.cfg.std[c]);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(Patches { data, grid_h: gh, grid_w: gw })
+        patches_for(&self.cfg, rgb, width, height)
     }
 
     /// The image's embeddings for the language model (see `Encoded`).
@@ -302,6 +272,41 @@ impl Vision {
         };
         Ok(Encoded { embeddings: raster(&merged), deepstack: deep.iter().map(|m| raster(m)).collect() })
     }
+}
+
+/// RGB bytes (row-major, 3 per pixel) to normalized patches for an encoder. Width and height must
+/// be multiples of `cfg.unit()` (28 for Qwen2.5-VL, 32 for Qwen3-VL); resize before.
+pub fn patches_for(cfg: &VisionConfig, rgb: &[u8], width: usize, height: usize) -> Result<Patches, String> {
+    let (p, u) = (cfg.patch, cfg.unit());
+    if !width.is_multiple_of(u) || !height.is_multiple_of(u) || width == 0 || height == 0 {
+        return Err(format!("image is {width}x{height}; both sides must be multiples of {u}"));
+    }
+    if rgb.len() != width * height * 3 {
+        return Err("RGB data does not match the image size".into());
+    }
+    let (gh, gw) = (height / p, width / p);
+    let row = 3 * TEMPORAL * p * p;
+    let mut data = Vec::with_capacity(gh * gw * row);
+    for bh in 0..gh / MERGE {
+        for bw in 0..gw / MERGE {
+            for mh in 0..MERGE {
+                for mw in 0..MERGE {
+                    let (y0, x0) = ((bh * MERGE + mh) * p, (bw * MERGE + mw) * p);
+                    for c in 0..3 {
+                        for _frame in 0..TEMPORAL {
+                            for y in 0..p {
+                                for x in 0..p {
+                                    let v = rgb[((y0 + y) * width + x0 + x) * 3 + c] as f32 / 255.0;
+                                    data.push((v - cfg.mean[c]) / cfg.std[c]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(Patches { data, grid_h: gh, grid_w: gw })
 }
 
 /// The learned position table (a square grid of positions) resized to the image's patch grid by
