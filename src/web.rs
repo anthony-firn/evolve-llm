@@ -271,6 +271,9 @@ pub fn layer_bytes(headers: js_sys::Array) -> Result<String, JsValue> {
         "layers": layers,
         "hidden": hidden,
         "tied": cfg.tied_embeddings,
+        // The attention cache a layer keeps per token (keys and values in f16): with the context
+        // length, what a layer needs besides its weights, for planning where layers fit.
+        "kv_per_token": 2 * cfg.kv_dim() * 2,
     })))
 }
 

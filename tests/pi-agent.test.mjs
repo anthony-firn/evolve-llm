@@ -56,7 +56,7 @@ test('edits require a prior read and an exact nonempty string; a failed edit sho
  let n=0;const operations=[];
  const task=createPiTask({workspace:{request:async(name,args)=>{operations.push(name);return name==='read'?{text:'background:red;'}:{ok:true}}},network:{options:()=>({enabled:false})},turn:async(messages)=>{
  n++;const call=n===1?{name:'edit',arguments:{path:'/workspace/game.html',oldText:'',newText:'blue'}}:n===2?{name:'read',arguments:{path:'/workspace/game.html'}}:n===3?{name:'edit',arguments:{path:'/workspace/game.html',oldText:'background:red;',newText:'background:blue;'}}:null;
- if(n===2)assert(messages.some(m=>m.role==='tool'&&m.content.includes('had not been read yet')&&m.content.includes('background:red;')));
+ if(n===2)assert(messages.some(m=>m.role==='tool'&&m.content.includes('oldText is empty')&&m.content.includes('background:red;')));
  return {text:call?'<tool_call>'+JSON.stringify(call)+'</tool_call>':'Changed.',reason:'end'};
  }});const result=await task.run('Make the file blue');assert.deepEqual(operations,['read','read','edit']);assert.equal(result.changes,1);assert.equal(result.errors,1);assert.equal(result.lastToolFailed,false);
 });
@@ -112,8 +112,9 @@ test('a failed preview allows the model to continue repairing the app',async()=>
 });
 
 test('a failed edit must be corrected before final preview can finish the task',async()=>{
- let n=0,opened=0;
- const task=createPiTask({workspace:{request:async(name)=>name==='read'?{text:'red'}:{ok:true}},network:{options:()=>({enabled:false})},preview:async()=>{opened++;return{ok:true}},turn:async()=>{
+ let n=0,opened=0,edits=0;
+ // The first edit misses (as when oldText is not in the file); the preview after it must refuse.
+ const task=createPiTask({workspace:{request:async(name)=>{if(name==='read')return{text:'red'};if(name==='edit'&&++edits===1)throw new Error('oldText is not in /workspace/game.html');return{ok:true}}},network:{options:()=>({enabled:false})},preview:async()=>{opened++;return{ok:true}},turn:async()=>{
   n++;
   const calls=n===1?[{name:'edit',arguments:{path:'/workspace/game.html',oldText:'red',newText:'blue'}},{name:'preview',arguments:{path:'/workspace/game.html'}}]:[
    {name:'read',arguments:{path:'/workspace/game.html'}},{name:'edit',arguments:{path:'/workspace/game.html',oldText:'red',newText:'blue'}},{name:'preview',arguments:{path:'/workspace/game.html'}}
@@ -261,4 +262,32 @@ test('Pi runs tools a model calls in its own syntax (Kimi K3.1) and returns stru
  assert.equal(call.content,'Writing it.');
  const res=history.find(m=>m.role==='tool');
  assert.equal(res.name,'write');assert.equal(res.tool_call_id,call.tool_calls[0].id);assert.match(call.tool_calls[0].id,/^functions\.write:\d+$/);
+});
+
+test('an edit needs no read when oldText matches once; a miss in a long file shows the closest lines',async()=>{
+ const long=Array.from({length:300},(_,i)=>i===150?'python3 -m http.server 8080 --directory dist':`line ${i} of a long README with enough words to pass three thousand characters`).join('\n');
+ let n=0,edited=null;const results=[];
+ const task=createPiTask({workspace:{request:async(name,args)=>{if(name==='read')return{text:long};if(name==='edit'){if(!long.includes(args.oldText))throw new Error(`oldText is not in ${args.path}; read the file again and copy the exact text`);edited=args;return{ok:true}}return{}}},network:{options:()=>({enabled:false})},
+  onEvent:e=>{if(e.type==='tool-result')results.push(e.result.content[0].text)},turn:async()=>{
+  n++;const call=n===1?{name:'edit',arguments:{path:'README.md',oldText:'python3 -m http.server 8000',newText:'x'}}:n===2?{name:'edit',arguments:{path:'README.md',oldText:'python3 -m http.server 8080 --directory dist',newText:'y'}}:null;
+  return{text:call?'<tool_call>'+JSON.stringify(call)+'</tool_call>':'Added the line.',reason:'end'};
+ }});
+ const result=await task.run('Add a line to README.md');
+ assert.match(results[0],/oldText is not in README\.md, so nothing was changed\. The closest lines of README\.md \(lines 147-155\)/);
+ assert.match(results[0],/151: python3 -m http\.server 8080 --directory dist/);
+ assert.equal(edited.newText,'y');assert.equal(result.changes,1);
+});
+
+test('an empty reply after tool results is asked to continue, and a long read says it was cut',async()=>{
+ let n=0;const seen=[];
+ const task=createPiTask({linux:{cwd:'/home/user'},workspace:{request:async(name)=>name==='read'?{text:'x'.repeat(20000)}:{}},network:{options:()=>({enabled:false})},turn:async(messages)=>{
+  n++;seen.push(messages.at(-1));
+  if(n===1)return{text:'<tool_call>'+JSON.stringify({name:'read',arguments:{path:'README.md'}})+'</tool_call>',reason:'end'};
+  if(n===2)return{text:'',reason:'end'};
+  return{text:'Read it; nothing else to do.',reason:'end'};
+ }});
+ const result=await task.run('Read README.md');
+ assert.match(seen[1].content,/more characters not shown\. To find a line, run: grep -n/);
+ assert.match(seen[2].content,/Your reply was empty\. Continue the task/);
+ assert.equal(result.repairs,1);assert.equal(n,3);
 });

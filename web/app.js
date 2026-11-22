@@ -19,7 +19,7 @@ let worker = newWorker();
 if (REMOTE_CODE) app.dataset.remote = '';
 const IS_MOBILE = navigator.userAgentData?.mobile ?? /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
 
-const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', cacheGb: 10, share: false, shareUpload: 2, internet: false, jinaKey: '', githubToken: '', autonomy: 1 };
+const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', cacheGb: 10, share: false, shareUpload: 2, internet: false, jinaKey: '', githubToken: '', autonomy: 1, poolGpus: true };
 const SUGGESTIONS = [
   'Make me a Snake game I can play.',
   'Write a haiku about running AI on my own laptop.',
@@ -267,7 +267,7 @@ async function startLoad(source) {
   setPhase('loading');
   if (source.kind === 'hf') remember('evolve-llm-last', source.id);
   // With paired devices, each reads only its share of a model from Hugging Face.
-  state.helpers?.unloadAll();
+  state.helpers?.unloadAll();localGpuPromise?.then((l)=>l.hub.unloadAll(),()=>{});
   const helpers = source.kind === 'hf' ? state.helpers?.ready() ?? [] : [];
   if (helpers.length && !source.stream) source = { ...source, stream: true, resolve: true, parts: null };
   if (source.kind === 'hf' && (source.resolve || !source.bytes) && !source.parts) {
@@ -283,8 +283,41 @@ async function startLoad(source) {
   stopSharing();
   const share = Boolean(!REMOTE_CODE && source.stream && state.settings.share && source.parts?.length);
   if (share) await startSharing(source);
-  state.split = helpers.length ? { source, helpers, pending: null, plan: null } : null;
-  worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx), gpu: state.settings.gpu, gpuMemory: state.settings.gpuMemory, cacheGb: Number(state.settings.cacheGb), share, split: helpers.length ? helpers.map((h) => h.capacity) : null });
+  // This machine's two GPUs: with the faster chosen, a model that does not fit in its free memory
+  // has its later layers on the other GPU (a second worker in this page), all on GPUs.
+  const localGpuHelper = !helpers.length && await poolingGpus() ? await localGpu() : null;
+  const pool = localGpuHelper ? [localGpuHelper.helper()] : [];
+  const hub = localGpuHelper ? localGpuHelper.hub : state.helpers;
+  state.split = helpers.length || pool.length ? { source, helpers: helpers.length ? helpers : pool, hub, pending: null, plan: null, local: Boolean(localGpuHelper) } : null;
+  worker.postMessage({ type: 'load', source, ctx: Number(state.settings.ctx), gpu: state.settings.gpu, gpuMemory: state.settings.gpuMemory, cacheGb: Number(state.settings.cacheGb), share, split: helpers.length ? helpers.map((h) => h.capacity) : pool.length ? [16 * 2 ** 30] : null, pool: Boolean(localGpuHelper) });
+}
+
+/** Whether to pool this machine's GPUs: chosen in Settings, the faster GPU selected, and two
+ *  different GPUs present (not on a phone using a computer). */
+let gpuPair = null;
+async function poolingGpus() {
+  if (REMOTE_CODE || state.settings.poolGpus === false || state.settings.gpu !== 'high-performance' || !navigator.gpu) return false;
+  gpuPair ??= Promise.all(['low-power', 'high-performance'].map((p) => navigator.gpu.requestAdapter({ powerPreference: p }).catch(() => null)))
+    .then(([a, b]) => Boolean(a && b && (a.info?.vendor !== b.info?.vendor || a.info?.architecture !== b.info?.architecture)));
+  return gpuPair;
+}
+
+/** The other GPU as a helper in this page: its own worker, reached through an in-page link. */
+let localGpuPromise = null;
+function localGpu() {
+  localGpuPromise ??= (async () => {
+    const { Helpers, Helping, localLinkPair } = await import('./devices.mjs');
+    const hub = new Helpers({ onChange: () => { if (state.phase === 'loading') renderDevices(); } });
+    const [main, side] = localLinkPair();
+    const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+    w.postMessage({ type: 'hello', gpu: 'low-power' });
+    new Helping({ link: side, worker: w, local: true, about: { name: 'the integrated GPU', capacity: 16 * 2 ** 30, gpu: 'integrated' },
+      settings: () => ({ gpu: 'low-power', gpuMemory: 'all', cacheGb: state.settings.cacheGb }) });
+    hub.add(main, 'local-gpu');
+    await new Promise((resolve) => { const ready = () => (hub.list[0]?.state === 'ready' ? resolve() : setTimeout(ready, 20)); ready(); });
+    return { hub, worker: w, helper: () => hub.list[0] };
+  })().catch((e) => { localGpuPromise = null; throw e; });
+  return localGpuPromise;
 }
 
 // ---- Your other devices: pairing, and running part of a model on them ----
@@ -347,22 +380,23 @@ function renderDevices() {
   }
 }
 
-function onSplitPlan({ helpers: plan, ctx, mine }) {
+function onSplitPlan({ helpers: plan, ctx, mine, pooled, free, n_layer }) {
   const sp = state.split;
   if (!sp) return;
+  trace({ type: 'split', model: state.loading?.label, n_layer, here: mine ? `${mine.first}-${mine.end}` : 'all', others: plan.map((p) => `${p.stage.first}-${p.stage.end}`).join(', '), pooled: Boolean(pooled), freeGB: free ? +(free / 2 ** 30).toFixed(2) : undefined });
   sp.plan = { mine, helpers: plan.map(({ helper, stage }) => ({ h: sp.helpers[helper], stage })) };
-  sp.pending = Promise.all(sp.plan.helpers.map(({ h, stage }) => state.helpers.load(h, sp.source, stage, ctx)));
+  sp.pending = Promise.all(sp.plan.helpers.map(({ h, stage }) => sp.hub.load(h, sp.source, stage, ctx)));
   // A device that cannot load its layers ends the load now rather than after this one's.
   sp.pending.catch((e) => {
     if (state.split !== sp || state.phase !== 'loading') return;
     worker.postMessage({ type: 'cancel' });
-    state.helpers.unloadAll();
+    sp.hub.unloadAll();
     onError({ during: 'load', message: e.message });
   });
 }
 
 function onRemoteForward({ id, hidden, n, pos0 }) {
-  state.helpers.forward(hidden, n, pos0).then(
+  (state.split?.hub || state.helpers).forward(hidden, n, pos0).then(
     (out) => worker.postMessage({ type: 'remote-result', id, hidden: out }, [out]),
     (e) => worker.postMessage({ type: 'remote-result', id, error: e.message || String(e) }),
   );
@@ -652,7 +686,7 @@ function onLoaded(msg) {
   const secs = (performance.now() - loadStarted) / 1000;
   const cfg = model.config;
   const types = Object.keys(model.weight_types).join(', ');
-  $('ready-title').textContent = state.split?.plan?.helpers.length ? `${label} is running on your devices` : `${label} is running on your GPU`;
+  $('ready-title').textContent = state.split?.plan?.helpers.length ? (state.split.local ? `${label} is running on both GPUs` : `${label} is running on your devices`) : `${label} is running on your GPU`;
   const active = model.active_parameters < model.parameters * 0.9 ? `, ${formatParams(model.active_parameters)} active per token` : '';
   const pl = chat.placement || {};
   const where = pl.streaming
@@ -852,7 +886,7 @@ async function getAssistant(){
         const t0=performance.now();
         try{
           const r=await agentTurn(messages,tools,{...opts,options:{enable_thinking:Boolean(state.settings.thinking)}});
-          trace({type:'turn',chat:state.chatId,ms:Math.round(performance.now()-t0),messages:messages.length,promptTokens:r.promptTokens,tokens:r.n,reason:r.reason,text:r.text});
+          trace({type:'turn',chat:state.chatId,ms:Math.round(performance.now()-t0),messages:messages.length,promptTokens:r.promptTokens,computed:r.computed,prefillMs:Math.round(r.prefillMs||0),decodeMs:Math.round(r.ms||0),tokens:r.n,reason:r.reason,text:r.text});
           return r;
         }catch(error){trace({type:'turn-error',chat:state.chatId,ms:Math.round(performance.now()-t0),error:String(error.message||error)});throw error;}
       },
@@ -890,7 +924,8 @@ async function runAssistant(question){
         else if(e.type==='retry')trace({type:'retry',chat:state.chatId,message:e.message,output:e.output});
       }});
     calls=result.calls;error=result.error;
-    m.content=result.answer||m.content||(result.calls?'Done.':'');
+    // Never claim success the model did not state: the steps show what actually ran.
+    m.content=result.answer||m.content||(result.calls?'I stopped without saying what I did. The steps above show what actually ran.':'');
     if(result.error)m.content=(m.content?m.content+'\n\n':'')+(m.cancelRequested?'Stopped.':`I stopped before finishing: ${result.error}`);
     if(!m.content.trim())m.content='(no reply)';
     m.stats=result.calls?`${result.calls} step${result.calls===1?'':'s'}`:'';
@@ -1047,7 +1082,7 @@ function onWorkerMessage(event) {
       break;
     case 'split-plan': onSplitPlan(msg); break;
     case 'remote-forward': onRemoteForward(msg); break;
-    case 'remote-control': state.helpers?.control(msg.op); break;
+    case 'remote-control': (state.split?.hub || state.helpers)?.control(msg.op); break;
     case 'prefill': onPrefill(msg); break;
     case 'token':
       if (state.live) {
@@ -1193,6 +1228,7 @@ function fillSettings() {
   form.elements.share.checked = Boolean(s.share);
   form.elements.shareUpload.value = String(s.shareUpload ?? 2);
   form.elements.thinking.checked = Boolean(s.thinking);
+  form.elements.poolGpus.checked = s.poolGpus !== false;
   form.elements.internet.checked = Boolean(s.internet);
   form.elements.jinaKey.value = s.jinaKey || '';
   form.elements.githubToken.value = s.githubToken || '';
@@ -1218,7 +1254,7 @@ form.addEventListener('input', (e) => {
   if (t.name === 'githubToken' || t.name === 'autonomy') configureVm();
 });
 form.addEventListener('change', (e) => {
-  if (['ctx', 'gpu', 'gpuMemory', 'cacheGb', 'share', 'shareUpload'].includes(e.target.name) && state.loaded) $('status-line').textContent = 'This setting applies the next time a model loads.';
+  if (['ctx', 'gpu', 'gpuMemory', 'poolGpus', 'cacheGb', 'share', 'shareUpload'].includes(e.target.name) && state.loaded) $('status-line').textContent = 'This setting applies the next time a model loads.';
 });
 $('open-settings').addEventListener('click', () => { fillSettings(); dialog.showModal(); });
 $('reset-settings').addEventListener('click', () => {
@@ -1244,7 +1280,7 @@ function finishAgent(error,value) {
 }
 function restartEngine(reason) {
   stopSharing();
-  state.helpers?.unloadAll();
+  state.helpers?.unloadAll();localGpuPromise?.then((l)=>l.hub.unloadAll(),()=>{});
   worker.terminate();finishAgent(new Error(reason));state.loaded=null;state.loading=null;
   worker=newWorker();worker.onmessage=onWorkerMessage;worker.onerror=onWorkerError;
   setPhase('starting');worker.postMessage({type:'hello',gpu:state.settings.gpu});$('status-line').textContent=reason+' Choose a saved model to reload it.';
@@ -1255,8 +1291,9 @@ function restartEngine(reason) {
 function piLimits() {
   if (state.loaded?.stream) return { turn: 0, task: 0, stop: 120000 };
   if (state.loaded?.chat?.placement?.streaming) return { turn: 1800000, task: 7200000, stop: 60000 };
-  // A 4B model on an integrated GPU reads a long prompt and writes a long reply in minutes, not seconds.
-  return { turn: 600000, task: 180000, stop: 10000 };
+  // A 4B model on an integrated GPU reads a long prompt in minutes, and reading cannot be
+  // interrupted, so the limit only catches a turn that never ends.
+  return { turn: 1800000, task: 180000, stop: 10000 };
 }
 function agentTurn(messages,tools,{signal,onToken,maxTokens=2048,options}={}) {
   if(state.phase!=='agent'||agentRequest)return Promise.reject(new Error('The model is busy.'));

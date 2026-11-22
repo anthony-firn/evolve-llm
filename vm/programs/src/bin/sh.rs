@@ -756,6 +756,11 @@ impl Shell {
                 None => 2,
             },
             "read" => {
+                // `read FILE` is a common slip for showing a file: say so instead of waiting for input.
+                if let Some(bad) = args.iter().find(|n| !(n.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))) {
+                    let _ = writeln!(err, "read: {bad} is not a variable name (read takes a line of input; to show a file, use: cat {bad})");
+                    return 2;
+                }
                 let mut line = String::new();
                 if io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 {
                     return 1;

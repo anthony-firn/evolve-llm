@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Helpers, Helping, Link, Pairing, newCode, normalizeCode } from '../web/devices.mjs';
-import { capacityOf, planSplit } from '../web/split.mjs';
+import { capacityOf, planFill, planSplit } from '../web/split.mjs';
 import { Signal } from '../web/swarm-signal.mjs';
 
 const settle = (ms = 30) => new Promise((r) => setTimeout(r, ms));
@@ -222,4 +222,19 @@ test('phone startup waits for the host listener and repeats hello after reconnec
   assert.equal(sent.length,2);
   next.onMessage({t:'host',loaded:null});
   assert.deepEqual(sent.map(m=>m.type),['hello','cache','hello'], 'reconnection refreshes GPU and cached models');
+});
+
+test('two GPUs: the faster takes as many layers as fit with their attention cache, the other the rest', () => {
+  // Qwen3 4B-like: 36 layers of 60 MB in the file, a 300 MB embedding (tied), 1.35x on the GPU,
+  // 72 KB of attention cache per token per layer.
+  const lb = { n_layer: 36, embed: 300e6, head: 0, tied: true, layers: Array(36).fill(60e6), kv_per_token: 2 * 1024 * 2 * 2 };
+  const per = 60e6 * 1.35 + lb.kv_per_token * 8192; // ~115 MB a layer
+  const [fast, slow] = planFill(lb, 1.75 * 2 ** 30, 8192, 1.35);
+  assert.equal(fast.first, 0);
+  assert.equal(fast.end, Math.floor((1.75 * 2 ** 30 * 0.9 - 300e6 * 1.35) / per));
+  assert.deepEqual(slow, { first: fast.end, end: 36 });
+  // Everything fits: nothing for the other GPU.
+  assert.deepEqual(planFill(lb, 8 * 2 ** 30, 8192, 1.35)[1], { first: 36, end: 36 });
+  // Not even the embedding fits: every layer on the other GPU.
+  assert.deepEqual(planFill(lb, 0.2 * 2 ** 30, 8192, 1.35), [{ first: 0, end: 0 }, { first: 0, end: 36 }]);
 });

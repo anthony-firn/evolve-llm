@@ -33,6 +33,10 @@ CASES = [
     ("yes | head -3", 0, "y\ny\ny\n"),
     ("seq 1 100000 | wc -l", 0, " 100000\n"),
     ("echo out; echo err >&2", 0, "out\n"),
+    # edit FILE OLD NEW: one exact match, \\n a new line; a miss or two matches change nothing.
+    ("printf 'a\\nb\\nb2\\n' > e.txt && edit e.txt a 'a\\nx' && edit e.txt zz q 2>&1; edit e.txt b q 2>&1; cat e.txt && rm e.txt", 0,
+     "edited e.txt\nedit: e.txt: the text to replace is not there. Find the exact line with: grep -n \"SOME WORDS\" e.txt\nedit: e.txt: the text to replace is in 2 places; include more of the surrounding text\na\nx\nb\nb2\n"),
+    ("read notes.txt 2>&1; echo status=$?", 0, "read: notes.txt is not a variable name (read takes a line of input; to show a file, use: cat notes.txt)\nstatus=2\n"),
     ("rm -r proj f1 f2 link.rs s.sh && ls", 0, "README\n"),
 ]
 
