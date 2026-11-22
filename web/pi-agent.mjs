@@ -66,6 +66,18 @@ const shellText = r => [`exit code ${r.code}${r.timedOut?' (timed out)':''}, in 
 /** What a small model needs to recover from a failed command: which folders exist when a cd
  *  missed, that a && chain stopped at its first error, that read/write/edit are tools, and that
  *  it is repeating a command that already failed. */
+/** Small models write each command as if it started where the task began ("cd app && ..."),
+ *  though a cd carries over. A leading cd to a folder that is not here, but is where the task
+ *  began, goes there: [command to run, note or null]. */
+async function fromStart(command, workspace, start) {
+  const lead = /^\s*cd\s+([^\s;&|]+)/.exec(command);
+  if (!lead || /^[\/~]/.test(lead[1]) || !workspace.vm || workspace.cwd === start) return [command, null];
+  if ((await workspace.vm.read(workspace.path(lead[1]))).kind === 3) return [command, null];
+  const there = workspace.path(`${start}/${lead[1]}`);
+  if ((await workspace.vm.read(there)).kind !== 3) return [command, null];
+  return [command.replace(lead[0], lead[0].replace(lead[1], there)), `there is no ${lead[1]} in ${workspace.cwd}, so this ran cd ${there} (where the task began). A cd carries over: you are now in ${there}.`];
+}
+
 async function shellNotes(command, r, workspace, failed, signal) {
   const notes = [];
   const err = r.stderr || '';
@@ -221,8 +233,10 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       return {content:[{type:'text',text:browserTools.format(outcome,limits.result)}],details:{browser:true},isError:outcome.ok===false};
     }
     if(name==='bash'){
-      result=await workspace.request('exec',{command:args.command,...(native?{asRoot:args.asRoot===true}:{}),network:network.options()},{signal});
+      const [command,moved]=linux?await fromStart(String(args.command||''),workspace,linux.cwd):[args.command,null];
+      result=await workspace.request('exec',{command,...(native?{asRoot:args.asRoot===true}:{}),network:network.options()},{signal});
       if(linux&&result.code)result.notes=await shellNotes(String(args.command||''),result,workspace,failedCommands,signal);
+      if(moved)result.notes=[moved,...(result.notes||[])];
     }
     else if(['read','write','edit'].includes(name)){
       // An edit applies only where oldText matches exactly once (the workspace checks), so it
@@ -285,7 +299,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
             const empty=!parsed.length&&!stripToolCalls(result.text).replace(/<think>[\s\S]*?(<\/think>|$)/g,'').trim()&&context.messages.at(-1)?.role==='toolResult';
             const failure=attempted&&!parsed.length?'invalid or incomplete tool call':empty?'empty reply':null;
             if(!failure)break;
-            if(repairs>=limits.repairs)throw new Error(empty?'The model kept replying with nothing after its tool results.':'The model returned an invalid or incomplete tool call after two format retries. No tools from the invalid replies were executed.');
+            if(repairs>=limits.repairs)throw new Error(failure==='empty reply'?'The model kept replying with nothing after its tool results.':'The model kept returning invalid or incomplete tool calls. No tools from the invalid replies were executed.');
             repairs++;
             if(empty){
               onEvent({type:'retry',attempt:repairs,message:'The reply was empty; asking the model to continue.',output:''});

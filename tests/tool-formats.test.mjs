@@ -64,3 +64,10 @@ test('structured history reaches native templates, and text reaches the rest', (
   assert.equal(text[3].role, 'user');
   assert.match(text[3].content, /<tool_response>\nR\n<\/tool_response>/);
 });
+
+test('a call whose reply ends after the JSON, without </tool_call>, still counts; a cut-off one does not', () => {
+  const call = '<tool_call>\n{"name": "bash", "arguments": {"command": "cd app && grep -n \\"x\\" README.md"}}';
+  const bash = new Set(['bash']);
+  assert.deepEqual(parseToolCalls(call, bash).map((c) => [c.name, c.args.command]), [['bash', 'cd app && grep -n "x" README.md']]);
+  assert.equal(parseToolCalls('<tool_call>\n{"name": "bash", "arguments": {"command": "ls', bash).length, 0);
+});

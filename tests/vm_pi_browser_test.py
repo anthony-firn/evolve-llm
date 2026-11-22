@@ -28,7 +28,7 @@ SCRIPT = [
     {"name": "bash", "arguments": {"command": "cd app"}},  # carries over to the next calls
     {"name": "read", "arguments": {"path": "README.md"}},
     {"name": "edit", "arguments": {"path": "README.md", "oldText": "# Demo", "newText": "# Demo\n\nBuilt by Pi."}},
-    {"name": "bash", "arguments": {"command": "git checkout -b pi-readme\ngit commit -m 'Describe the project'\ngit push"}},  # one command per line
+    {"name": "bash", "arguments": {"command": "cd app && git checkout -b pi-readme\ngit commit -m 'Describe the project'\ngit push"}},  # cd app again, from inside app; one command per line
     {"name": "bash", "arguments": {"command": "gh pr create --title 'Describe the project' --body 'From Pi' && gh pr merge"}},
 ]
 
@@ -115,6 +115,7 @@ def main():
         main = gh.FAKE.trees[gh.FAKE.commits[gh.FAKE.refs["main"]]["tree"]]
         check(gh.FAKE.pulls and gh.FAKE.pulls[-1].get("merged") and gh.FAKE.blobs[main["README.md"]] == b"# Demo\n\nBuilt by Pi.\n", "Pi merged it once approved")
         check(len(result["asked"]) == 1 and result["asked"][0].startswith("Merge pull request #1"), f"only the merge asked the person ({result['asked']})")
+        check(any("so this ran cd /home/user/app (where the task began)" in e[1] for e in result["events"]), "a repeated cd app runs from where the task began")
         shell = [e[1] for e in result["events"] if "exit code" in e[1]]
         check(shell and all("in /home/user" in t for t in shell) and any("in /home/user/app" in t for t in shell), "shell results read as text with the directory")
         browser.close()

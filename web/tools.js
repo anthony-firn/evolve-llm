@@ -128,6 +128,13 @@ export function parseToolCalls(text, allowed = NAMES, types = null) {
     const c = call(parseJson(m[1]), allowed);
     if (c) calls.push(c);
   }
+  // Small models often end the reply right after the JSON, without </tool_call>. What follows
+  // the last opening tag still counts when it is complete JSON (a cut-off call does not parse).
+  const open = text.lastIndexOf('<tool_call>');
+  if (open >= 0 && !text.slice(open).includes('</tool_call>')) {
+    const c = call(parseJson(text.slice(open + '<tool_call>'.length).trim()), allowed);
+    if (c) calls.push(c);
+  }
   if (calls.length) return calls;
   const bare = text.replace(/^\s*<\|python_tag\|>/, '').trim();
   // A reply consisting entirely of complete JSON blocks is another call
