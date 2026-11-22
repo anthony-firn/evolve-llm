@@ -42,6 +42,7 @@ def main():
             page.set_input_files('#file-input', str(model))
             page.wait_for_selector('#ready:not([hidden])', timeout=300000)
             page.locator('#open-terminal').click()
+            page.locator('#linux-terminal-toggle').click()  # the browser sandbox
             page.wait_for_function("() => document.querySelector('#terminal-status')?.textContent.startsWith('Ready')", timeout=60000)
             word, name = f'evolve{i}ok', f'note{i}.txt'
             log = run(page, f'pi Write the text "{word}" to a file named {name}', 600000)

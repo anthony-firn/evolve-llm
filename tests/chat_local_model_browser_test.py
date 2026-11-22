@@ -25,19 +25,18 @@ def check(runtime,model):
    page.frame_locator('.chat-preview-host iframe').locator('canvas').wait_for(timeout=20000)
    frame=page.frame_locator('.chat-preview-host iframe')
    frame.locator('#restart').click();assert frame.locator('#score').inner_text()=='0'
-   assert 'Snake starter' in page.locator('.chat-development').inner_text()
+   assert 'included Snake game' in page.locator('.work-steps').last.text_content()
    assert not page.locator('#workbench').is_visible()
    page.wait_for_function('() => window.__piTokens>0',timeout=90000)
    # The starter is already playable while the actual model runs Pi. Stop is
    # intentionally exercised rather than claiming a tiny model customized it.
    if page.locator('#stop').is_visible():page.locator('#stop').click()
    page.wait_for_selector('#app[data-phase=ready]',timeout=20000)
-   assert 'snake.html' in page.locator('.development-files').inner_text(),page.locator('.msg.assistant').last.inner_text()
-   page.locator('.development-files').get_by_role('button',name='Play',exact=True).click()
+   assert 'snake' in page.locator('.work-steps').last.text_content(),page.locator('.msg.assistant').last.inner_text()
    page.frame_locator('.chat-preview-host iframe').locator('canvas').wait_for(timeout=10000)
    page.screenshot(path='/tmp/llm-main-chat-real-model.png')
    assert not errors,errors
-   print('Real GGUF/WebGPU main chat: Auto → shared WASM workspace → labeled playable Snake starter → actual Pi model tokens → cancellation and saved file passed.')
+   print('Real GGUF/WebGPU main chat: the included Snake game plays at once → actual model tokens → cancellation, and the game stays playable.')
    browser.close()
  finally:server.shutdown();server.server_close()
 

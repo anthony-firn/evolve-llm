@@ -10,6 +10,7 @@ Needs: Python Playwright and Google Chrome. On Linux Chrome needs WebGPU flags, 
 """
 import argparse
 import functools
+import json
 import http.server
 import os
 import shutil
@@ -48,6 +49,37 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+    # A trace of the assistant's work (web/trace.mjs): the page posts events to …/__trace when the
+    # server has a trace_file (tools/serve_local.py, the real-model tests). Without one, and on any
+    # production or plain static host, …/__trace is a 404 and the page sends nothing.
+    trace_file = None
+    trace_lock = threading.Lock()
+
+    def trace(self):
+        if not self.path.split("?", 1)[0].endswith("/__trace"):
+            return False
+        if self.command == "POST" and self.trace_file:
+            n = min(int(self.headers.get("Content-Length") or 0), 1 << 20)
+            try:
+                event = json.loads(self.rfile.read(n) or b"null")
+            except ValueError:
+                event = None
+            if isinstance(event, dict):
+                with self.trace_lock, open(self.trace_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        self.send_response(204 if self.trace_file else 404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return True
+
+    def do_GET(self):
+        if not self.trace():
+            super().do_GET()
+
+    def do_POST(self):
+        if not self.trace():
+            self.send_error(405)
 
 
 def serve(directory):

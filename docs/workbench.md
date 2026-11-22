@@ -1,30 +1,46 @@
-# Main chat, browser terminal and Pi
+# The main chat, the terminal and Pi
 
-Ask the main chat **“Make me a Snake game I can play.”** No terminal command is needed.
-The mode selector beside the message box offers:
+There is one chat. Ask it anything: **“What is WebGPU?”**, **“Make me a Snake game I can play”**,
+or **“Clone anthony-firn/evolve-llm, fix the typo in the README and open a pull request.”**
+The model decides whether a message needs tools. A question gets an answer; a request to make or
+change something runs tools and shows one collapsed line under the reply (**Worked · 4 steps**),
+each step in plain words (“Ran git status”, “Edited README.md”) with its output inside. An app or
+game it opens plays in the conversation. Follow-up messages see the conversation and the same
+files. Stop ends the current reply. New chat clears the conversation and previews; files stay.
 
-- **Auto** (default): development requests use Pi; questions and explanations use ordinary chat.
-- **Chat**: replies without changing workspace files.
-- **Build**: always gives the request to Pi's workspace tools.
+Behind the chat is Pi's agent core (below) with the loaded model and one prompt and set of tools:
+`bash`, `read`, `write`, `edit`, `preview` and `browser_test`, `web_search` and `open_url` when Web
+is on, and the shared browser for requests about a live website. In Chrome and Edge it works in the
+Evolve VM's Linux system, the same files, `git` and `gh` as **Terminal** (see “Linux terminal”
+below); its `cd` carries over between commands and messages. Browsers without WebAssembly JSPI
+(Firefox, Safari) cannot run the VM, so there it works in the browser sandbox's `/workspace`, with
+the same files and previews but no `git`. Models whose chat template takes no tools (SmolLM2,
+OLMoE) answer as plain chat.
 
-Builds show activity, actual saved files, Source and Download buttons, and an isolated playable
-preview in the conversation. Ask for changes in the next message: Auto continues development
-requests against the same files. Recent conversation context is passed to Pi with the current
-file list. Select Chat for an explanation, or Build if Auto misses a task. Stop cancels the
-current task. New chat clears the conversation and previews; it keeps workspace files.
+**Chats** lists earlier conversations, saved in this browser only (IndexedDB) after every reply.
+Opening one shows its replies and steps, reopens an app it made from the files, and continues where
+it stopped; Delete removes it.
 
-Snake creation starts from the included working Snake starter, clearly labeled in the activity
-and result. It opens immediately while Pi applies customizations. The starter includes arrow
-keys, touch controls, food, scoring, collision handling and Restart. Existing files are preserved
-by giving each new starter an unused name. If Pi damages the starter and its runtime check
-fails or the canvas disappears, the working starter is restored and the partial failure is
-reported. Other apps rely on the loaded model to create their files. Small models still make
-incorrect tool choices; saved-file counts and runtime checks describe observed results, rather
-than trusting model completion claims. A runtime smoke check does not prove gameplay logic.
+### Watching the assistant work, on your own computer
 
-Main chat and Terminal share one WASM workspace, task budget, network toggle and model lease.
-No second model or server inference is used. The mode selection is remembered on this device.
+```sh
+python3 tools/build_web.py
+python3 tools/serve_local.py            # http://localhost:8080/play/evolve-llm/
+python3 tools/trace_view.py --follow    # in another terminal
+```
 
+`serve_local.py` serves the app to this computer only and appends a trace of every chat to
+`~/.cache/evolve-llm/traces/YYYY-MM-DD.jsonl`: each run's request and settings (never the GitHub
+token or API keys), each model turn with its raw output, token counts and time, each tool call and
+result, and each approval. `trace_view.py` prints one line per event (`--full` for whole outputs),
+which shows where a model goes wrong: an invalid tool call, a wrong path, a refused command. The
+page traces only when it was served from this computer by that server; the public site and plain
+static hosting never send it. `tests/chat_github_real_model_test.py` prints the same trace live.
+
+Making a new Snake game starts from the included working Snake game, saved under an unused name
+and opened at once; the model then only applies the requested changes. Other apps rely on the
+loaded model. Small models still make wrong tool choices: the steps show what actually ran, and a
+runtime smoke check does not prove gameplay logic.
 
 Open [Evolve LLM](https://www.evolvetech.dev/play/evolve-llm/) and select **Terminal**.
 The shell works before loading a model. It runs a Rust kernel compiled to WebAssembly in a
@@ -92,7 +108,7 @@ integration, not the complete Node-based Pi coding-agent CLI.
 
 ## Linux terminal: Pi on your repositories
 
-**Linux terminal** in Terminal & Pi opens the Evolve VM: a Rust kernel compiled to WebAssembly that
+**Terminal** opens the Linux terminal on the Evolve VM (in Chrome and Edge): a Rust kernel compiled to WebAssembly that
 runs WASI programs as processes, with files, pipes, terminals and a POSIX-style shell, in a
 GNOME-style terminal (tabs, Ctrl+Shift+T, Find, themes) drawn by ghostty-web. Files under
 `/home/user` are saved in this browser.
@@ -115,12 +131,28 @@ terminal, and stops on Ctrl+C. A task allows 40 model turns and 80 tool calls. T
 compiler, Node or Python yet, so builds and tests run in the repository's GitHub Actions: Pi pushes
 a branch and reads its CI run.
 
-Settings → **Pi and your GitHub** sets what Pi may do:
+Merging works on GitHub, and always asks the person first, whatever the autonomy setting:
 
-- **Commit locally only**: `git push`, `gh pr create` and write calls through `gh api` are refused.
-- **Ask me before pushing or opening a pull request** (default): the page asks each time.
+```text
+gh pr merge                  # this branch's pull request (or gh pr merge 12, --squash, --rebase)
+git checkout main && git pull
+git merge feature            # feature into the current branch, as a merge commit on GitHub
+```
+
+The question names the pull request or branches, the commits and files, and the checks. A declined
+or conflicting merge changes nothing and says so. `git checkout BRANCH` switches to a branch on
+GitHub, `git branch` lists them, and every refusal names the command to run instead (“3 changed
+files not committed yet. First run: git commit -m "MESSAGE"”), so a small model can recover. `git
+help` and `gh help` print a short recipe. Switching, pulling and merging need everything committed
+and pushed first.
+
+Settings → **GitHub** sets what the assistant (in the chat or `pi`) may do:
+
+- **Commit locally only**: `git push`, `gh pr create`, merging and write calls through `gh api`
+  are refused.
+- **Ask me before pushing, opening a pull request or merging** (default): the page asks each time.
 - **Push branches and open pull requests freely**: no question, except for a repository's
-  default branch, which always asks.
+  default branch and for merging, which always ask.
 
 A GitHub token is optional; without one, Pi can clone public repositories (GitHub allows 60 API
 requests an hour without a token). Use a fine-grained token limited to the repositories Pi may
@@ -128,9 +160,13 @@ change, with Contents and Pull requests (read and write) and Actions (read). The
 browser and in the page's VM host: programs in the VM ask the host to make a request, the host
 adds the token only for `api.github.com`, and only `api.github.com` and
 `raw.githubusercontent.com` are reachable. `tests/vm_github_browser_test.py` checks clone, status,
-diff, commit, push (the pushed tree, its parent, the question), pull requests, CI, the three
-autonomy levels and the token's destination against a fake GitHub; `tests/vm_pi_browser_test.py`
-runs Pi's agent core with a scripted model through a clone, an edit, a push and a pull request.
+diff, commit, push (the pushed tree, its parent, the question), pull requests, CI, switching
+branches, `git merge` and `gh pr merge` (asked even when pushing is free; declined and conflicting
+merges change nothing), the three autonomy levels and the token's destination against a fake
+GitHub; `tests/vm_pi_browser_test.py` runs Pi's agent core with a scripted model through a clone, a
+`cd` in its own command, an edit, a push, a pull request and an approved merge.
+`tests/chat_github_real_model_test.py --runtime dist model.gguf` sends the same work to a real
+model through the main chat and prints its steps and what the fake GitHub then holds.
 
 ## Explicit public internet reads
 
@@ -166,14 +202,14 @@ node tools/build_workbench.mjs
 npm test
 npm run typecheck
 python3 tests/workbench_browser_test.py --runtime web
-python3 tests/chat_development_browser_test.py --runtime web
+python3 tests/chat_development_browser_test.py --runtime web   # the main chat, Chrome (VM) and Firefox (sandbox)
 ```
 
 The browser test requires Python Playwright and its Chromium installation. It uses production
 CSP, the actual compiled shell and actual Pi core with a scripted model transport, so it does
 not download weights. A local Chrome/Qwen3 0.6B GPU smoke test separately verified a two-tool
 write/read loop; this is functional evidence, not a model accuracy benchmark.
-For a real-GGUF main-chat check, run `python3 tests/chat_local_model_browser_test.py --runtime dist --model /path/to/model.gguf`. This checks the labeled starter and cancellation with the actual WebGPU model; it does not claim that a tiny model reliably customizes games.
+For a real-GGUF main-chat check, run `python3 tests/chat_local_model_browser_test.py --runtime dist --model /path/to/model.gguf`. This checks the included Snake game and cancellation with the actual WebGPU model; it does not claim that a tiny model reliably customizes games.
 Pi's upstream license is preserved in `vendor/PI-LICENSE.txt` and distributed beside the bundle.
 
 ## Run and inspect HTML apps

@@ -1,6 +1,8 @@
 // The page's connection to the Evolve VM worker: terminal sessions, and commands and files for
 // Pi. One VM serves the whole page.
 
+import { trace } from '../trace.mjs';
+
 let shared = null;
 let config = () => ({});
 
@@ -28,6 +30,7 @@ export class VmClient {
     this.exits = new Map();
     this.agentAborts = new Map();
     this.ready = new Promise((resolve, reject) => {
+      this.worker.addEventListener('error', () => reject(new Error('The Linux VM could not start.')), { once: true });
       this.worker.onmessage = (e) => {
         const m = e.data;
         if (m.type === 'ready') resolve();
@@ -54,13 +57,15 @@ export class VmClient {
 
   /** `pi TASK` in a terminal: run Pi in `cwd`, writing progress with `write`; resolves the status. */
   onAgent(task, cwd, write) {
-    write('pi: open Terminal & Pi with a tool-capable model loaded, then run pi again.\n');
+    write('pi: open Terminal in Evolve LLM with a tool-capable model loaded, then run pi again.\n');
     return 1;
   }
 
-  /** A program asks to do something that leaves this device (push, open a pull request). */
+  /** A program asks to do something that changes GitHub (push, open a pull request, merge). */
   onAsk(question) {
-    return window.confirm(`Pi's Linux terminal asks:\n\n${question}`);
+    const allowed = window.confirm(`Allow the assistant to do this?\n\n${question.replace(/\?$/, '')}`);
+    trace({ type: 'ask', question, allowed });
+    return allowed;
   }
 
   configure({ github } = {}) {

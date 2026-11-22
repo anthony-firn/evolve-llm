@@ -117,12 +117,17 @@ function newSession() {
   return tty;
 }
 
-/** Run `command` with sh -c: its output, errors and status, ended after `timeoutMs`. */
+let execSeq = 0;
+
+/** Run `command` with sh -c: its output, errors, status and the directory it ended in (so a `cd`
+ *  can carry over to the next command), ended after `timeoutMs`. */
 async function exec({ command, cwd = '/home/user', timeoutMs = 120000, stdin = '' }) {
   const [inR, inW] = vm.pipe(init_pid);
   const [outR, outW] = vm.pipe(init_pid);
   const [errR, errW] = vm.pipe(init_pid);
-  const env = [...ENV, `PWD=${cwd}`];
+  const cwdFile = `/tmp/.exec-cwd-${++execSeq}`;
+  vm.mkdir_p('/tmp');
+  const env = [...ENV, `PWD=${cwd}`, `EVOLVE_CWD_FILE=${cwdFile}`];
   const pid = vm.spawn(init_pid, ['sh', '-c', command], env, cwd, new Uint32Array([0, inR, 1, outW, 2, errW]), 0);
   for (const fd of [inR, outW, errW]) vm.fd_close(init_pid, fd);
   if (pid < 0) {
@@ -165,7 +170,10 @@ async function exec({ command, cwd = '/home/user', timeoutMs = 120000, stdin = '
   await run;
   clearTimeout(timer);
   const code = vm.wait(init_pid, pid);
-  return { code: timedOut ? 124 : code, stdout: out.text, stderr: err.text, truncated: out.truncated || err.truncated, timedOut };
+  const ended = vm.read_file(cwdFile);
+  if (ended) vm.path_remove(init_pid, 3, cwdFile.slice(1), false);
+  const endCwd = ended ? dec.decode(ended) : cwd;
+  return { code: timedOut ? 124 : code, stdout: out.text, stderr: err.text, truncated: out.truncated || err.truncated, timedOut, cwd: vm.kind(endCwd) === 3 ? endCwd : cwd };
 }
 
 const handlers = {

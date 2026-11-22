@@ -7,7 +7,9 @@ test can push without touching GitHub. In Chrome, through the VM worker:
 clone (every file checked against its blob hash), status, diff, commit, log, a push to a new
 branch (asked and allowed; the fake must then hold exactly the edited tree, parented on the
 original commit), a pull request, CI runs, a refused push (autonomy: local only), a declined push,
-a hash mismatch refusing a clone, and the token reaching only the API.
+a hash mismatch refusing a clone, switching to a branch on GitHub, merging (git merge and gh pr
+merge, which ask even when pushing is free; declined and conflicting merges change nothing), and
+the token reaching only the API.
 
     python3 tools/build_vm.py && python3 tests/vm_github_browser_test.py
 """
@@ -59,6 +61,51 @@ class Fake:
         self.trees[tid] = dict(tree)
         return tid
 
+    def ancestors(self, c):
+        seen, todo = [], [c]
+        while todo:
+            x = todo.pop(0)
+            if x not in seen:
+                seen.append(x)
+                todo.extend(self.commits[x]["parents"])
+        return seen
+
+    def merged_tree(self, base, head):
+        """The tree of merging head into base, or None on a conflict (file-level, like a test needs)."""
+        mb = next(c for c in self.ancestors(base) if c in self.ancestors(head))
+        t0, tb, th = (self.trees[self.commits[c]["tree"]] for c in (mb, base, head))
+        out = {}
+        for p in set(t0) | set(tb) | set(th):
+            o, b, h = t0.get(p), tb.get(p), th.get(p)
+            if b == h or h == o:
+                v = b
+            elif b == o:
+                v = h
+            else:
+                return None
+            if v is not None:
+                out[p] = v
+        return out
+
+    def merge(self, base, head, message):
+        """Merge branch head into branch base: (status, sha)."""
+        b, h = self.refs[base], self.refs[head]
+        if h in self.ancestors(b):
+            return 204, None
+        tree = self.merged_tree(b, h)
+        if tree is None:
+            return 409, None
+        cid = hashlib.sha1(f"{b}{h}{message}".encode()).hexdigest()
+        self.commits[cid] = {"tree": self.tree_id(tree), "parents": [b, h], "message": message}
+        self.refs[base] = cid
+        return 201, cid
+
+    def pull_json(self, p):
+        merged = p.get("merged", False)
+        mergeable = None if merged else self.merged_tree(self.refs[p["base"]], self.refs[p["head"]]) is not None
+        return {"number": p["number"], "title": p["title"], "body": p.get("body", ""), "state": "closed" if merged else "open", "merged": merged, "mergeable": mergeable,
+                "head": {"ref": p["head"], "sha": self.refs.get(p["head"])}, "base": {"ref": p["base"]}, "html_url": f"https://github.com/demo/app/pull/{p['number']}"}
+
     def handle(self, method, path, query, body, headers):
         """(status, json-or-bytes) for a request under /mockgh/."""
         self.auth.append((path, headers.get("Authorization")))
@@ -77,6 +124,29 @@ class Fake:
         rest = path[len(prefix):]
         if rest == "" and method == "GET":
             return 200, {"default_branch": "main", "private": False}
+        if rest == "/branches":
+            return 200, [{"name": b, "commit": {"sha": c}} for b, c in sorted(self.refs.items())]
+        if rest.startswith("/compare/"):
+            base, head = rest[len("/compare/"):].split("...")
+            mine = self.ancestors(self.refs[base])
+            new = [c for c in self.ancestors(self.refs[head]) if c not in mine]
+            mb = next(c for c in self.ancestors(self.refs[head]) if c in mine)
+            t0, th = (self.trees[self.commits[c]["tree"]] for c in (mb, self.refs[head]))
+            return 200, {"ahead_by": len(new), "files": [{"filename": p} for p in sorted(set(t0) | set(th)) if t0.get(p) != th.get(p)]}
+        if rest == "/merges" and method == "POST":
+            status, sha = self.merge(body["base"], body["head"], body.get("commit_message", "Merge"))
+            return status, ({"sha": sha} if sha else {"message": "Merge conflict"} if status == 409 else b"")
+        if "/check-runs" in rest:
+            return 200, {"check_runs": [{"name": "CI", "status": "completed", "conclusion": "success"}]}
+        if rest.startswith("/pulls/") and rest.endswith("/merge") and method == "PUT":
+            p = self.pulls[int(rest.split("/")[2]) - 1]
+            status, sha = self.merge(p["base"], p["head"], f"Merge pull request #{p['number']}")
+            if status == 409:
+                return 405, {"message": "Pull Request is not mergeable"}
+            p["merged"] = True
+            return 200, {"sha": sha or self.refs[p["base"]], "merged": True}
+        if rest.startswith("/pulls/") and method == "GET":
+            return 200, self.pull_json(self.pulls[int(rest.split("/")[2]) - 1])
         if rest.startswith("/branches/"):
             b = rest[len("/branches/"):]
             return (200, {"commit": {"sha": self.refs[b]}}) if b in self.refs else (404, {"message": "Branch not found"})
@@ -114,7 +184,8 @@ class Fake:
             self.pulls.append({**body, "number": n})
             return 201, {"number": n, "html_url": f"https://github.com/demo/app/pull/{n}"}
         if rest == "/pulls":
-            return 200, [{"number": p["number"], "title": p["title"], "head": {"ref": p["head"]}, "base": {"ref": p["base"]}} for p in self.pulls]
+            head = query.get("head", "").partition(":")[2]
+            return 200, [self.pull_json(p) for p in self.pulls if not p.get("merged") and head in ("", p["head"])]
         if rest == "/actions/runs":
             return 200, {"workflow_runs": [{"id": 7, "status": "completed", "conclusion": "failure", "name": "CI", "head_branch": "feature"}]}
         if rest.startswith("/commits"):
@@ -139,6 +210,8 @@ class Handler(browser_test.Handler):
         body = json.loads(self.rfile.read(n) or b"null") if n else None
         status, out = FAKE.handle(method, u.path, query, body, dict(self.headers))
         data = out if isinstance(out, bytes) else json.dumps(out).encode()
+        if status == 204:
+            data = b""
         self.send_response(status)
         self.send_header("Content-Type", "application/octet-stream" if isinstance(out, bytes) else "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -151,10 +224,14 @@ class Handler(browser_test.Handler):
             super().do_GET()
 
     def do_POST(self):
-        self.route("POST")
+        if not self.route("POST"):
+            super().do_POST()
 
     def do_PATCH(self):
         self.route("PATCH")
+
+    def do_PUT(self):
+        self.route("PUT")
 
 
 def main():
@@ -217,6 +294,60 @@ def main():
         code, out, err = sh("gh repo clone demo/app bad")
         check(code != 0 and "does not match GitHub's hash" in err, f"a tampered file stops the clone ({err!r})")
         FAKE.corrupt = None
+
+        # Switching branches needs everything pushed; the error names the command to run.
+        code, out, err = sh("cd app && git checkout main")
+        check(code != 0 and "not pushed yet. First run: git push" in err, f"switching with unpushed commits says to push ({err!r})")
+        code, out, err = sh("cd app && git push && git checkout main && cat README.md && git branch")
+        check(code == 0 and "Switched to branch 'main'" in out and "# Demo\n" in out and "* main\n" in out and "  feature\n" in out, f"checkout of a branch on GitHub ({out!r} {err!r})")
+        code, out, err = sh("cd app && git pull origin feature")
+        check(code != 0 and "run: git merge feature" in err, f"pulling another branch points to git merge ({err!r})")
+
+        # git merge: refused when local-only, asks every time, declined changes nothing.
+        config(0)
+        code, out, err = sh("cd app && git merge feature")
+        check(code != 0 and "not allowed" in err and FAKE.refs["main"] == C0, f"local-only refuses to merge ({err!r})")
+        config(2)
+        page.evaluate("window.vmAnswer = false; window.vmQuestions = []")
+        code, out, err = sh("cd app && git merge feature")
+        asked = page.evaluate("window.vmQuestions")
+        check(code != 0 and "declined by the person" in err and FAKE.refs["main"] == C0, f"a declined merge changes nothing ({err!r})")
+        check(asked == ["Merge 2 commits from feature into main (the default branch) on demo/app, 3 files changed?"], f"merging asks even with push freely ({asked})")
+        page.evaluate("window.vmAnswer = true")
+        code, out, err = sh("cd app && git merge feature && cat README.md && ls && git status")
+        main = FAKE.commits[FAKE.refs["main"]]
+        check(code == 0 and "Merged feature into main" in out and main["parents"] == [C0, FAKE.refs["feature"]], f"git merge makes a merge commit on GitHub ({out!r} {err!r})")
+        check("# Demo\nmore\nagain\n" in out and "new.txt" in out and "notes.txt" not in out and "working tree clean" in out, "and updates the files")
+        code, out, _ = sh("cd app && git merge feature")
+        check(code == 0 and "Already up to date" in out, "merging again has nothing to do")
+
+        # gh pr merge: the current branch's pull request, asked even with push freely.
+        page.evaluate("window.vmQuestions = []")
+        code, out, err = sh("cd app && git checkout -b fix && echo fixed > fix.txt && git commit -m 'Fix' && git push && gh pr create --title 'Fix it' --body 'x' && gh pr merge")
+        asked = page.evaluate("window.vmQuestions")
+        fixed = FAKE.trees[FAKE.commits[FAKE.refs["main"]]["tree"]]
+        check(code == 0 and "Merged pull request #2 into main" in out and "git checkout main" in out, f"gh pr merge merges this branch's pull request ({out!r} {err!r})")
+        check(asked == ['Merge pull request #2 "Fix it" (fix into main) on demo/app, checks: 1 passed?'], f"only the merge asked ({asked})")
+        check("fix.txt" in fixed and FAKE.pulls[1].get("merged"), "main on GitHub holds the fix")
+        code, out, _ = sh("cd app && gh pr merge 2")
+        check(code == 0 and "already merged" in out, "merging a merged pull request says so")
+
+        # A conflict: nothing changes, and the message says what to do.
+        c = FAKE.refs["main"]
+        tree = dict(FAKE.trees[FAKE.commits[c]["tree"]])
+        tree["README.md"] = FAKE.put(b"# Changed on main\n")
+        cid = "c" * 40
+        FAKE.commits[cid] = {"tree": FAKE.tree_id(tree), "parents": [c], "message": "Retitle on main"}
+        FAKE.refs["main"] = cid
+        code, out, err = sh("cd app && echo other > README.md && git commit -m 'Retitle here' && git push && gh pr create --title 'Retitle' && gh pr merge")
+        check(code != 0 and "has merge conflicts with main" in err and FAKE.refs["main"] == cid, f"a conflicting pull request is not merged ({err!r})")
+        code, out, err = sh("cd app && git checkout main && git merge fix")
+        check(code != 0 and "merge conflict" in err and "Tell the person" in err and FAKE.refs["main"] == cid, f"a conflicting git merge changes nothing ({out!r} {err!r})")
+        code, out, err = sh("cd app && git checkout -b fix")
+        check(code != 0 and "already exists on GitHub. Switch to it with: git checkout fix" in err, f"a new branch may not reuse a name on GitHub ({err!r})")
+        code, out, _ = sh("git help && gh help")
+        check("git merge BRANCH" in out and "gh pr merge" in out and "always asks the person" in out, "help lists merging")
+
         raw_with_token = [p for p, a in FAKE.auth if p.startswith("/raw/") and a]
         api_with_token = [p for p, a in FAKE.auth if p.startswith("/api/") and a == "Bearer test-token"]
         check(not raw_with_token and api_with_token, "the token goes only to the API")

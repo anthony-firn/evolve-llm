@@ -72,13 +72,12 @@ def main():
         expect(wait_for(lambda: (page.text_content(".vt-find-count") or "").endswith("of 2")), "Find counts the matches")
         page.keyboard.press("Escape")
 
-        # In the app: Terminal, then Linux terminal.
+        # In the app: Terminal opens the Linux terminal.
         app = browser.new_page(viewport={"width": 1280, "height": 900})
         app.on("pageerror", lambda e: problems.append(f"app page error: {e}"))
         app.goto(base)
         app.wait_for_selector("#gpu-chip[data-state=ok]", state="attached", timeout=30000)
         app.click("#open-terminal")
-        app.click("#linux-terminal-toggle")
         app_text = lambda: app.evaluate("document.querySelector('.vm-console .vt-term:not([hidden])') ? 'ready' : ''")
         expect(wait_for(app_text), "the app opens the Linux terminal")
         time.sleep(1)

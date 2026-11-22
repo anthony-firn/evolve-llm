@@ -14,7 +14,7 @@ def check(runtime):
             page=browser.new_page(); errors=[]; remote=[]
             page.on('pageerror',lambda e:errors.append(str(e)))
             page.on('request',lambda r:remote.append(r.url) if not r.url.startswith(base.split('/play/')[0]+'/') else None)
-            page.goto(base);page.locator('#open-terminal').click()
+            page.goto(base);page.locator('#open-terminal').click();page.locator('#linux-terminal-toggle').click()  # the browser sandbox
             page.wait_for_function("() => document.querySelector('#terminal-status')?.textContent.startsWith('Ready')")
             def command(text):
                 page.locator('#terminal-input').fill(text)
@@ -25,7 +25,7 @@ def check(runtime):
             assert 'Only /workspace paths' in command('cat /etc/passwd')
             assert 'off' in command('curl https://example.com').lower()
             assert not remote,remote
-            page.reload();page.locator('#open-terminal').click()
+            page.reload();page.locator('#open-terminal').click();page.locator('#linux-terminal-toggle').click()
             assert 'apple\npear' in command('cat fruit.txt')
             # Real Pi agent core + actual sandbox WASM, using a deterministic model transport.
             result=page.evaluate("""async()=>{

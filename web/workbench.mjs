@@ -15,12 +15,12 @@ async function database(mode, value) {
 }
 export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwork, modelName, taskTimeLimit = () => 180000 }) {
   const root=node('section',undefined,'workbench');root.id='workbench';root.hidden=true;root.setAttribute('aria-label','WASM terminal and Pi agent');
-  const head=node('header'),title=node('div');title.append(node('strong','Terminal & Pi'),node('small','WASM workspace · local model'));
+  const head=node('header'),title=node('div');title.append(node('strong','Terminal'),node('small','The assistant\u2019s files · runs in this page'));
   const tokenLabel=node('label'),tokenLimit=node('select');tokenLimit.id='pi-output-tokens';for(const value of [1024,2048,4096]){const option=node('option',String(value));option.value=value;tokenLimit.append(option)}tokenLimit.value='2048';tokenLabel.append(node('span','Pi tokens'),tokenLimit);
   const webLabel=node('label'),webToggle=node('input');webToggle.type='checkbox';webToggle.id='terminal-web';webLabel.append(webToggle,node('span','Web access'));
   const close=button('Close',()=>{if(!externalTask)cancel();preview.stop();previewPanel.hidden=true;console.classList.remove('preview-expanded');root.hidden=true});
   // The Linux terminal: the Evolve VM (web/vm/) in a GNOME-style window, in place of the console.
-  const linuxToggle=button('Linux terminal',()=>toggleLinux());linuxToggle.id='linux-terminal-toggle';linuxToggle.title='A Linux-style shell in this page: real programs compiled to WebAssembly';
+  const linuxToggle=button('Browser sandbox',()=>toggleLinux());linuxToggle.id='linux-terminal-toggle';linuxToggle.title='Switch between the Linux terminal (the assistant\u2019s files, git and gh) and the older browser sandbox';
   head.append(title,tokenLabel,webLabel,linuxToggle,close);
   const notice=node('p','Commands and files stay in a browser-only /workspace. Web searches and page URLs go to external services when enabled. This supports a shell subset, not host Bash.','workbench-note');
   const layout=node('div',undefined,'workbench-layout'),aside=node('aside'),files=node('div',undefined,'workbench-files');files.id='workspace-files';
@@ -40,9 +40,11 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   const vmHost=node('div',undefined,'vm-console');vmHost.hidden=true;
   aside.append(node('h2','Workspace files'),actions,files);layout.append(aside,console,vmHost);root.append(head,notice,layout,filePicker,restorePicker);document.body.append(root);
   let vmWindow=null;
+  // The Linux terminal needs WebAssembly JSPI (Chrome, Edge); elsewhere the sandbox is the terminal.
+  const linuxAvailable=typeof WebAssembly.Suspending==='function';linuxToggle.hidden=!linuxAvailable;
   async function toggleLinux(){
-    const on=vmHost.hidden;vmHost.hidden=!on;aside.hidden=on;console.hidden=on;layout.classList.toggle('vm-mode',on);
-    linuxToggle.textContent=on?'Pi workspace':'Linux terminal';
+    const on=vmHost.hidden;vmHost.hidden=!on;aside.hidden=on;console.hidden=on;notice.hidden=on;layout.classList.toggle('vm-mode',on);
+    linuxToggle.textContent=on?'Browser sandbox':'Linux terminal';
     if(on&&!vmWindow){
       if(!document.querySelector('link[href$="vm/terminal.css"]')){const l=document.createElement('link');l.rel='stylesheet';l.href=new URL('./vm/terminal.css',import.meta.url).href;document.head.append(l)}
       const [{sharedVm},{TerminalWindow}]=await Promise.all([import('./vm/client.mjs'),import('./vm/terminal.mjs')]);
@@ -50,6 +52,7 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
       vmWindow=new TerminalWindow({vm,container:vmHost});await vmWindow.open();
     }
     if(on)vmWindow?.active?.term.focus();
+    else{await boot();input.focus()}
   }
   let initialized=false, initialization=null, task=null, busy=false, externalTask=false, saving=Promise.resolve(), agent=null, abortWeb=new AbortController(), history=[],cursor=0;
   function record(label,text='',className='') {
@@ -219,5 +222,7 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   form.addEventListener('submit',e=>{e.preventDefault();const line=input.value.trim();if(!line||busy)return;input.value='';history.push(line);history=history.slice(-50);cursor=history.length;run(()=>command(line))});
   input.addEventListener('keydown',e=>{if(e.key==='ArrowUp'||e.key==='ArrowDown'){e.preventDefault();cursor=Math.max(0,Math.min(history.length,cursor+(e.key==='ArrowUp'?-1:1)));input.value=history[cursor]||''}if(e.ctrlKey&&e.key.toLowerCase()==='c'){e.preventDefault();cancel()}});
   webToggle.addEventListener('change',()=>setNetwork(webToggle.checked));
-  return {runTask:(question,options)=>run(()=>performTask(question,options),{rethrow:true}),cancel,async open(){root.hidden=false;webToggle.checked=getNetwork().enabled;await boot();input.focus()},setNetwork(){if(busy)cancel();abortWeb.abort();abortWeb=new AbortController();webToggle.checked=getNetwork().enabled},dispose(){cancel();workspace.dispose();preview.dispose();root.remove()}};
+  return {runTask:(question,options)=>run(()=>performTask(question,options),{rethrow:true}),cancel,
+    /** The sandbox's /workspace, saved in this browser: the assistant's files where the Linux VM cannot run. */
+    async sandbox(){await boot();return workspace},async open(){root.hidden=false;webToggle.checked=getNetwork().enabled;if(linuxAvailable&&!vmWindow&&vmHost.hidden){await toggleLinux();return}if(vmHost.hidden){await boot();input.focus()}else vmWindow?.active?.term.focus()},setNetwork(){if(busy)cancel();abortWeb.abort();abortWeb=new AbortController();webToggle.checked=getNetwork().enabled},dispose(){cancel();workspace.dispose();preview.dispose();root.remove()}};
 }

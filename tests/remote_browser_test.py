@@ -132,6 +132,7 @@ def main():
                 a.hf = a.pi_hf
                 load(phone)
                 phone.locator("#open-terminal").click()
+                phone.locator("#linux-terminal-toggle").click()  # the browser sandbox
                 phone.wait_for_function("() => document.querySelector('#terminal-status')?.textContent.startsWith('Ready')", timeout=60000)
                 phone.locator("#terminal-input").fill('pi Write the text "phoneok" to a file named phone.txt')
                 phone.locator(".terminal-form button[type=submit]").click()

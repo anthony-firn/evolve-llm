@@ -447,7 +447,8 @@ async function loadModel(source, wantCtx, lowPower, budgetPref, { stage = null, 
   } finally {
     loader.free();
   }
-  return { model, chat: JSON.parse(chat.info()) };
+  // Whether the chat template takes tools: the main chat's assistant needs it.
+  return { model, chat: JSON.parse(chat.info()), tools: Boolean(toolTemplate) };
 }
 
 function unload() {
@@ -665,7 +666,8 @@ const handlers = {
     const schemas = msg.tools || [];
     remote?.resume();
     const { messages, options } = toolTransport(msg.messages, schemas, toolTemplate, { argsAsString });
-    const result = await turn(messages, options, msg.maxTokens || 512, chat.context_length(), (type,data) => post('agent_event',{requestId:msg.requestId,event:{type,...data}}), true);
+    // The page's template options (enable_thinking) for this turn.
+    const result = await turn(messages, { ...options, ...(msg.options || {}) }, msg.maxTokens || 512, chat.context_length(), (type,data) => post('agent_event',{requestId:msg.requestId,event:{type,...data}}), true);
     post('agent_done',{requestId:msg.requestId,...result});
   },
   stop() {

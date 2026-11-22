@@ -3,10 +3,15 @@
 //! The VM has no sockets, so this is not Git's protocol: `clone` lists a commit's tree through
 //! the API and downloads each file (checked against GitHub's own blob hash); `status`, `diff`
 //! and `commit` work offline against the files as cloned; `push` creates the same blobs, trees
-//! and commits through the Git Data API and moves a branch; `gh pr` and `gh run` open pull
-//! requests and read CI results. Requests go through the host (evolve.http_fetch), which adds the
-//! person's token for GitHub and enforces which hosts are reachable; pushing and opening pull
-//! requests follow their autonomy setting (evolve.policy, evolve.ask_user).
+//! and commits through the Git Data API and moves a branch; `checkout BRANCH` and `pull` replace
+//! the files with a branch's on GitHub; `merge` and `gh pr merge` merge on GitHub; `gh pr` and
+//! `gh run` open pull requests and read CI results. Requests go through the host
+//! (evolve.http_fetch), which adds the person's token for GitHub and enforces which hosts are
+//! reachable; pushing and opening pull requests follow their autonomy setting (evolve.policy,
+//! evolve.ask_user), and merging always asks them.
+//!
+//! Messages are written for a small model as much as for a person: every refusal says which
+//! command to run instead.
 //!
 //! State lives in `.evolve-git/` at the top of a clone: config.json, head.json (path -> blob
 //! hash of the last commit), objects/ (file contents by hash) and log.json (commits not pushed).
@@ -98,18 +103,27 @@ fn ask(question: &str) -> bool {
     e == 0 && a == 1
 }
 
-/// Whether an action that leaves this device may go ahead under the autonomy setting.
-fn allowed(action: &str, to_default_branch: bool) -> R<()> {
+/// Whether an action that changes GitHub may go ahead under the autonomy setting. `always_ask`
+/// (merges, the default branch, raw API writes) asks even when pushing is allowed freely.
+fn allowed(action: &str, always_ask: bool) -> R<()> {
     match level() {
         0 => Err(format!("{action}: not allowed (autonomy: local commits only; change it in Settings)")),
-        2 if !to_default_branch => Ok(()),
+        2 if !always_ask => Ok(()),
         _ => {
             if ask(&format!("{action}?")) {
                 Ok(())
             } else {
-                Err(format!("{action}: declined"))
+                Err(format!("{action}: declined by the person, so nothing changed on GitHub"))
             }
         }
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 
@@ -209,6 +223,59 @@ impl Repo {
         }
         Ok(out)
     }
+}
+
+/// Switching, pulling and merging replace files, so everything must be committed and pushed.
+fn ready_for(r: &Repo, what: &str) -> R<()> {
+    let (a, m, d) = changes(&r.head(), &r.work()?);
+    let n = a.len() + m.len() + d.len();
+    if n > 0 {
+        return Err(format!("{what}: {n} changed file{} not committed yet. First run: git commit -m \"MESSAGE\" (or undo with: git restore FILE)", plural(n)));
+    }
+    let ahead = r.log().len();
+    if ahead > 0 {
+        return Err(format!("{what}: {ahead} commit{} on {} not pushed yet. First run: git push", plural(ahead), r.branch()));
+    }
+    Ok(())
+}
+
+/// The commit a branch on GitHub points to, or None when GitHub has no such branch.
+fn branch_head(or: &str, name: &str) -> R<Option<String>> {
+    match api("GET", &format!("/repos/{or}/branches/{}", url_path(name)), None) {
+        Ok(b) => Ok(b["commit"]["sha"].as_str().map(String::from)),
+        Err(e) if e.starts_with("GitHub 404") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn branch_names(or: &str) -> R<Vec<String>> {
+    Ok(api("GET", &format!("/repos/{or}/branches?per_page=100"), None)?.as_array().cloned().unwrap_or_default().iter().filter_map(|b| b["name"].as_str().map(String::from)).collect())
+}
+
+fn no_branch(or: &str, name: &str) -> String {
+    let names = branch_names(or).unwrap_or_default();
+    format!("there is no branch {name} on GitHub (branches: {}). To start a new branch, run: git checkout -b {name}", names.join(", "))
+}
+
+/// Make the working tree a branch's commit on GitHub: download what changed, remove what went.
+/// The tree must be clean (ready_for). Returns (added, modified, deleted).
+fn sync_to(r: &mut Repo, branch: &str, commit: &str) -> R<(usize, usize, usize)> {
+    let (owner, repo) = (r.config["owner"].as_str().unwrap_or("").to_string(), r.config["repo"].as_str().unwrap_or("").to_string());
+    let (files, tree, _) = tree_of(&owner, &repo, commit)?;
+    let new: BTreeMap<String, String> = files.iter().map(|(p, s, _)| (p.clone(), s.clone())).collect();
+    let (a, m, d) = changes(&r.head(), &new);
+    let fetch: Vec<_> = files.iter().filter(|(p, _, _)| a.contains(p) || m.contains(p)).cloned().collect();
+    download(&owner, &repo, commit, r.config["private"].as_bool().unwrap_or(false), &fetch, &r.root, &r.state("objects"))?;
+    for p in &d {
+        let _ = fs::remove_file(r.root.join(p));
+    }
+    r.save_head(&new)?;
+    fs::write(r.state("upstream.json"), serde_json::to_string(&new).unwrap()).map_err(|e| e.to_string())?;
+    r.config["branch"] = Value::String(branch.to_string());
+    r.config["upstream"] = json!({ "branch": branch, "commit": commit, "tree": tree });
+    r.config["modes"] = Value::Object(files.iter().filter(|(_, _, m)| m != "100644").map(|(p, _, m)| (p.clone(), Value::String(m.clone()))).collect());
+    r.save_config()?;
+    Ok((a.len(), m.len(), d.len()))
 }
 
 /// (added, modified, deleted) between two path -> hash maps.
@@ -351,13 +418,13 @@ fn status(r: &Repo) -> R<()> {
     println!("On branch {}", r.branch());
     let ahead = r.log().len();
     if ahead > 0 {
-        println!("Your branch is ahead of 'origin/{}' by {ahead} commit{} (not pushed).", r.config["upstream"]["branch"].as_str().unwrap_or(""), if ahead == 1 { "" } else { "s" });
+        println!("Your branch is ahead of 'origin/{}' by {ahead} commit{} (not pushed; git push uploads them).", r.config["upstream"]["branch"].as_str().unwrap_or(""), plural(ahead));
     }
     if a.is_empty() && m.is_empty() && d.is_empty() {
         println!("nothing to commit, working tree clean");
         return Ok(());
     }
-    println!("Changes not committed:");
+    println!("Changes not committed (git commit -m \"MESSAGE\" saves them all; git restore FILE undoes one):");
     for p in &m {
         println!("\tmodified:   {p}");
     }
@@ -473,7 +540,7 @@ fn push(r: &mut Repo) -> R<()> {
     let (owner, repo) = (r.config["owner"].as_str().unwrap().to_string(), r.config["repo"].as_str().unwrap().to_string());
     let branch = r.branch();
     let to_default = branch == r.default_branch();
-    allowed(&format!("Push {} commit{} to {owner}/{repo} branch {branch}", log.len(), if log.len() == 1 { "" } else { "s" }), to_default)?;
+    allowed(&format!("Push {} commit{} to {owner}/{repo} branch {branch}", log.len(), plural(log.len())), to_default)?;
     let mut parent = r.config["upstream"]["commit"].as_str().unwrap().to_string();
     let mut prev_tree_sha = r.config["upstream"]["tree"].as_str().unwrap().to_string();
     let mut prev: BTreeMap<String, String> = serde_json::from_value(r.config["upstream"]["files"].clone()).unwrap_or_default();
@@ -519,6 +586,70 @@ fn push(r: &mut Repo) -> R<()> {
     Ok(())
 }
 
+/// A pull request's number from `12`, `#12`, its URL or a branch name; with none, the open pull
+/// request of the current branch.
+fn pr_number(r: &Repo, args: &[String]) -> R<String> {
+    let given = args.iter().find(|a| !a.starts_with('-'));
+    if let Some(n) = given.map(|a| a.trim_start_matches('#').rsplit('/').next().unwrap_or("").to_string()).filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
+        return Ok(n);
+    }
+    let branch = given.cloned().unwrap_or_else(|| r.branch());
+    let open = api("GET", &format!("/repos/{}/pulls?state=open&head={}:{}", r.owner_repo(), r.config["owner"].as_str().unwrap_or(""), url_path(&branch)), None)?;
+    match open.as_array().and_then(|a| a.first()).and_then(|p| p["number"].as_u64()) {
+        Some(n) => Ok(n.to_string()),
+        None => Err(format!("no open pull request for branch {branch}. Open one with: gh pr create --title \"TITLE\" (or run gh pr list to see the numbers)")),
+    }
+}
+
+/// "2 passed, 1 failed" for the checks on a commit.
+fn checks_summary(or: &str, sha: &str) -> R<String> {
+    let runs = api("GET", &format!("/repos/{or}/commits/{sha}/check-runs"), None)?["check_runs"].as_array().cloned().unwrap_or_default();
+    if runs.is_empty() {
+        return Ok("no checks".into());
+    }
+    let count = |want: &[&str]| runs.iter().filter(|c| want.contains(&c["conclusion"].as_str().unwrap_or("pending"))).count();
+    let parts = [(count(&["success", "neutral", "skipped"]), "passed"), (count(&["failure", "timed_out", "cancelled", "action_required", "startup_failure"]), "failed"), (count(&["pending"]), "still running")];
+    Ok(parts.iter().filter(|(n, _)| *n > 0).map(|(n, w)| format!("{n} {w}")).collect::<Vec<_>>().join(", "))
+}
+
+/// gh pr merge: merge a pull request on GitHub. Always asks the person first.
+fn pr_merge(r: &Repo, args: &[String]) -> R<()> {
+    let or = r.owner_repo();
+    let n = pr_number(r, args)?;
+    let p = api("GET", &format!("/repos/{or}/pulls/{n}"), None)?;
+    if p["merged"].as_bool() == Some(true) {
+        println!("Pull request #{n} is already merged.");
+        return Ok(());
+    }
+    if p["state"].as_str() != Some("open") {
+        return Err(format!("pull request #{n} is closed, so it cannot be merged"));
+    }
+    let (head, base, title) = (p["head"]["ref"].as_str().unwrap_or(""), p["base"]["ref"].as_str().unwrap_or(""), p["title"].as_str().unwrap_or(""));
+    if p["mergeable"].as_bool() == Some(false) {
+        return Err(format!("pull request #{n} has merge conflicts with {base}, so it cannot be merged. Tell the person; they can resolve the conflicts on GitHub"));
+    }
+    let method = if args.iter().any(|a| a == "--squash" || a == "-s") {
+        "squash"
+    } else if args.iter().any(|a| a == "--rebase" || a == "-r") {
+        "rebase"
+    } else {
+        "merge"
+    };
+    let checks = checks_summary(&or, p["head"]["sha"].as_str().unwrap_or(""))?;
+    allowed(&format!("Merge pull request #{n} \"{title}\" ({head} into {base}) on {or}, checks: {checks}"), true)?;
+    let done = api("PUT", &format!("/repos/{or}/pulls/{n}/merge"), Some(json!({ "merge_method": method }))).map_err(|e| format!("GitHub did not merge #{n}: {e}"))?;
+    println!("Merged pull request #{n} into {base} ({}).", short(done["sha"].as_str().unwrap_or("")));
+    if r.branch() == base {
+        println!("Run git pull to get the merged files.");
+    } else {
+        println!("To work on {base} now, run: git checkout {base}");
+    }
+    if args.iter().any(|a| a == "--delete-branch" || a == "-d") {
+        println!("The branch {head} was kept: deleting branches is not available here.");
+    }
+    Ok(())
+}
+
 fn pr(r: &Repo, args: &[String]) -> R<()> {
     let or = r.owner_repo();
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
@@ -539,16 +670,18 @@ fn pr(r: &Repo, args: &[String]) -> R<()> {
                 println!("#{}\t{}\t{} -> {}", p["number"], p["title"].as_str().unwrap_or(""), p["head"]["ref"].as_str().unwrap_or(""), p["base"]["ref"].as_str().unwrap_or(""));
             }
         }
-        Some("view") => {
-            let n = args.get(1).ok_or("usage: gh pr view NUMBER")?;
+        Some("view") | Some("checks") => {
+            let n = pr_number(r, &args[1..])?;
             let p = api("GET", &format!("/repos/{or}/pulls/{n}"), None)?;
-            println!("#{n} {}\nstate: {}{}\n{} -> {}\n{}\n\n{}", p["title"].as_str().unwrap_or(""), p["state"].as_str().unwrap_or(""), if p["merged"].as_bool() == Some(true) { " (merged)" } else { "" }, p["head"]["ref"].as_str().unwrap_or(""), p["base"]["ref"].as_str().unwrap_or(""), p["html_url"].as_str().unwrap_or(""), p["body"].as_str().unwrap_or(""));
+            let conflicts = if p["mergeable"].as_bool() == Some(false) { " (has merge conflicts)" } else { "" };
+            println!("#{n} {}\nstate: {}{}{conflicts}\n{} -> {}\n{}\n\n{}", p["title"].as_str().unwrap_or(""), p["state"].as_str().unwrap_or(""), if p["merged"].as_bool() == Some(true) { " (merged)" } else { "" }, p["head"]["ref"].as_str().unwrap_or(""), p["base"]["ref"].as_str().unwrap_or(""), p["html_url"].as_str().unwrap_or(""), p["body"].as_str().unwrap_or(""));
             let sha = p["head"]["sha"].as_str().unwrap_or("");
             for c in api("GET", &format!("/repos/{or}/commits/{sha}/check-runs"), None)?["check_runs"].as_array().cloned().unwrap_or_default() {
                 println!("check: {} — {}", c["name"].as_str().unwrap_or(""), c["conclusion"].as_str().or(c["status"].as_str()).unwrap_or(""));
             }
         }
-        Some(other) => return Err(format!("gh pr {other}: not supported (create, list, view)")),
+        Some("merge") => pr_merge(r, &args[1..])?,
+        Some(other) => return Err(format!("gh pr {other}: not available here (create, list, view, checks, merge)")),
     }
     Ok(())
 }
@@ -610,24 +743,122 @@ fn log_cmd(r: &Repo, args: &[String]) -> R<()> {
     Ok(())
 }
 
+/// Put files back as they were in the last commit; "." means every changed file.
 fn restore(r: &Repo, paths: &[String]) -> R<()> {
     let head = r.head();
-    for p in paths {
-        let sha = head.get(p).ok_or(format!("{p}: not in the last commit"))?;
-        fs::write(r.root.join(p), r.object(sha).ok_or("content missing")?).map_err(|e| e.to_string())?;
+    let paths: Vec<String> = if paths.iter().any(|p| p == ".") {
+        let (_, m, d) = changes(&head, &r.work()?);
+        m.into_iter().chain(d).collect()
+    } else {
+        paths.to_vec()
+    };
+    if paths.is_empty() {
+        return Err("usage: git restore FILE (or git restore . for every changed file)".into());
     }
+    for p in &paths {
+        let sha = head.get(p).ok_or(format!("{p}: not in the last commit (a new file: remove it with rm {p})"))?;
+        let at = r.root.join(p);
+        if let Some(dir) = at.parent() {
+            fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        fs::write(at, r.object(sha).ok_or("content missing")?).map_err(|e| e.to_string())?;
+    }
+    println!("Restored {} file{}", paths.len(), plural(paths.len()));
     Ok(())
 }
+
+/// git checkout BRANCH: the files of a branch on GitHub.
+fn switch(r: &mut Repo, name: &str) -> R<()> {
+    if name == r.branch() {
+        println!("Already on '{name}'");
+        return Ok(());
+    }
+    ready_for(r, &format!("git checkout {name}"))?;
+    let or = r.owner_repo();
+    let commit = branch_head(&or, name)?.ok_or_else(|| no_branch(&or, name))?;
+    let (a, m, d) = sync_to(r, name, &commit)?;
+    println!("Switched to branch '{name}' (at {}; {a} new, {m} changed, {d} removed files)", short(&commit));
+    Ok(())
+}
+
+/// git merge BRANCH: merge BRANCH into the current branch on GitHub (asking the person first),
+/// then update the files.
+fn merge(r: &mut Repo, args: &[String]) -> R<()> {
+    let mut words = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "-m" {
+            it.next();
+        } else if a == "--abort" {
+            return Err("nothing to abort: a merge here either finishes on GitHub or changes nothing".into());
+        } else if !a.starts_with('-') {
+            words.push(a.trim_start_matches("origin/").to_string());
+        }
+    }
+    let from = words.first().ok_or("usage: git merge BRANCH   (brings BRANCH's commits into the current branch; asks the person first)")?;
+    let into = r.branch();
+    if *from == into {
+        return Err(format!("you are on {into}; to merge it into another branch, run git checkout OTHER first, then git merge {into}"));
+    }
+    ready_for(r, "git merge")?;
+    let or = r.owner_repo();
+    if branch_head(&or, &into)?.is_none() {
+        return Err(format!("branch {into} is not on GitHub yet. First run: git push"));
+    }
+    if branch_head(&or, from)?.is_none() {
+        return Err(no_branch(&or, from));
+    }
+    let cmp = api("GET", &format!("/repos/{or}/compare/{}...{}", url_path(&into), url_path(from)), None)?;
+    let ahead = cmp["ahead_by"].as_u64().unwrap_or(0) as usize;
+    if ahead == 0 {
+        println!("Already up to date: {into} has every commit of {from}.");
+        return Ok(());
+    }
+    let files = cmp["files"].as_array().map(|f| f.len()).unwrap_or(0);
+    let default = if into == r.default_branch() { " (the default branch)" } else { "" };
+    allowed(&format!("Merge {ahead} commit{} from {from} into {into}{default} on {or}, {files} file{} changed", plural(ahead), plural(files)), true)?;
+    let made = match api("POST", &format!("/repos/{or}/merges"), Some(json!({ "base": into, "head": from, "commit_message": format!("Merge branch '{from}' into {into}") }))) {
+        Err(e) if e.starts_with("GitHub 409") => return Err(format!("merge conflict: {from} and {into} change the same lines, so nothing was merged. Tell the person; they can resolve it on GitHub")),
+        other => other?,
+    };
+    let Some(sha) = made["sha"].as_str().map(String::from) else {
+        println!("Already up to date.");
+        return Ok(());
+    };
+    let (a, m, d) = sync_to(r, &into, &sha)?;
+    println!("Merged {from} into {into} ({}): {a} new, {m} changed, {d} removed files.", short(&sha));
+    Ok(())
+}
+
+const GIT_HELP: &str = "git here works on GitHub repositories through GitHub's API. Every command runs inside a clone.
+
+  Start:       gh repo clone OWNER/REPO, then cd REPO
+  Look:        git status   git diff   git log --oneline   git branch
+  New branch:  git checkout -b NAME          (do this before changing files)
+  Save:        git commit -m \"MESSAGE\"       (includes every change; git add is not needed)
+  Upload:      git push                      (may ask the person)
+  Update:      git pull                      (the newest version of this branch)
+  Switch:      git checkout BRANCH           (a branch on GitHub)
+  Merge:       git merge BRANCH              (BRANCH into this branch; always asks the person)
+  Undo:        git restore FILE              (or git restore . for every changed file)
+
+Pull requests and CI: gh help";
 
 fn git(args: &[String]) -> R<()> {
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("help");
     let rest = if args.is_empty() { &[][..] } else { &args[1..] };
-    if cmd == "clone" {
-        return clone(rest);
-    }
-    if matches!(cmd, "help" | "--help" | "-h") {
-        println!("git (Evolve VM, through GitHub's API): clone status diff add commit log branch checkout -b switch -c restore rm push pull remote\nRun `gh help` for pull requests and CI.");
-        return Ok(());
+    match cmd {
+        "clone" => return clone(rest),
+        "help" | "--help" | "-h" => {
+            println!("{GIT_HELP}");
+            return Ok(());
+        }
+        "init" => return Err("git init is not available: git here works on GitHub repositories. Clone one with: gh repo clone OWNER/REPO".into()),
+        "config" => {
+            eprintln!("git config: not needed here (commits are made with the person's GitHub account)");
+            return Ok(());
+        }
+        _ => {}
     }
     let mut r = Repo::find()?;
     match cmd {
@@ -636,19 +867,57 @@ fn git(args: &[String]) -> R<()> {
         "add" => Ok(()), // Every change is part of the next commit.
         "commit" => commit(&r, rest),
         "log" => log_cmd(&r, rest),
-        "push" => push(&mut r),
-        "branch" => {
-            println!("* {}", r.branch());
+        "push" => {
+            let cur = r.branch();
+            if let Some(b) = rest.iter().filter(|a| !a.starts_with('-') && *a != "origin" && *a != "HEAD").map(|a| a.trim_start_matches("HEAD:")).find(|b| *b != cur) {
+                return Err(format!("you are on branch {cur}, and git push uploads the current branch. To push {b}, first run: git checkout {b}"));
+            }
+            push(&mut r)
+        }
+        "fetch" => {
+            println!("Nothing to fetch: git pull, git checkout and git merge read GitHub directly.");
             Ok(())
         }
-        "checkout" | "switch" if rest.first().is_some_and(|a| a == "-b" || a == "-c") => {
+        "merge" => merge(&mut r, rest),
+        "branch" => {
+            let cur = r.branch();
+            if rest.iter().any(|a| a == "--show-current") {
+                println!("{cur}");
+                return Ok(());
+            }
+            if let Some(a) = rest.iter().find(|a| !matches!(a.as_str(), "-a" | "-r" | "-v" | "-vv" | "--all" | "--list" | "--remotes")) {
+                return Err(format!("git branch {a}: only listing branches works here. To start a new branch, run: git checkout -b NAME"));
+            }
+            let names = branch_names(&r.owner_repo())?;
+            if !names.contains(&cur) {
+                println!("* {cur} (not on GitHub yet; git push creates it)");
+            }
+            for n in names {
+                println!("{} {n}", if n == cur { "*" } else { " " });
+            }
+            Ok(())
+        }
+        "checkout" | "switch" if rest.first().is_some_and(|a| a == "-b" || a == "-c" || a == "-B") => {
             let name = rest.get(1).ok_or("usage: git checkout -b NAME")?;
+            if let Ok(Some(_)) = branch_head(&r.owner_repo(), name) {
+                return Err(format!("branch {name} already exists on GitHub. Switch to it with: git checkout {name} (or pick a new name)"));
+            }
             r.config["branch"] = Value::String(name.clone());
             r.save_config()?;
             println!("Switched to a new branch '{name}' (created on GitHub at the next push)");
             Ok(())
         }
-        "checkout" | "restore" => restore(&r, &rest.iter().filter(|a| *a != "--" && !a.starts_with('-')).cloned().collect::<Vec<_>>()),
+        "checkout" | "switch" => {
+            let names: Vec<String> = rest.iter().filter(|a| *a != "--" && !a.starts_with('-')).cloned().collect();
+            // `git checkout FILE` (or `-- FILE`) restores files, as in Git.
+            if cmd == "checkout" && (rest.iter().any(|a| a == "--") || names.iter().any(|p| p == "." || r.head().contains_key(p))) {
+                return restore(&r, &names);
+            }
+            let name = names.first().ok_or("usage: git checkout BRANCH (or git checkout -b NEW-BRANCH)")?;
+            switch(&mut r, name.trim_start_matches("origin/"))
+        }
+        "restore" => restore(&r, &rest.iter().filter(|a| *a != "--" && !a.starts_with('-')).cloned().collect::<Vec<_>>()),
+        "stash" => Err("git stash is not available. Commit your changes (git commit -m \"MESSAGE\") or undo them (git restore FILE)".into()),
         "rm" => {
             for p in rest.iter().filter(|a| !a.starts_with('-')) {
                 fs::remove_file(r.root.join(p)).map_err(|e| format!("{p}: {e}"))?;
@@ -660,35 +929,34 @@ fn git(args: &[String]) -> R<()> {
             Ok(())
         }
         "pull" => {
-            let (a, m, d) = changes(&r.head(), &r.work()?);
-            if !(a.is_empty() && m.is_empty() && d.is_empty() && r.log().is_empty()) {
-                return Err("commit and push (or restore) your changes before pulling".into());
+            let branch = r.branch();
+            if let Some(b) = rest.iter().filter(|a| !a.starts_with('-') && *a != "origin").find(|b| **b != branch) {
+                return Err(format!("git pull updates this branch ({branch}) only. To bring {b}'s commits into it, run: git merge {b}"));
             }
-            let (owner, repo) = (r.config["owner"].as_str().unwrap().to_string(), r.config["repo"].as_str().unwrap().to_string());
-            let b = api("GET", &format!("/repos/{owner}/{repo}/branches/{}", r.branch()), None)?;
-            let commit = b["commit"]["sha"].as_str().unwrap_or("").to_string();
+            ready_for(&r, "git pull")?;
+            let commit = branch_head(&r.owner_repo(), &branch)?.ok_or(format!("branch {branch} is not on GitHub yet; git push creates it"))?;
             if Some(commit.as_str()) == r.config["upstream"]["commit"].as_str() {
                 println!("Already up to date.");
                 return Ok(());
             }
-            let (files, tree, _) = tree_of(&owner, &repo, &commit)?;
-            let new: BTreeMap<String, String> = files.iter().map(|(p, s, _)| (p.clone(), s.clone())).collect();
-            let (a, m, d) = changes(&r.head(), &new);
-            let fetch: Vec<_> = files.iter().filter(|(p, _, _)| a.contains(p) || m.contains(p)).cloned().collect();
-            download(&owner, &repo, &commit, r.config["private"].as_bool().unwrap_or(false), &fetch, &r.root, &r.state("objects"))?;
-            for p in &d {
-                let _ = fs::remove_file(r.root.join(p));
-            }
-            r.save_head(&new)?;
-            fs::write(r.state("upstream.json"), serde_json::to_string(&new).unwrap()).map_err(|e| e.to_string())?;
-            r.config["upstream"] = json!({ "branch": r.branch(), "commit": commit, "tree": tree });
-            r.save_config()?;
-            println!("Updated to {} ({} new, {} changed, {} removed)", short(&commit), a.len(), m.len(), d.len());
+            let (a, m, d) = sync_to(&mut r, &branch, &commit)?;
+            println!("Updated {branch} to {} ({a} new, {m} changed, {d} removed)", short(&commit));
             Ok(())
         }
-        other => Err(format!("git {other}: not supported here (see `git help`)")),
+        other => Err(format!("git {other}: not available here. Run git help for the commands that work")),
     }
 }
+
+const GH_HELP: &str = "gh here works on GitHub through its API.
+
+  gh repo clone OWNER/REPO [DIR] [--branch B]    gh repo list [OWNER]    gh auth status
+  gh pr create --title \"TITLE\" --body \"TEXT\" [--base BRANCH]   (push first; may ask the person)
+  gh pr list            gh pr view [NUMBER]       gh pr checks [NUMBER]
+  gh pr merge [NUMBER] [--squash|--rebase]        (always asks the person; no NUMBER = this branch's pull request)
+  gh run list [--branch B]    gh run view RUN_ID  (CI results: failed steps and errors)
+  gh api PATH
+
+Local work (git status, diff, commit, push, pull, checkout, merge): git help";
 
 fn gh(args: &[String]) -> R<()> {
     match (args.first().map(|s| s.as_str()), args.get(1).map(|s| s.as_str())) {
@@ -723,7 +991,7 @@ fn gh(args: &[String]) -> R<()> {
             Ok(())
         }
         _ => {
-            println!("gh (Evolve VM, through GitHub's API):\n  gh repo clone OWNER/REPO [DIR] [--branch B]   gh repo list [OWNER]   gh auth status\n  gh pr create --title T [--body B] [--base B]   gh pr list   gh pr view N\n  gh run list [--branch B]   gh run view ID   gh api PATH\nLocal work: git status, diff, commit -m, log, checkout -b, push, pull (see `git help`).");
+            println!("{GH_HELP}");
             Ok(())
         }
     }

@@ -103,11 +103,24 @@ fn lex(line: &str) -> Result<Vec<Tok>, String> {
     while i < c.len() {
         let ch = c[i];
         match ch {
-            ' ' | '\t' | '\n' => {
+            ' ' | '\t' => {
                 end_word!();
                 i += 1;
             }
-            '#' if !in_word => break,
+            '\n' => {
+                // An unquoted newline ends a command, as `;` does, unless an operator continues it.
+                end_word!();
+                if !matches!(toks.last(), None | Some(Tok::Op("|" | "&&" | "||" | ";" | "&"))) {
+                    toks.push(Tok::Op(";"));
+                }
+                i += 1;
+            }
+            // A comment runs to the end of its line.
+            '#' if !in_word => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+            }
             '\'' => {
                 in_word = true;
                 flush_lit!(false);
@@ -843,6 +856,9 @@ fn main() {
         let _ = env::set_current_dir(p);
     }
     let mut vars: BTreeMap<String, String> = env::vars().collect();
+    // Commands the page runs for Pi ask the shell where it ended up, so a `cd` carries over to the
+    // next command. Not passed on: a nested shell's directory is not this one's.
+    let cwd_file = vars.remove("EVOLVE_CWD_FILE");
     vars.entry("PATH".into()).or_insert_with(|| "/bin:/usr/bin".into());
     vars.entry("HOME".into()).or_insert_with(|| "/home/user".into());
     vars.insert("PWD".into(), cwd());
@@ -852,6 +868,9 @@ fn main() {
         Some("-c") => {
             sh.args = std::iter::once(args.get(3).cloned().unwrap_or("sh".into())).chain(args.iter().skip(4).cloned()).collect();
             sh.run_line(args.get(2).map(|s| s.as_str()).unwrap_or(""));
+            if let Some(f) = &cwd_file {
+                let _ = fs::write(f, cwd());
+            }
             sh.exit.unwrap_or(sh.status)
         }
         Some(script) => match fs::read_to_string(script) {
@@ -915,6 +934,9 @@ mod tests {
         assert_eq!(first.args.len(), 4);
         assert_eq!(l[0].0[1].redirs.len(), 2);
         assert!(lex("echo 'open").is_err());
+        // Lines are commands; a newline after && continues; comments end at the line's end.
+        let l = parse(lex("cd app # go in\ngit status &&\n  git diff\necho 'a\nb'").unwrap()).unwrap();
+        assert_eq!(l.iter().map(|(p, op)| (p[0].args.len(), *op)).collect::<Vec<_>>(), vec![(2, ";"), (2, "&&"), (2, ";"), (2, ";")]);
         assert!(glob_match(&"*.r[sx]".chars().collect::<Vec<_>>(), &"main.rs".chars().collect::<Vec<_>>()));
         assert!(!glob_match(&"[!m]*".chars().collect::<Vec<_>>(), &"main".chars().collect::<Vec<_>>()));
     }

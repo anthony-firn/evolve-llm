@@ -12,7 +12,9 @@ def check(runtime):
     browser=kind.launch();page=browser.new_page();remote=[]
     page.on('request',lambda r:remote.append(r.url) if not r.url.startswith('http://127.0.0.1:') else None)
     page.goto(f'http://127.0.0.1:{server.server_address[1]}/play/evolve-llm/')
-    page.locator('#open-terminal').click();page.wait_for_function("() => document.querySelector('#terminal-status')?.textContent.startsWith('Ready')")
+    page.locator('#open-terminal').click();page.locator('#workbench').wait_for()
+    if page.locator('#linux-terminal-toggle').is_visible():page.locator('#linux-terminal-toggle').click()  # to the browser sandbox (the only terminal without JSPI)
+    page.wait_for_function("() => document.querySelector('#terminal-status')?.textContent.startsWith('Ready')")
     page.locator('#terminal-input').fill('demo snake');page.locator('.terminal-form button[type=submit]').click()
     page.wait_for_function("() => !document.querySelector('.terminal-form button[type=submit]').disabled",timeout=20000)
     log=page.locator('.terminal-log').inner_text();assert '"ok": true' in log,(kind.name,log)
@@ -43,6 +45,7 @@ def check(runtime):
       const workbench=await mountWorkbench({ready:()=>true,lease:()=>()=>{},getNetwork:()=>({enabled:false}),setNetwork:()=>{},modelName:()=> 'Scripted transport fixture',turn:async()=>{
         round++;if(round>3)throw new Error('Model called after final preview');return {text:round===1?'<tool_call>'+JSON.stringify({name:'write',arguments:{path:'/workspace/fixture-game.html',text:html}})+'</tool_call>':round===2?'<tool_call>'+JSON.stringify({name:'browser_test',arguments:{path:'/workspace/fixture-game.html'}})+'</tool_call>':'<tool_call>'+JSON.stringify({name:'preview',arguments:{path:'/workspace/fixture-game.html'}})+'</tool_call>',reason:'end'};
       }});await workbench.open();
+      const sandbox=document.querySelector('#linux-terminal-toggle');if(!sandbox.hidden)sandbox.click();
     }''')
     page.locator('#terminal-input').fill('pi Create and test a game');page.locator('.terminal-form button[type=submit]').click()
     page.wait_for_function("() => !document.querySelector('.terminal-form button[type=submit]').disabled",timeout=30000)

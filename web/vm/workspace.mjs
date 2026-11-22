@@ -25,11 +25,13 @@ export class VmWorkspace {
     if (type === 'exec') {
       const r = await this.vm.exec(data.command, { cwd: this.cwd, timeoutMs: this.timeoutMs });
       signal?.throwIfAborted();
+      // A `cd` carries over to the next command and to file paths, as in a terminal.
+      if (r.cwd) this.cwd = r.cwd;
       return { code: r.code, stdout: r.stdout, stderr: r.stderr, cwd: this.cwd, ...(r.timedOut && { timedOut: true }), ...(r.truncated && { truncated: true }) };
     }
     if (type === 'read') {
       const r = await this.vm.read(this.path(data.path));
-      if (!r.ok) throw new Error(r.kind === 3 ? `${data.path} is a directory` : `${data.path}: no such file`);
+      if (!r.ok) throw new Error(r.kind === 3 ? `${data.path} is a directory; run ls ${data.path} to see its files` : `${data.path}: no such file in ${this.cwd}; run ls to see the files here`);
       return { path: this.path(data.path), text: r.data };
     }
     if (type === 'write') {
@@ -39,9 +41,9 @@ export class VmWorkspace {
     if (type === 'edit') {
       const path = this.path(data.path);
       const r = await this.vm.read(path);
-      if (!r.ok) throw new Error(`${data.path}: no such file`);
+      if (!r.ok) throw new Error(`${data.path}: no such file in ${this.cwd}; run ls to see the files here`);
       const count = data.oldText ? r.data.split(data.oldText).length - 1 : 0;
-      if (count !== 1) throw new Error(count ? `oldText matches ${count} places in ${data.path}; include more context` : `oldText is not in ${data.path}; read the file again`);
+      if (count !== 1) throw new Error(count ? `oldText matches ${count} places in ${data.path}; include more context` : `oldText is not in ${data.path}; read the file again and copy the exact text`);
       await this.vm.write(path, r.data.replace(data.oldText, () => data.newText ?? ''));
       return { path, replaced: 1 };
     }
