@@ -783,15 +783,17 @@ fn pr_number(r: &Repo, args: &[String], verb: &str) -> R<String> {
         Some(n) => Ok(n.to_string()),
         // The open pull requests and their numbers are in the error, so the next command can be right.
         None => {
-            let what = match given {
-                Some(g) => format!("{g} is not a pull request number or a branch with an open pull request"),
-                None => format!("no open pull request for branch {branch}"),
-            };
+            // Lead with what to run: "no open pull request for branch main" reads as "nothing to
+            // merge" to a small model that was asked to merge #1.
             let open = api("GET", &format!("/repos/{}/pulls?state=open&per_page=10", r.owner_repo()), None)?.as_array().cloned().unwrap_or_default();
             let list: Vec<String> = open.iter().map(|p| format!("#{} \"{}\" ({} into {})", p["number"], p["title"].as_str().unwrap_or(""), p["head"]["ref"].as_str().unwrap_or(""), p["base"]["ref"].as_str().unwrap_or(""))).collect();
+            let which = match given {
+                Some(g) => format!("{g} is not a pull request number. Which pull request?"),
+                None => "which pull request?".to_string(),
+            };
             match open.first() {
-                Some(p) => Err(format!("{what}. Give its number, as in: gh pr {verb} {}. Open pull requests on {}: {}", p["number"], r.owner_repo(), list.join("; "))),
-                None => Err(format!("{what}, and {} has no open pull requests. Open one with: gh pr create --title \"TITLE\"", r.owner_repo())),
+                Some(p) => Err(format!("{which} Give its number: gh pr {verb} {} (open pull requests on {}: {})", p["number"], r.owner_repo(), list.join("; "))),
+                None => Err(format!("{} has no open pull requests (branch {branch} has none either). Open one with: gh pr create --title \"TITLE\"", r.owner_repo())),
             }
         }
     }
