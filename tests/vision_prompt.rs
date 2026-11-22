@@ -67,7 +67,7 @@ fn hidden_states_with_positions_match_tokens() {
 fn qwen3vl_names_the_colour_it_sees() {
     use evolve_llm::gpu::vision::VisionGpu;
     use evolve_llm::sampler::SamplerConfig;
-    use evolve_llm::session::{ImageInput, Session};
+    use evolve_llm::session::Session;
     let (text, proj) = ("Qwen3VL-2B-Instruct-Q4_K_M.gguf", "mmproj-Qwen3VL-2B-Instruct-F16.gguf");
     let (Ok(proj_bytes), Some((e, bytes))) = (std::fs::read(models_dir().join(proj)), engine(text)) else {
         eprintln!("skipping: {text} and {proj}, or a GPU, are missing");
@@ -89,21 +89,13 @@ fn qwen3vl_names_the_colour_it_sees() {
                 img[(y * w + x) * 3..(y * w + x) * 3 + 3].copy_from_slice(&rgb);
             }
         }
-        let cpu_cfg = vision.cfg.clone();
-        let px = evolve_llm::vision::patches_for(&cpu_cfg, &img, w, h).unwrap();
-        let enc = pollster::block_on(vision.encode(&px)).unwrap();
-        let (rows, cols) = (px.grid_h / 2, px.grid_w / 2);
         let prompt = "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>What color is the square? Answer with one word.<|im_end|>\n<|im_start|>assistant\n";
-        let mut tokens = Vec::new();
-        for t in s.encode_prompt(prompt) {
-            if t == pad[0] {
-                tokens.extend(std::iter::repeat_n(pad[0], rows * cols));
-            } else {
-                tokens.push(t);
-            }
-        }
-        let image = ImageInput { embeddings: enc.embeddings, rows, cols, deepstack: enc.deepstack };
-        pollster::block_on(s.prefill_images(&tokens, pad[0], &[image])).unwrap();
+        let tokens = s.encode_prompt(prompt);
+        // Text that spells out a second placeholder does not shift the image.
+        let mut two = tokens.clone();
+        two.insert(3, pad[0]);
+        assert!(pollster::block_on(s.prefill_rgb(&two, &vision, &[(&img, w, h)])).is_err());
+        pollster::block_on(s.prefill_rgb(&tokens, &vision, &[(&img, w, h)])).unwrap();
         let mut out = Vec::new();
         for _ in 0..6 {
             let t = pollster::block_on(s.next()).unwrap();

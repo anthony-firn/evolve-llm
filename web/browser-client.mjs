@@ -614,6 +614,8 @@ export class BrowserClient extends EventTarget {
   select(ref, value) { return this._agent('agentSelect', { ref, value: String(value) }, 'select'); }
   scroll(dy) { return this._agent('agentScroll', { dy: Number(dy) || 0 }, 'scroll'); }
   key(key) { return this._agent('agentKey', { key: String(key) }, 'key'); }
+  /** The page as drawn, for a vision model: { rgb, width, height }, sides multiples of unit. */
+  screenshot({ unit = 32, maxSide = 1024 } = {}) { return this.request('screenshot', { unit, maxSide }, { timeoutMs: this._agentTimeoutMs }); }
 
   /** Resolves once loading has finished and no engine events arrived for quietMs (or on timeout). */
   waitForIdle(timeoutMs = 15000, quietMs = 500) {

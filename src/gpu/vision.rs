@@ -220,8 +220,9 @@ struct Mat {
     m: usize,
 }
 
-pub struct VisionGpu<'g> {
-    gpu: &'g Gpu,
+pub struct VisionGpu {
+    /// The device the language model runs on, shared (wgpu handles are reference counted).
+    gpu: Gpu,
     pub cfg: VisionConfig,
     mats: HashMap<String, Mat>,
     vecs: HashMap<String, wgpu::Buffer>,
@@ -246,10 +247,11 @@ fn groups(n: usize) -> (u32, u32) {
     (x as u32, wg.div_ceil(x) as u32)
 }
 
-impl<'g> VisionGpu<'g> {
+impl VisionGpu {
     /// Upload the encoder from a whole mmproj file. Matrices must be F16, vectors F32 (as in
     /// llama.cpp's f16 mmproj files).
-    pub fn load(gpu: &'g Gpu, bytes_all: &[u8]) -> Result<Self, String> {
+    pub fn load(gpu: &Gpu, bytes_all: &[u8]) -> Result<Self, String> {
+        let gpu = gpu.clone();
         let g: Gguf = parse(bytes_all).map_err(|e| e.to_string())?;
         let cfg = VisionConfig::read(&g)?;
         let dev = &gpu.device;
@@ -480,7 +482,7 @@ impl<'g> VisionGpu<'g> {
                 self.merger(&mut enc, &x, &wide_tmp, &m0, &deep_out[j], n, None, Some(&format!("{p}.norm")), (&format!("{p}.fc1"), &format!("{p}.fc2")));
             }
             self.gpu.queue.submit([enc.finish()]);
-            wait_idle(self.gpu).await?;
+            wait_idle(&self.gpu).await?;
         }
         // The merger: normalized patches, four side by side, linear, GELU, linear.
         let out = self.buffer("out", tokens * out_dim);
@@ -492,7 +494,7 @@ impl<'g> VisionGpu<'g> {
             enc.copy_buffer_to_buffer(b, 0, &staging, j as u64 * size, size);
         }
         self.gpu.queue.submit([enc.finish()]);
-        let all = f32s(&read_back(self.gpu, &staging, size * (1 + deep_out.len() as u64)).await?);
+        let all = f32s(&read_back(&self.gpu, &staging, size * (1 + deep_out.len() as u64)).await?);
         let raster = |merged: &[f32]| {
             let mut r = vec![0f32; merged.len()];
             for (k, &u) in order.iter().enumerate() {

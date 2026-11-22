@@ -390,6 +390,7 @@ impl Loader {
         Ok(Chat {
             inner: Rc::new(RefCell::new(session)),
             decoder: RefCell::new(StreamDecoder::default()),
+            vision: RefCell::new(None),
         })
     }
 }
@@ -443,6 +444,8 @@ impl Layers {
 pub struct Chat {
     inner: Rc<RefCell<Session>>,
     decoder: RefCell<StreamDecoder>,
+    /// The image encoder (an mmproj file), when one is attached.
+    vision: RefCell<Option<Rc<crate::gpu::vision::VisionGpu>>>,
 }
 
 #[derive(Serialize)]
@@ -513,6 +516,45 @@ impl Chat {
                 .try_borrow_mut()
                 .map_err(|_| err("the model is busy"))?;
             let p = s.prefill(&tokens).await.map_err(err)?;
+            Ok(JsValue::from_str(&json(&p)))
+        })
+    }
+
+    /// Load an image encoder (llama.cpp mmproj GGUF) on the chat's GPU. Returns the size images'
+    /// sides must be multiples of.
+    pub fn attach_vision(&self, bytes: &[u8]) -> Result<u32, JsValue> {
+        let s = self.inner.borrow();
+        if s.image_pad().is_none() {
+            return Err(err("this model does not read images"));
+        }
+        let v = crate::gpu::vision::VisionGpu::load(&s.engine.gpu, bytes).map_err(err)?;
+        let unit = v.cfg.unit() as u32;
+        drop(s);
+        *self.vision.borrow_mut() = Some(Rc::new(v));
+        Ok(unit)
+    }
+
+    /// `prefill` for a prompt with one <|image_pad|> per image: `rgb` holds the images' pixels
+    /// one after another (3 bytes each), `sizes` each one's width and height. Resolves to JSON
+    /// `{reused, computed}`.
+    pub fn prefill_images(&self, tokens: Vec<u32>, rgb: Vec<u8>, sizes: Vec<u32>) -> js_sys::Promise {
+        let inner = self.inner.clone();
+        let vision = self.vision.borrow().clone();
+        self.decoder.borrow_mut().flush();
+        wasm_bindgen_futures::future_to_promise(async move {
+            let vision = vision.ok_or_else(|| err("no image encoder is attached"))?;
+            let mut images = Vec::new();
+            let mut at = 0usize;
+            for wh in sizes.chunks_exact(2) {
+                let n = wh[0] as usize * wh[1] as usize * 3;
+                let px = rgb.get(at..at + n).ok_or_else(|| err("the pixels do not match the image sizes"))?;
+                images.push((px, wh[0] as usize, wh[1] as usize));
+                at += n;
+            }
+            let mut s = inner
+                .try_borrow_mut()
+                .map_err(|_| err("the model is busy"))?;
+            let p = s.prefill_rgb(&tokens, &vision, &images).await.map_err(err)?;
             Ok(JsValue::from_str(&json(&p)))
         })
     }

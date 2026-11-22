@@ -7,6 +7,8 @@
  * back. The worker also sends { type: 'events', events }, { type: 'ready' }, { type: 'crashed' }.
  */
 
+import { fitImage } from './images.mjs';
+
 const AGENT = { snapshot: 'snapshot', agentClick: 'agentClick', agentType: 'agentType', agentSelect: 'agentSelect', agentScroll: 'agentScroll', agentKey: 'agentKey' };
 
 /**
@@ -29,6 +31,8 @@ export function createBrowserHost({ load, post, now = () => performance.now(), s
   let timer = null;
   let starting = null;
   let size = { width: 1280, height: 800, dpr: 1 };
+  // The last frame drawn, kept for screenshots (also when no canvas shows it).
+  let frame = null;
 
   const isPanic = (e) => (typeof WebAssembly !== 'undefined' && e instanceof WebAssembly.RuntimeError) || /unreachable|RuntimeError|already borrowed|panicked/i.test(String(e && (e.message || e)));
 
@@ -60,7 +64,9 @@ export function createBrowserHost({ load, post, now = () => performance.now(), s
     const pixels = browser.takeFrame();
     if (!pixels) return false;
     const width = browser.frameWidth(), height = browser.frameHeight();
-    if (!ctx || !width || !height || pixels.length !== width * height * 4) return false;
+    if (!width || !height || pixels.length !== width * height * 4) return false;
+    frame = { pixels, width, height };
+    if (!ctx) return false;
     if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
     const data = new Uint8ClampedArray(pixels.buffer, pixels.byteOffset, pixels.byteLength);
     ctx.putImageData(new ImageData(data, width, height), 0, 0);
@@ -139,6 +145,12 @@ export function createBrowserHost({ load, post, now = () => performance.now(), s
     agentSelect: (b, m) => JSON.parse(b.agentSelect(m.ref, String(m.value))),
     agentScroll: (b, m) => JSON.parse(b.agentScroll(m.dy)),
     agentKey: (b, m) => JSON.parse(b.agentKey(String(m.key))),
+    // The page as drawn, sized for a vision model: { rgb, width, height }.
+    screenshot: (b, m) => {
+      draw();
+      if (!frame) throw new Error('The page has not been drawn yet.');
+      return fitImage(frame.pixels, frame.width, frame.height, { unit: m.unit || 32, maxSide: m.maxSide || 1024 });
+    },
   };
 
   async function handle(message) {

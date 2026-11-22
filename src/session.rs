@@ -203,6 +203,43 @@ impl Session {
         }
     }
 
+    /// The token chat templates write for an image (Qwen-VL's <|image_pad|>), if the model has one.
+    pub fn image_pad(&self) -> Option<u32> {
+        let p = self.tok.encode("<|image_pad|>", false, true);
+        (p.len() == 1).then(|| p[0])
+    }
+
+    /// `prefill_images` for a prompt as a chat template writes it, with one placeholder token
+    /// per image: encodes each image (RGB bytes, width, height; sides multiples of the encoder's
+    /// unit) and gives it as many placeholder tokens as it has merged patches. A placeholder
+    /// count that does not match the images (text that spells out the placeholder) is refused.
+    pub async fn prefill_rgb(&mut self, tokens: &[u32], vision: &crate::gpu::vision::VisionGpu, images: &[(&[u8], usize, usize)]) -> Result<Prefill, String> {
+        let pad = self.image_pad().ok_or("this model has no image placeholder token")?;
+        let found = tokens.iter().filter(|&&t| t == pad).count();
+        if found != images.len() {
+            return Err(format!("the prompt has {found} image placeholders for {} images", images.len()));
+        }
+        let merge = vision.cfg.unit() / vision.cfg.patch;
+        let mut inputs = Vec::with_capacity(images.len());
+        for &(rgb, w, h) in images {
+            let px = crate::vision::patches_for(&vision.cfg, rgb, w, h)?;
+            let enc = vision.encode(&px).await?;
+            inputs.push(ImageInput { embeddings: enc.embeddings, rows: px.grid_h / merge, cols: px.grid_w / merge, deepstack: enc.deepstack });
+        }
+        let mut expanded = Vec::with_capacity(tokens.len() + inputs.iter().map(|i| i.rows * i.cols).sum::<usize>());
+        let mut next = inputs.iter();
+        for &t in tokens {
+            match next.len() {
+                _ if t != pad => expanded.push(t),
+                _ => {
+                    let i = next.next().ok_or("more image placeholders than images")?;
+                    expanded.extend(std::iter::repeat_n(pad, i.rows * i.cols));
+                }
+            }
+        }
+        self.prefill_images(&expanded, pad, &inputs).await
+    }
+
     /// Bring the cache to `tokens`, where each run of `pad` tokens takes the next image's
     /// embeddings (rows x cols tokens). Text keeps one position per token; an image's tokens are
     /// at (start, start + row, start + col) in (time, height, width), and the text after it

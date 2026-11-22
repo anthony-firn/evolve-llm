@@ -157,7 +157,9 @@ function catalogEntry(m) {
   // Models marked `stream` are read from Hugging Face as they run instead of downloaded.
   const stream = Boolean(m.stream) && !cachedEntry(key)?.complete;
   // Streamed models always list their parts: each part's SHA-256 names its swarm.
-  return { kind: 'hf', id: m.id, key, repo: m.repo, file: m.file, revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, name: m.name, resolve: split || stream, stream };
+  // A vision model's image encoder is stored beside it, under the model's key.
+  const vision = m.vision ? { key: `${key}.vision`, file: m.vision.file, url: hfUrl(m.vision.repo || m.repo, m.vision.file), bytes: m.vision.bytes } : null;
+  return { kind: 'hf', id: m.id, key, repo: m.repo, file: m.file, revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, name: m.name, resolve: split || stream, stream, vision };
 }
 
 const ALL = [...MODELS, ...LARGE];
