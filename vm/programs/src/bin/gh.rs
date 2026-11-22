@@ -658,8 +658,23 @@ fn push(r: &mut Repo) -> R<()> {
 
 /// A pull request's number from `12`, `#12`, its URL or a branch name; with none, the open pull
 /// request of the current branch.
-fn pr_number(r: &Repo, args: &[String]) -> R<String> {
-    let given = args.iter().find(|a| !a.starts_with('-'));
+/// Flags of gh pr merge and gh pr view that take a value, so the value is not taken for the
+/// pull request (`gh pr merge -b "Merge #1"`).
+const PR_VALUE_FLAGS: &[&str] = &["-b", "--body", "-t", "--subject", "--title", "-F", "--body-file", "--match-head-commit", "-A", "--author-email", "--json", "-q", "--jq", "--template"];
+
+fn pr_number(r: &Repo, args: &[String], verb: &str) -> R<String> {
+    let mut given = None;
+    let mut i = 0;
+    while i < args.len() {
+        if PR_VALUE_FLAGS.contains(&args[i].as_str()) {
+            i += 2;
+        } else if args[i].starts_with('-') {
+            i += 1;
+        } else {
+            given = Some(&args[i]);
+            break;
+        }
+    }
     if let Some(n) = given.map(|a| a.trim_start_matches('#').rsplit('/').next().unwrap_or("").to_string()).filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
         return Ok(n);
     }
@@ -667,7 +682,19 @@ fn pr_number(r: &Repo, args: &[String]) -> R<String> {
     let open = api("GET", &format!("/repos/{}/pulls?state=open&head={}:{}", r.owner_repo(), r.config["owner"].as_str().unwrap_or(""), url_path(&branch)), None)?;
     match open.as_array().and_then(|a| a.first()).and_then(|p| p["number"].as_u64()) {
         Some(n) => Ok(n.to_string()),
-        None => Err(format!("no open pull request for branch {branch}. Open one with: gh pr create --title \"TITLE\" (or run gh pr list to see the numbers)")),
+        // The open pull requests and their numbers are in the error, so the next command can be right.
+        None => {
+            let what = match given {
+                Some(g) => format!("{g} is not a pull request number or a branch with an open pull request"),
+                None => format!("no open pull request for branch {branch}"),
+            };
+            let open = api("GET", &format!("/repos/{}/pulls?state=open&per_page=10", r.owner_repo()), None)?.as_array().cloned().unwrap_or_default();
+            let list: Vec<String> = open.iter().map(|p| format!("#{} \"{}\" ({} into {})", p["number"], p["title"].as_str().unwrap_or(""), p["head"]["ref"].as_str().unwrap_or(""), p["base"]["ref"].as_str().unwrap_or(""))).collect();
+            match open.first() {
+                Some(p) => Err(format!("{what}. Give its number, as in: gh pr {verb} {}. Open pull requests on {}: {}", p["number"], r.owner_repo(), list.join("; "))),
+                None => Err(format!("{what}, and {} has no open pull requests. Open one with: gh pr create --title \"TITLE\"", r.owner_repo())),
+            }
+        }
     }
 }
 
@@ -685,7 +712,7 @@ fn checks_summary(or: &str, sha: &str) -> R<String> {
 /// gh pr merge: merge a pull request on GitHub. Always asks the person first.
 fn pr_merge(r: &Repo, args: &[String]) -> R<()> {
     let or = r.owner_repo();
-    let n = pr_number(r, args)?;
+    let n = pr_number(r, args, "merge")?;
     let p = api("GET", &format!("/repos/{or}/pulls/{n}"), None)?;
     if p["merged"].as_bool() == Some(true) {
         println!("Pull request #{n} is already merged.");
@@ -748,8 +775,8 @@ fn pr(r: &Repo, args: &[String]) -> R<()> {
                 println!("#{}\t{}\t{} -> {}", p["number"], p["title"].as_str().unwrap_or(""), p["head"]["ref"].as_str().unwrap_or(""), p["base"]["ref"].as_str().unwrap_or(""));
             }
         }
-        Some("view") | Some("checks") => {
-            let n = pr_number(r, &args[1..])?;
+        Some(verb @ ("view" | "checks")) => {
+            let n = pr_number(r, &args[1..], verb)?;
             let p = api("GET", &format!("/repos/{or}/pulls/{n}"), None)?;
             let conflicts = if p["mergeable"].as_bool() == Some(false) { " (has merge conflicts)" } else { "" };
             println!("#{n} {}\nstate: {}{}{conflicts}\n{} -> {}\n{}\n\n{}", p["title"].as_str().unwrap_or(""), p["state"].as_str().unwrap_or(""), if p["merged"].as_bool() == Some(true) { " (merged)" } else { "" }, p["head"]["ref"].as_str().unwrap_or(""), p["base"]["ref"].as_str().unwrap_or(""), p["html_url"].as_str().unwrap_or(""), p["body"].as_str().unwrap_or(""));

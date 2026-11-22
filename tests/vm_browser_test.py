@@ -39,6 +39,7 @@ CASES = [
     # echo reads backslash escapes as dash does (-E does not); edit takes an optional line number.
     ("echo 'a\\nb' && echo -E 'c\\nd' && echo -n x && echo 'y\\cz'", 0, "a\nb\nc\\nd\nxy"),
     ("printf 'one\\ntwo\\n' > l.txt && edit l.txt 2 two 2 && cat l.txt && rm l.txt", 0, "edited l.txt\none\n2\n"),
+    ("printf 'one\\n' > s.txt; edit s.txt one one 2>&1; echo status=$?; rm s.txt", 0, "edit: OLD and NEW are the same, so nothing would change. Show the lines with grep -n \"WORDS\" -A3 s.txt, then edit s.txt 'exact old text' 'corrected text'\nstatus=1\n"),
     ("read notes.txt 2>&1; echo status=$?", 0, "read: notes.txt is not a variable name (read takes a line of input; to show a file, use: cat notes.txt)\nstatus=2\n"),
     # python3: RustPython, loaded on first use; scripts, the standard library and unittest.
     ("python3 -c 'import json; print(json.dumps({\"sum\": 2 + 3}))'", 0, '{"sum": 5}\n'),

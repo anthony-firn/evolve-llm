@@ -42,6 +42,7 @@ export class VmWorkspace {
       const path = this.path(data.path);
       const r = await this.vm.read(path);
       if (!r.ok) throw new Error(`${data.path}: no such file in ${this.cwd}; run ls to see the files here`);
+      if (data.oldText && data.oldText === (data.newText ?? '')) throw new Error('oldText and newText are the same, so nothing would change. Put the corrected text in newText.');
       const count = data.oldText ? r.data.split(data.oldText).length - 1 : 0;
       if (count !== 1) throw new Error(count ? `oldText matches ${count} places in ${data.path}; include more context` : `oldText is not in ${data.path}; read the file again and copy the exact text`);
       await this.vm.write(path, r.data.replace(data.oldText, () => data.newText ?? ''));

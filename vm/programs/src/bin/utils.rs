@@ -697,6 +697,9 @@ fn run(name: &str, args: &[String]) -> R {
             if old.is_empty() {
                 return Err("edit: OLD is empty: give the exact text to replace".into());
             }
+            if old == new {
+                return Err(format!("edit: OLD and NEW are the same, so nothing would change. Show the lines with grep -n \"WORDS\" -A3 {file}, then edit {file} 'exact old text' 'corrected text'"));
+            }
             let text = fs::read_to_string(file).map_err(|e| err(e, file))?;
             match text.matches(old.as_str()).count() {
                 1 => {

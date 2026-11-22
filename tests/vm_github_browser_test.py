@@ -356,6 +356,9 @@ def main():
         check(code == 0 and out.startswith("#2 Fix it"), f"gh pr works outside a clone with GH_REPO ({out!r} {err!r})")
         code, out, err = sh("cd / && gh pr view 2 -R demo/app && gh pr merge 2 --repo demo/app")
         check(code == 0 and "#2 Fix it" in out and "already merged" in out, f"gh pr works outside a clone with -R ({out!r} {err!r})")
+        # Without a number: -b's value is not taken for the pull request, and the error lists the open ones.
+        code, out, err = sh("cd / && GH_REPO=demo/app gh pr merge -b 'Merge pull request #1'")
+        check(code == 1 and "no open pull request for branch main" in err and "as in: gh pr merge 1." in err and '#1 "Change things" (feature into main)' in err, f"gh pr merge without a number lists the open pull requests ({err!r})")
 
         # A conflict: nothing changes, and the message says what to do.
         c = FAKE.refs["main"]
