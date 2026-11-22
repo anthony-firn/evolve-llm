@@ -278,6 +278,51 @@ fn sync_to(r: &mut Repo, branch: &str, commit: &str) -> R<(usize, usize, usize)>
     Ok((a.len(), m.len(), d.len()))
 }
 
+/// Lines added and removed between two texts (by their longest common subsequence; for very long
+/// files, only the change in length).
+fn line_stats(a: &[u8], b: &[u8]) -> (usize, usize) {
+    let (a, b) = (String::from_utf8_lossy(a), String::from_utf8_lossy(b));
+    let x: Vec<&str> = a.lines().collect();
+    let y: Vec<&str> = b.lines().collect();
+    let (n, m) = (x.len(), y.len());
+    if n * m > 16_000_000 {
+        return (m.saturating_sub(n), n.saturating_sub(m));
+    }
+    let mut next = vec![0u32; m + 1];
+    for i in (0..n).rev() {
+        let mut row = vec![0u32; m + 1];
+        for j in (0..m).rev() {
+            row[j] = if x[i] == y[j] { next[j + 1] + 1 } else { next[j].max(row[j + 1]) };
+        }
+        next = row;
+    }
+    let same = next[0] as usize;
+    (m - same, n - same)
+}
+
+/// "README.md +1 -311, new.txt +3": what changed between two trees, for a person deciding.
+fn change_summary(r: &Repo, from: &BTreeMap<String, String>, to: &BTreeMap<String, String>) -> String {
+    let (a, m, d) = changes(from, to);
+    let mut parts: Vec<String> = Vec::new();
+    for p in &m {
+        let (plus, minus) = line_stats(&r.object(&from[p]).unwrap_or_default(), &r.object(&to[p]).unwrap_or_default());
+        parts.push(format!("{p} +{plus} -{minus}"));
+    }
+    for p in &a {
+        let n = String::from_utf8_lossy(&r.object(&to[p]).unwrap_or_default()).lines().count();
+        parts.push(format!("{p} new, {n} line{}", plural(n)));
+    }
+    for p in &d {
+        parts.push(format!("{p} deleted"));
+    }
+    let more = parts.len().saturating_sub(4);
+    parts.truncate(4);
+    if more > 0 {
+        parts.push(format!("and {more} more"));
+    }
+    parts.join(", ")
+}
+
 /// (added, modified, deleted) between two path -> hash maps.
 fn changes(from: &BTreeMap<String, String>, to: &BTreeMap<String, String>) -> (Vec<String>, Vec<String>, Vec<String>) {
     let added = to.keys().filter(|k| !from.contains_key(*k)).cloned().collect();
@@ -528,13 +573,26 @@ fn commit(r: &Repo, args: &[String]) -> R<()> {
         };
         r.store(&data)?;
     }
+    // A file that lost most of its lines was most likely overwritten by mistake (`>` instead of
+    // `>>`, or a write of one line): refuse, unless asked for.
+    if !args.iter().any(|a| a == "--allow-shrink") {
+        for p in &m {
+            let (old, new) = (r.object(&head[p]).unwrap_or_default(), r.object(&work[p]).unwrap_or_default());
+            let (before, after) = (String::from_utf8_lossy(&old).lines().count(), String::from_utf8_lossy(&new).lines().count());
+            let (_, removed) = line_stats(&old, &new);
+            if before >= 20 && after * 2 < before && removed * 5 >= before * 4 {
+                return Err(format!("{p} would go from {before} lines to {after}, so nothing was committed. It looks overwritten (for example with > instead of >>). Undo it with: git restore {p}   (if you meant it: git commit -m \"MESSAGE\" --allow-shrink)"));
+            }
+        }
+    }
+    let summary = change_summary(r, &head, &work);
     let mut log = r.log();
     let id = blob_sha(format!("{msg}{}{}", log.len(), serde_json::to_string(&work).unwrap()).as_bytes());
     log.push(json!({ "id": id, "message": msg, "tree": work }));
     r.save_log(&log)?;
     r.save_head(&work)?;
     println!("[{} {}] {msg}", r.branch(), short(&id));
-    println!(" {} file{} changed ({} new, {} modified, {} deleted)", a.len() + m.len() + d.len(), if a.len() + m.len() + d.len() == 1 { "" } else { "s" }, a.len(), m.len(), d.len());
+    println!(" {} file{} changed: {summary}", a.len() + m.len() + d.len(), plural(a.len() + m.len() + d.len()));
     Ok(())
 }
 
@@ -550,7 +608,9 @@ fn push(r: &mut Repo) -> R<()> {
     let (owner, repo) = (r.config["owner"].as_str().unwrap().to_string(), r.config["repo"].as_str().unwrap().to_string());
     let branch = r.branch();
     let to_default = branch == r.default_branch();
-    allowed(&format!("Push {} commit{} to {owner}/{repo} branch {branch}", log.len(), plural(log.len())), to_default)?;
+    let base: BTreeMap<String, String> = fs::read_to_string(r.state("upstream.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let last: BTreeMap<String, String> = log.last().and_then(|c| serde_json::from_value(c["tree"].clone()).ok()).unwrap_or_default();
+    allowed(&format!("Push {} commit{} to {owner}/{repo} branch {branch} ({})", log.len(), plural(log.len()), change_summary(r, &base, &last)), to_default)?;
     let mut parent = r.config["upstream"]["commit"].as_str().unwrap().to_string();
     let mut prev_tree_sha = r.config["upstream"]["tree"].as_str().unwrap().to_string();
     let mut prev: BTreeMap<String, String> = serde_json::from_value(r.config["upstream"]["files"].clone()).unwrap_or_default();

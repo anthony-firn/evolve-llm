@@ -74,7 +74,8 @@ async function shellNotes(command, r, workspace, failed, signal) {
     notes.push(`there is no ${missing[1]} here (${r.cwd}). ${dirs.length ? `Folders here: ${dirs.join(' ')}` : 'There are no folders here.'}`);
   }
   // read is also a shell builtin (it reads input), so look at the command itself as well.
-  const misused = /\b(read|write|edit): (?:command )?not found/.exec(err) || /(?:^|&&|\|\||;|\|)\s*(read|write|edit)\s+[\w./-]+\.\w+/.exec(command);
+  // (edit FILE OLD NEW is also a command in the VM, so only read and write get this note.)
+  const misused = /\b(read|write): (?:command )?not found/.exec(err) || /(?:^|&&|\|\||;|\|)\s*(read|write)\s+[\w./-]+\.\w+/.exec(command);
   if (misused) notes.push(`${misused[1]} is a tool, not a shell command. Call the ${misused[1]} tool instead.`);
   if (/&&/.test(command)) notes.push('the command stopped at the first error, so the steps after it did not run. Run one step per command.');
   const key = command.trim();

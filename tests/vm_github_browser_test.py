@@ -279,7 +279,7 @@ def main():
         code, out, err = sh("cd app && git push")
         asked = page.evaluate("window.vmQuestions || []")
         check(code == 0 and "-> feature (new branch)" in out, f"push creates the branch ({out!r} {err!r})")
-        check(asked == ["Push 1 commit to demo/app branch feature?"], f"push asked first ({asked})")
+        check(asked == ["Push 1 commit to demo/app branch feature (README.md +1 -0, new.txt new, 1 line, docs/notes.txt deleted)?"], f"push asked first, saying what changes ({asked})")
         head = FAKE.refs.get("feature")
         tree = FAKE.trees[FAKE.commits[head]["tree"]] if head else {}
         check(sorted(tree) == ["README.md", "new.txt", "src/main.rs"] and FAKE.blobs[tree["README.md"]] == b"# Demo\nmore\n", "the pushed tree holds the edits")
@@ -356,6 +356,11 @@ def main():
         check(code != 0 and "is not on GitHub yet" in err and page.evaluate("window.vmQuestions") == [], f"an empty pull request is refused before asking ({err!r})")
         code, out, err = sh("cd app && git checkout fix && git checkout -b fix")
         check(code != 0 and "already exists on GitHub. Switch to it with: git checkout fix" in err, f"a new branch may not reuse a name on GitHub ({err!r})")
+        # A file that loses most of its lines looks overwritten (> instead of >>): no commit.
+        code, out, err = sh("gh repo clone demo/app guard >/dev/null && cd guard && seq 1 40 > long.txt && git commit -m Long && echo one > long.txt && git commit -m Oops")
+        check(code != 0 and "Long" in out and "long.txt would go from 40 lines to 1, so nothing was committed" in err and "git restore long.txt" in err, f"an overwritten file is not committed ({out!r} {err!r})")
+        code, out, err = sh("cd guard && git commit -m Oops --allow-shrink && git log --oneline -n 1")
+        check(code == 0 and "long.txt +1 -40" in out, f"unless asked, and the commit says what changed ({out!r} {err!r})")
         code, out, _ = sh("git help && gh help")
         check("git merge BRANCH" in out and "gh pr merge" in out and "always asks the person" in out, "help lists merging")
 

@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const NAMES: &[&str] = &[
     "ls", "cat", "cp", "mv", "rm", "mkdir", "rmdir", "touch", "head", "tail", "wc", "sort", "uniq", "tee", "grep", "find", "env", "sleep",
     "basename", "dirname", "seq", "tr", "cut", "date", "yes", "stat", "ln", "readlink", "realpath", "clear", "uname", "whoami", "du", "diff",
-    "test", "[", "printf", "nl", "rev", "xxd", "hostname", "id", "nproc", "df", "file",
+    "test", "[", "printf", "nl", "rev", "xxd", "hostname", "id", "nproc", "df", "file", "edit",
 ];
 
 type R = Result<i32, String>;
@@ -682,6 +682,29 @@ fn run(name: &str, args: &[String]) -> R {
                 i = j;
             }
             Ok(0)
+        }
+        // Not a Unix tool, but what people and small models reach for to change one line:
+        // OLD becomes NEW where it occurs exactly once; \n, \t and \\ in both are a new line,
+        // a tab and a backslash.
+        "edit" => {
+            let [file, old, new] = args else {
+                return Err("edit: usage: edit FILE OLD NEW   (replaces OLD with NEW where it occurs exactly once; \\n is a new line)".into());
+            };
+            let unescape = |s: &str| s.replace("\\\\", "\u{0}").replace("\\n", "\n").replace("\\t", "\t").replace('\u{0}', "\\");
+            let (old, new) = (unescape(old), unescape(new));
+            if old.is_empty() {
+                return Err("edit: OLD is empty: give the exact text to replace".into());
+            }
+            let text = fs::read_to_string(file).map_err(|e| err(e, file))?;
+            match text.matches(old.as_str()).count() {
+                1 => {
+                    fs::write(file, text.replacen(&old, &new, 1)).map_err(|e| err(e, file))?;
+                    writeln!(out, "edited {file}").ok();
+                    Ok(0)
+                }
+                0 => Err(format!("edit: {file}: the text to replace is not there. Find the exact line with: grep -n \"SOME WORDS\" {file}")),
+                n => Err(format!("edit: {file}: the text to replace is in {n} places; include more of the surrounding text")),
+            }
         }
         "tee" => {
             let a = Args::parse(args, "");
