@@ -313,3 +313,12 @@ test('the same failing command a third time stops the task with the reason',asyn
  await assert.rejects(task.run('Do it'),/The same command failed 3 times, so the task stopped: make it work/);
  assert.equal(n,3);
 });
+
+test('a request about failing CI says where the reason is',async()=>{
+ const seen=[];const vm={read:async()=>({ok:false}),exec:async()=>({code:0,stdout:'',stderr:''})};
+ const task=createPiTask({linux:{cwd:'/home/user'},workspace:{cwd:'/home/user',vm,path:p=>p,request:async()=>({})},network:{options:()=>({enabled:false})},turn:async messages=>{seen.push(messages.at(-1).content);return{text:'Done.',reason:'end'}}});
+ await task.run('CI is failing for the GitHub repository demo/app. Fix it.');
+ assert.match(seen[0],/To find out why CI fails, run gh run list, then gh run view ID/);
+ await task.run('Add a line to README.md in demo/app.');
+ assert.doesNotMatch(seen.at(-1),/find out why CI fails/);
+});

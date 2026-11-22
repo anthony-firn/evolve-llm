@@ -38,7 +38,7 @@ Tools: bash runs shell commands (pipes, &&, redirections; ls cat grep find head 
 git and gh work on GitHub repositories. Use them in this order, one step per bash call, reading each result before the next step:
 1. Clone the repository the person names with gh repo clone and its owner/name (it makes a folder with the name after the slash), then cd into that folder
 2. git checkout -b NEW-BRANCH before changing files
-3. Change files with write or edit, then check with git status and git diff
+3. Change files with write or edit, then check with git status and git diff. If CI is failing, first find why: gh run list, then gh run view ID
 4. git commit -m "What changed" (it includes every change; git add is not needed)
 5. git push, then gh pr create --title "Title" --body "What and why"
 6. Only if the person asked you to merge: run gh pr merge. Merging always asks the person. If they decline, stop and tell them.
@@ -82,6 +82,9 @@ async function preamble(prompt, workspace, cwd) {
   // One repository: gh pr and gh run work on it from anywhere (GH_REPO, set for each command).
   const repo = new Set(repos).size === 1 ? repos[0] : null;
   if (repo) lines.push(`gh pr and gh run commands work on ${repo} without a clone.`);
+  // A request about failing CI: say where the reason is, or a small model guesses at git commands.
+  if (/\b(CI|checks?|workflows?|GitHub Actions|builds? (is |are )?(failing|broken|red))\b/i.test(prompt))
+    lines.push('To find out why CI fails, run gh run list, then gh run view ID: it shows the failed step and the error with its file and line.');
   return { text: `(${lines.join(' ')})`, repo };
 }
 
