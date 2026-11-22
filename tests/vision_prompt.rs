@@ -118,3 +118,32 @@ fn qwen3vl_names_the_colour_it_sees() {
         s.reset();
     }
 }
+
+/// A real Qwen3.5 (Gated DeltaNet, gated attention with 256-wide heads, its tokenizer) completes
+/// a sentence sensibly. Skips without Qwen3.5-0.8B.
+#[test]
+fn qwen35_completes_a_sentence() {
+    use evolve_llm::sampler::SamplerConfig;
+    use evolve_llm::session::Session;
+    let file = "Qwen3.5-0.8B-Q4_K_M.gguf";
+    let Some((e, bytes)) = engine(file) else {
+        eprintln!("skipping: {file} or a GPU is missing");
+        return;
+    };
+    let g = gguf::parse(&bytes).unwrap();
+    let mut s = Session::new(e, &g).unwrap();
+    s.set_sampler(SamplerConfig { temperature: 0.0, ..SamplerConfig::default() });
+    let prompt = s.encode_prompt("The capital of France is");
+    pollster::block_on(s.prefill(&prompt)).unwrap();
+    let mut out = Vec::new();
+    for _ in 0..6 {
+        let t = pollster::block_on(s.next()).unwrap();
+        if s.tok.is_end_of_generation(t) {
+            break;
+        }
+        out.push(t);
+    }
+    let text = s.tok.decode(&out);
+    eprintln!("Qwen3.5-0.8B: The capital of France is{text}");
+    assert!(text.contains("Paris"), "expected Paris, got {text:?}");
+}
