@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nativeToolFormat, toolTransport } from '../web/tool-transport.mjs';
+import { nativeToolFormat, toolTransport, toolResult } from '../web/tool-transport.mjs';
 
 test('GGUF double-braced tool example disables the malformed native tool template',()=>{
  assert.equal(nativeToolFormat('<tools>web_search</tools><tool_call>\n{{"name": <function-name>, "arguments": <args-json-object>}}\n</tool_call>'),false);
@@ -19,4 +19,14 @@ test('fallback preserves policy and tool feedback for templates without a tool r
  assert.equal(result.messages.at(-1).role,'user');
  assert.equal(result.messages.at(-1).content,'<tool_response>\nFile contents\n</tool_response>');
  assert.deepEqual(messages.at(-1),{role:'tool',content:'File contents'});
+});
+
+test('images on tool results survive the text tool format', () => {
+  const image = { rgb: new Uint8Array(3), width: 1, height: 1 };
+  const { messages } = toolTransport([{ role: 'user', content: 'Look' }, toolResult('call_0', 'browser_open', 'Page'), ], [], false);
+  assert.equal(messages[2].images, undefined);
+  const withImage = toolTransport([{ role: 'user', content: 'Look' }, { ...toolResult('call_0', 'browser_open', 'Page'), images: [image] }], [], false);
+  assert.equal(withImage.messages[2].images[0], image);
+  const native = toolTransport([{ ...toolResult('call_0', 'browser_open', 'Page'), images: [image] }], [], true);
+  assert.equal(native.messages[0].images[0], image);
 });

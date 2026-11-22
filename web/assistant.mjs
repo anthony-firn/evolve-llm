@@ -10,7 +10,7 @@ const HOME = '/home/user';
 
 /** `turn(messages, tools, opts)`: one model turn (app.js agentTurn). `sandbox()`: the browser
  *  sandbox's workspace (web/workbench.mjs), used when the VM cannot run. */
-export function createAssistant({ turn, getNetwork, sandbox }) {
+export function createAssistant({ turn, getNetwork, sandbox, getVision = () => null }) {
   let linux = typeof WebAssembly.Suspending === 'function';
   let building = () => null; // the repository the paired computer builds, if any
   let workspace = null; // one for the conversation, so a `cd` carries over between messages
@@ -72,7 +72,7 @@ export function createAssistant({ turn, getNetwork, sandbox }) {
       view.event(e);
       if (e.type !== 'token') observe(e);
     };
-    agent = createPiTask({ turn, workspace: ws, network, onEvent, modelName, maxTokens, preview, browser, confirmBrowserAction, linux: linux ? { cwd: ws.cwd, building } : null, history });
+    agent = createPiTask({ turn, workspace: ws, network, onEvent, modelName, maxTokens, preview, browser, confirmBrowserAction, linux: linux ? { cwd: ws.cwd, building } : null, history, vision: getVision() });
     let result = null, error = null;
     try { result = await agent.run(prompt); }
     catch (e) { error = String(e.message || e); }

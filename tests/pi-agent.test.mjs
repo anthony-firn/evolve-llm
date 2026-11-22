@@ -475,3 +475,29 @@ test('a button clicked again on the same page is held once and explained, then a
   assert.deepEqual(browser.log.filter(l => l[0] === 'click').map(l => l[1]), [2, 2, 1]);
   assert.match(JSON.stringify(seen[2]), /was not done: you already clicked button \\"Add Blue Kettle to cart\\" on this page, and the page then said: \\"Cart: 1 item\(s\)\\"/);
 });
+
+test('a model that reads images gets the newest page screenshot with the browser result', async () => {
+  const browser = fakeBrowser({ 'https://shop.example/': '# Shop\n[1] button "Buy"' });
+  let shots = 0;
+  browser.screenshot = async ({ unit, maxSide }) => { shots++; return { rgb: new Uint8Array(unit * unit * 3), width: unit, height: unit, maxSide, shot: shots }; };
+  let n = 0, seen = null, system = '';
+  const task = createPiTask({ browser, vision: { unit: 32 }, workspace: { request: async () => ({}) }, network, turn: async (messages) => {
+    n++;
+    system = messages[0].content;
+    if (n === 1) return call('browser_open', { url: 'https://shop.example/' });
+    if (n === 2) return call('browser_snapshot', {});
+    seen = messages; return { text: 'A shop.', reason: 'end' };
+  } });
+  await task.run('What is on the page?');
+  const tools = seen.filter((m) => m.role === 'tool');
+  assert.equal(tools.length, 2);
+  assert.equal(tools[0].images, undefined);
+  assert.deepEqual([tools[1].images.length, tools[1].images[0].width, tools[1].images[0].shot], [1, 32, 2]);
+  assert.match(system, /screenshot of the page/);
+  // Without vision: no screenshots, no prompt about them.
+  const plain = fakeBrowser({ 'https://shop.example/': '# Shop' });
+  plain.screenshot = async () => { throw new Error('not asked for'); };
+  let m = 0, prompt = '';
+  await createPiTask({ browser: plain, workspace: { request: async () => ({}) }, network, turn: async (messages) => { m++; prompt = messages[0].content; return m === 1 ? call('browser_open', { url: 'https://shop.example/' }) : { text: 'ok', reason: 'end' }; } }).run('Look');
+  assert.doesNotMatch(prompt, /screenshot of the page/);
+});

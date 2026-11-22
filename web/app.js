@@ -685,7 +685,7 @@ function onLoaded(msg) {
   const { model, chat, source } = msg;
   state.lastLoaded = msg;
   const label = state.loading?.label || chat.name;
-  state.loaded = { ...source, key: state.loading?.key ?? source.key, label, info: model, chat, tools: Boolean(msg.tools), stream: Boolean(state.loading?.stream) };
+  state.loaded = { ...source, key: state.loading?.key ?? source.key, label, info: model, chat, tools: Boolean(msg.tools), stream: Boolean(state.loading?.stream), vision: msg.vision || null };
   state.loading = null;
   $('loading-bar').classList.remove('indeterminate');
   const secs = (performance.now() - loadStarted) / 1000;
@@ -923,6 +923,7 @@ async function getAssistant(){
       },
       getNetwork:()=>({enabled:Boolean(state.settings.internet),jinaKey:state.settings.jinaKey||''}),
       sandbox:async()=>(await ensureWorkbench()).sandbox(),
+      getVision:()=>state.loaded?.vision||null,
     });
   }
   return assistant;
