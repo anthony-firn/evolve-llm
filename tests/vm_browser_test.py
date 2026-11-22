@@ -36,6 +36,9 @@ CASES = [
     # edit FILE OLD NEW: one exact match, \\n a new line; a miss or two matches change nothing.
     ("printf 'a\\nb\\nb2\\n' > e.txt && edit e.txt a 'a\\nx' && edit e.txt zz q 2>&1; edit e.txt b q 2>&1; cat e.txt && rm e.txt", 0,
      "edited e.txt\nedit: e.txt: the text to replace is not there. Find the exact line with: grep -n \"SOME WORDS\" e.txt\nedit: e.txt: the text to replace is in 2 places; include more of the surrounding text\na\nx\nb\nb2\n"),
+    # echo reads backslash escapes as dash does (-E does not); edit takes an optional line number.
+    ("echo 'a\\nb' && echo -E 'c\\nd' && echo -n x && echo 'y\\cz'", 0, "a\nb\nc\\nd\nxy"),
+    ("printf 'one\\ntwo\\n' > l.txt && edit l.txt 2 two 2 && cat l.txt && rm l.txt", 0, "edited l.txt\none\n2\n"),
     ("read notes.txt 2>&1; echo status=$?", 0, "read: notes.txt is not a variable name (read takes a line of input; to show a file, use: cat notes.txt)\nstatus=2\n"),
     # python3: RustPython, loaded on first use; scripts, the standard library and unittest.
     ("python3 -c 'import json; print(json.dumps({\"sum\": 2 + 3}))'", 0, '{"sum": 5}\n'),

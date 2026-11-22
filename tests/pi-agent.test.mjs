@@ -291,3 +291,16 @@ test('an empty reply after tool results is asked to continue, and a long read sa
  assert.match(seen[2].content,/Your reply was empty\. Continue the task/);
  assert.equal(result.repairs,1);assert.equal(n,3);
 });
+
+test('write does not replace an existing file the task has not read; it may after a read',async()=>{
+ const files=new Map([['/workspace/calc.py','def add(a, b):\n    return a - b\n\n\ndef sub(a, b):\n    return a - b\n']]);let n=0;const results=[];
+ const task=createPiTask({workspace:{request:async(name,args)=>{if(name==='read'){if(!files.has(args.path))throw Error('no such file');return{text:files.get(args.path)}}if(name==='write'){files.set(args.path,args.text);return{ok:true}}return{}}},network:{options:()=>({enabled:false})},
+  onEvent:e=>{if(e.type==='tool-result')results.push([e.isError,e.result.content[0].text])},turn:async()=>{
+  n++;const call=n===1?{name:'write',arguments:{path:'/workspace/calc.py',text:'def add(a, b):\n    return a + b\n'}}:n===2?{name:'write',arguments:{path:'/workspace/new.txt',text:'fresh'}}:n===3?{name:'read',arguments:{path:'/workspace/calc.py'}}:n===4?{name:'write',arguments:{path:'/workspace/calc.py',text:'whole new file'}}:null;
+  return{text:call?'<tool_call>'+JSON.stringify(call)+'</tool_call>':'Done.',reason:'end'};
+ }});
+ await task.run('Fix calc.py');
+ assert.equal(results[0][0],true);assert.match(results[0][1],/calc\.py already exists, so nothing was written\. To change part of it, use edit/);
+ assert.equal(results[1][0],false);assert.equal(files.get('/workspace/new.txt'),'fresh');
+ assert.equal(results[3][0],false);assert.equal(files.get('/workspace/calc.py'),'whole new file');
+});

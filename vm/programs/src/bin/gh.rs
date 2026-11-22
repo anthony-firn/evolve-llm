@@ -1039,17 +1039,23 @@ Local work (git status, diff, commit, push, pull, checkout, merge): git help";
 /// The repository for gh pr and gh run: `-R OWNER/REPO` (or `--repo`), as in GitHub's gh, works
 /// anywhere; otherwise the clone around the working directory. Returns it and the other args.
 fn repo_or_flag(args: &[String]) -> R<(Repo, Vec<String>)> {
-    let Some(i) = args.iter().position(|a| a == "-R" || a == "--repo") else {
-        return Ok((Repo::find()?, args.to_vec()));
+    let (spec, rest): (String, Vec<String>) = match args.iter().position(|a| a == "-R" || a == "--repo") {
+        Some(i) => (
+            args.get(i + 1).ok_or("usage: -R OWNER/REPO")?.clone(),
+            args.iter().enumerate().filter(|(j, _)| *j != i && *j != i + 1).map(|(_, a)| a.clone()).collect(),
+        ),
+        // Outside a clone, GH_REPO names the repository, as in GitHub's gh.
+        None => match Repo::find() {
+            Ok(r) => return Ok((r, args.to_vec())),
+            Err(e) => (env::var("GH_REPO").map_err(|_| e)?, args.to_vec()),
+        },
     };
-    let spec = args.get(i + 1).ok_or("usage: -R OWNER/REPO")?;
     let spec = spec.trim_start_matches("https://github.com/").trim_end_matches(".git");
-    let (owner, repo) = spec.split_once('/').ok_or("expected -R OWNER/REPO")?;
+    let (owner, repo) = spec.split_once('/').ok_or("expected OWNER/REPO")?;
     let info = api("GET", &format!("/repos/{owner}/{repo}"), None)?;
     let default = info["default_branch"].as_str().unwrap_or("main").to_string();
     // Not a clone: no local commits, and the branch is the default one unless --head says.
     let r = Repo { root: PathBuf::from("/nonexistent-clone"), config: json!({ "owner": owner, "repo": repo, "default_branch": default, "branch": default }) };
-    let rest = args.iter().enumerate().filter(|(j, _)| *j != i && *j != i + 1).map(|(_, a)| a.clone()).collect();
     Ok((r, rest))
 }
 
@@ -1101,6 +1107,15 @@ fn gh(args: &[String]) -> R<()> {
 }
 
 fn main() {
+    // A reader that stopped early (`gh pr list | head -1`) ends the program quietly, as it would
+    // a native one, instead of a panic about a broken pipe.
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info.to_string();
+        if msg.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        eprintln!("{msg}");
+    }));
     if let Ok(p) = env::var("PWD") {
         let _ = env::set_current_dir(p);
     }

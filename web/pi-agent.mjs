@@ -71,13 +71,18 @@ const shellText = r => [`exit code ${r.code}${r.timedOut?' (timed out)':''}, in 
  *  models otherwise skip the clone or copy a placeholder like OWNER/REPO. */
 async function preamble(prompt, workspace, cwd) {
   const lines = [`Working directory: ${cwd}.`];
+  const repos = [];
   for (const [, owner, name] of String(prompt).matchAll(/(?:github\.com\/|\brepo(?:sitory)?\s+)([\w.-]+)\/([\w.-]+?)(?:\.git)?(?=[\s,.;:)]|$)/gi)) {
     const dir = `${cwd.replace(/\/$/, '')}/${name}`;
     const config = await workspace.vm?.read(`${dir}/.evolve-git/config.json`).catch(() => null);
     const here = config?.ok && config.data.includes(`"owner": "${owner}"`) && config.data.includes(`"repo": "${name}"`);
     lines.push(here ? `${owner}/${name} is already cloned in ${dir}: run cd ${dir}` : `To work on ${owner}/${name}, first run: gh repo clone ${owner}/${name}, then cd ${name}`);
+    repos.push(`${owner}/${name}`);
   }
-  return `(${lines.join(' ')})`;
+  // One repository: gh pr and gh run work on it from anywhere (GH_REPO, set for each command).
+  const repo = new Set(repos).size === 1 ? repos[0] : null;
+  if (repo) lines.push(`gh pr and gh run commands work on ${repo} without a clone.`);
+  return { text: `(${lines.join(' ')})`, repo };
 }
 
 /** Small models write each command as if it started where the task began ("cd app && ..."),
@@ -215,7 +220,7 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
 export function createPiTask({ turn, workspace, network, onEvent = () => {}, modelName = 'Local model', preview, maxTokens = 2048, browser, confirmBrowserAction, browserSnapshotChars, linux = null, native = false, history = [] }) {
   // Call ids in Kimi's form (functions.name:index), which other templates ignore or only match.
   let callIndex=0;
-  let turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, pendingChangeError=false, previewPath=null;const failedCommands=new Set();
+  let turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, pendingChangeError=false, previewPath=null;const failedCommands=new Set(), seen=new Set();let ghRepo=null;
   const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction}):null;
   const limits=linux?LINUX_LIMITS:browserTools?BROWSER_LIMITS:LIMITS;
   const declarations=(linux?[
@@ -248,7 +253,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     }
     if(name==='bash'){
       const [command,moved]=linux?await fromStart(String(args.command||''),workspace,linux.cwd):[args.command,null];
-      result=await workspace.request('exec',{command,...(native?{asRoot:args.asRoot===true}:{}),network:network.options()},{signal});
+      result=await workspace.request('exec',{command:ghRepo?`export GH_REPO=${ghRepo}; ${command}`:command,...(native?{asRoot:args.asRoot===true}:{}),network:network.options()},{signal});
       if(linux&&result.code)result.notes=await shellNotes(String(args.command||''),result,workspace,failedCommands,signal);
       if(moved)result.notes=[moved,...(result.notes||[])];
     }
@@ -265,7 +270,15 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
           throw new Error(`${failure.replace(/[.;]\s*(read the file|include more).*$/i,'')}, so nothing was changed. ${closestLines(file.text,args.oldText,args.path)}`);
         }
       }
-      else result=await workspace.request(name,args,{signal});
+      else{
+        // Replacing a whole existing file is how small models delete what they meant to keep:
+        // a file this task has not read or written is not replaced (edit changes part of it).
+        const key=workspace.path?workspace.path(args.path):String(args.path);
+        if(name==='write'&&!seen.has(key)&&await workspace.request('read',{path:args.path},{signal}).then(r=>typeof r?.text==='string',()=>false))
+          throw new Error(`${args.path} already exists, so nothing was written. To change part of it, use edit with the exact old text; to replace all of it, read it first, then write.`);
+        result=await workspace.request(name,args,{signal});
+        seen.add(key);
+      }
       if(['write','edit'].includes(name)){changes++;if(/\.html?$/i.test(args.path))previewPath=args.path;}
     }
     else if(['preview','browser_test'].includes(name)){if(!preview)throw new Error('Preview is unavailable.');if(name==='preview'&&pendingChangeError)throw new Error('A file change failed. Read the file and correct the failed write or edit before final preview.');result=await preview(args.path,{signal,smoke:name==='browser_test'});if(name==='preview'&&result.ok===true)completedPreview=true;}
@@ -336,5 +349,5 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
-  return {async run(prompt){await agent.prompt(linux?`${await preamble(prompt,workspace,linux.cwd)}\n\n${prompt}`:prompt);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
+  return {async run(prompt){const pre=linux?await preamble(prompt,workspace,linux.cwd):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
 }

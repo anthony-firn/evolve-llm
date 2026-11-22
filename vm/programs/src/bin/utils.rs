@@ -687,7 +687,9 @@ fn run(name: &str, args: &[String]) -> R {
         // OLD becomes NEW where it occurs exactly once; \n, \t and \\ in both are a new line,
         // a tab and a backslash.
         "edit" => {
-            let [file, old, new] = args else {
+            // `edit FILE LINE OLD NEW` (small models add the line number) works as without it.
+            let picked: Vec<&String> = if args.len() == 4 && !args[1].is_empty() && args[1].chars().all(|c| c.is_ascii_digit()) { vec![&args[0], &args[2], &args[3]] } else { args.iter().collect() };
+            let [file, old, new] = picked[..] else {
                 return Err("edit: usage: edit FILE OLD NEW   (replaces OLD with NEW where it occurs exactly once; \\n is a new line)".into());
             };
             let unescape = |s: &str| s.replace("\\\\", "\u{0}").replace("\\n", "\n").replace("\\t", "\t").replace('\u{0}', "\\");
