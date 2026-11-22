@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiTask, askedSteps, namedRepos, wantsSources } from '../web/pi-agent.mjs';
+import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement } from '../web/pi-agent.mjs';
 
 test('real Pi agent loop invokes sandbox tools and feeds their results back to the local transport',async()=>{
  const files=new Map(),events=[];let round=0;
@@ -409,4 +409,15 @@ test('a request for sources answered from memory is asked to search first, once,
   if(enabled){assert.match(seen[1],/Not finished yet: This question asks for sources, and you have not searched yet\. Make that tool call now: web_search/);assert.equal(n,3);}
   else assert.equal(n,1);
  }
+});
+
+test('a line asked for after another line but appended with >> gets a note on how to place it',async()=>{
+ assert.ok(wantsPlacement('In README.md, right after the line "npm test", add the line "x".'));assert.ok(!wantsPlacement('Add a line to README.md'));
+ const results=[];let n=0;
+ const workspace={cwd:'/home/user/app',vm:{read:async()=>({ok:false})},path:p=>p,request:async(name)=>name==='exec'?{code:0,stdout:'',stderr:'',cwd:'/home/user/app'}:{}};
+ const task=createPiTask({linux:{cwd:'/home/user/app'},workspace,network:{options:()=>({enabled:false})},onEvent:e=>{if(e.type==='tool-result')results.push(e.result.content[0].text)},turn:async()=>{
+  n++;return{text:n===1?'<tool_call>'+JSON.stringify({name:'bash',arguments:{command:"echo 'npm run lint' >> README.md"}})+'</tool_call>':'Done.',reason:'end'};
+ }});
+ await task.run('In README.md of demo/app, right after the line "npm test", add the line "npm run lint".');
+ assert.match(results[0],/>> added the text at the end of README\.md, but the request asks for it next to a particular line\. Undo it with: git restore README\.md/);
 });
