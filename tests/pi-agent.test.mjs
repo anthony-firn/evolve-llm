@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiTask, askedSteps } from '../web/pi-agent.mjs';
+import { createPiTask, askedSteps, namedRepos } from '../web/pi-agent.mjs';
 
 test('real Pi agent loop invokes sandbox tools and feeds their results back to the local transport',async()=>{
  const files=new Map(),events=[];let round=0;
@@ -373,4 +373,26 @@ test('an edit aimed at the wrong file is told where the text is, and the same fa
  const task=createPiTask({linux:{cwd:'/home/user/app'},workspace,network:{options:()=>({enabled:false})},onEvent:e=>{if(e.type==='tool-result')results.push(e.result.content[0].text)},turn:async()=>({text:'<tool_call>'+JSON.stringify(call)+'</tool_call>',reason:'end'})});
  await assert.rejects(task.run('Fix add in calc.py'),/The same edit call failed 3 times, so the task stopped/);
  assert.match(results[0],/oldText is not in test_calc\.py, so nothing was changed\. That text is in calc\.py: call edit with that path\./);
+});
+
+test('namedRepos finds OWNER/NAME however a request names the repository, and not file paths',()=>{
+ const names=p=>namedRepos(p).map(([o,n])=>`${o}/${n}`);
+ assert.deepEqual(names('Clone the GitHub repository demo/app. In tools/serve_local.py add x.'),['demo/app']);
+ assert.deepEqual(names('In demo/app on GitHub, README.md has the line'),['demo/app']);
+ assert.deepEqual(names('calc.py in demo/app (GitHub) is broken'),['demo/app']);
+ assert.deepEqual(names('Please merge PR #1 on demo/app (it is on GitHub).'),['demo/app']);
+ assert.deepEqual(names("The checks on demo/app's main branch are red."),['demo/app']);
+ assert.deepEqual(names('See https://github.com/anthony-firn/evolve-llm/pull/4'),['anthony-firn/evolve-llm']);
+ assert.deepEqual(names('Run python3 tests/vm_browser_test.py and fix web/app.js'),[]);
+});
+
+test('a request about the repository the paired computer builds says to build and test there',async()=>{
+ const seen=[];
+ const workspace={cwd:'/home/user',vm:{read:async()=>({ok:false})},path:p=>p,request:async()=>({code:0,stdout:'',stderr:''})};
+ let building='demo/app';
+ const task=createPiTask({linux:{cwd:'/home/user',building:()=>building},workspace,network:{options:()=>({enabled:false})},turn:async m=>{seen.push(m.at(-1).content);return{text:'Done.',reason:'end'}}});
+ await task.run('Fix the tests of the GitHub repository demo/app.');
+ assert.match(seen[0],/Your computer is paired for building demo\/app: in its clone, cargo, npm, npx and node run on the computer/);
+ building=null;await task.run('Fix the tests of the GitHub repository demo/app.');
+ assert.doesNotMatch(seen.at(-1),/paired for building/);
 });

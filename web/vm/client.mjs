@@ -5,6 +5,18 @@ import { trace } from '../trace.mjs';
 
 let shared = null;
 let config = () => ({});
+let computer = null;
+
+/** The paired computer for builds: { call({type, data}), run(req, write, signal) -> status },
+ *  or null. Programs in the VM (native, cargo, npm, npx, node) reach it through these. */
+export function provideComputer(c) {
+  computer = c;
+}
+
+/** Whether a computer is paired for building, and which repository: { project } or null. */
+export function pairedComputer() {
+  return computer?.project ? { project: computer.project } : null;
+}
 
 /** The page's one VM (started on first use), configured from the page's settings. */
 export function sharedVm() {
@@ -46,7 +58,18 @@ export class VmClient {
             write(`pi: ${e?.message || e}\n`);
             this.worker.postMessage({ type: 'agent-done', id: m.id, code: 1 });
           });
-        } else if (m.type === 'ask') Promise.resolve(this.onAsk(m.question)).then((yes) => this.worker.postMessage({ type: 'answer', id: m.id, yes }), () => this.worker.postMessage({ type: 'answer', id: m.id, yes: false }));
+        } else if (m.type === 'computer-run') {
+          const write = (text) => this.worker.postMessage({ type: 'agent-output', id: m.id, text });
+          const abort = new AbortController();
+          this.agentAborts.set(m.id, abort);
+          Promise.resolve().then(() => this.onComputerRun(m.req, write, abort.signal)).finally(() => this.agentAborts.delete(m.id)).then((code) => this.worker.postMessage({ type: 'agent-done', id: m.id, code: code | 0 }), (e) => {
+            write(`${e?.message || e}\n`);
+            this.worker.postMessage({ type: 'agent-done', id: m.id, code: 1 });
+          });
+        } else if (m.type === 'computer') Promise.resolve().then(() => this.onComputer(m.req)).then(
+          (answer) => this.worker.postMessage({ type: 'computer-answer', id: m.id, answer }),
+          (e) => this.worker.postMessage({ type: 'computer-answer', id: m.id, answer: { error: e?.message || String(e) } }));
+        else if (m.type === 'ask') Promise.resolve(this.onAsk(m.question)).then((yes) => this.worker.postMessage({ type: 'answer', id: m.id, yes }), () => this.worker.postMessage({ type: 'answer', id: m.id, yes: false }));
         else if (m.type === 'session' || m.type === 'result') {
           this.pending.get(m.id)?.(m);
           this.pending.delete(m.id);
@@ -60,6 +83,20 @@ export class VmClient {
   onAgent(task, cwd, write) {
     write('pi: open Terminal in Evolve LLM with a tool-capable model loaded, then run pi again.\n');
     return 1;
+  }
+
+  /** A request to the paired computer: { type, data } -> its answer. */
+  onComputer(req) {
+    if (!computer) return { error: 'no computer is paired for building' };
+    trace({ type: 'computer', request: req.type });
+    return computer.call(req);
+  }
+
+  /** A command on the paired computer, its output written as it comes: -> exit status. */
+  onComputerRun(req, write, signal) {
+    if (!computer) return 127;
+    trace({ type: 'computer-run', command: req.command, cwd: req.cwd });
+    return computer.run(req, write, signal);
   }
 
   /** A program asks to do something that changes GitHub (push, open a pull request, merge). */

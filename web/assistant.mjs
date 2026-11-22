@@ -12,6 +12,7 @@ const HOME = '/home/user';
  *  sandbox's workspace (web/workbench.mjs), used when the VM cannot run. */
 export function createAssistant({ turn, getNetwork, sandbox }) {
   let linux = typeof WebAssembly.Suspending === 'function';
+  let building = () => null; // the repository the paired computer builds, if any
   let workspace = null; // one for the conversation, so a `cd` carries over between messages
   let agent = null;
   let abortWeb = new AbortController();
@@ -23,7 +24,8 @@ export function createAssistant({ turn, getNetwork, sandbox }) {
   async function getWorkspace() {
     if (linux && !workspace) {
       try {
-        const [{ sharedVm }, { VmWorkspace }] = await Promise.all([import('./vm/client.mjs'), import('./vm/workspace.mjs')]);
+        const [{ sharedVm, pairedComputer }, { VmWorkspace }] = await Promise.all([import('./vm/client.mjs'), import('./vm/workspace.mjs')]);
+        building = () => pairedComputer()?.project || null;
         const vm = sharedVm();
         await vm.ready;
         workspace = new VmWorkspace(vm, { cwd: HOME });
@@ -70,7 +72,7 @@ export function createAssistant({ turn, getNetwork, sandbox }) {
       view.event(e);
       if (e.type !== 'token') observe(e);
     };
-    agent = createPiTask({ turn, workspace: ws, network, onEvent, modelName, maxTokens, preview, browser, confirmBrowserAction, linux: linux ? { cwd: ws.cwd } : null, history });
+    agent = createPiTask({ turn, workspace: ws, network, onEvent, modelName, maxTokens, preview, browser, confirmBrowserAction, linux: linux ? { cwd: ws.cwd, building } : null, history });
     let result = null, error = null;
     try { result = await agent.run(prompt); }
     catch (e) { error = String(e.message || e); }

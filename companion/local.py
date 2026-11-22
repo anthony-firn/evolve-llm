@@ -147,6 +147,7 @@ class Project:
         self.copy = Path(base or PROJECTS) / repo
         self.tools = find_tools() if tools is None else tools
         self.granted_until = 0
+        self.unknown = set()
         self.runs = {}
         self.process = None
         self.lock = threading.Lock()
@@ -255,11 +256,17 @@ class Project:
             if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha):
                 raise ValueError('Invalid sync request.')
         with self.lock:
-            if self.git('rev-parse', 'HEAD').strip() != commit:
-                if self.git('cat-file', '-t', commit, check=False).strip() != 'commit':
-                    self.git('fetch', '--quiet', 'origin', commit)
-                self.git('checkout', '--quiet', '--force', '--detach', commit)
-                self.git('clean', '-fdq')
+            # The base commit only saves sending files: one that cannot be fetched (not pushed
+            # anywhere this copy can reach) leaves the checkout as it is, and the files still match.
+            if self.git('rev-parse', 'HEAD').strip() != commit and commit not in self.unknown:
+                known = lambda: self.git('cat-file', '-t', commit, check=False).strip() == 'commit'
+                if not known():
+                    self.git('fetch', '--quiet', 'origin', commit, check=False)
+                if known():
+                    self.git('checkout', '--quiet', '--force', '--detach', commit)
+                    self.git('clean', '-fdq')
+                else:
+                    self.unknown.add(commit)
             for path, b64 in contents.items():
                 raw = base64.b64decode(b64)
                 if files.get(path) != blob_sha(raw):

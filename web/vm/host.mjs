@@ -41,6 +41,9 @@ export class Host {
       write('pi: the agent is not available here\n');
       return 1;
     };
+    // The paired computer (builds and tests): ({type, data}) -> answer, and runs that stream.
+    this.computer = async () => ({ error: 'no computer is paired for building' });
+    this.computerRun = async () => 127;
   }
 
   /** One request from a program: only GitHub's API and raw files, with the token for the API. */
@@ -527,6 +530,32 @@ export class Host {
           host.changed();
         };
         const code = await host.agent(str(taskPtr, taskLen), str(cwdPtr, cwdLen), write, pid);
+        view().setInt32(statusPtr, code, true);
+        return 0;
+      }),
+      computer_call: new WebAssembly.Suspending(async (reqPtr, reqLen, outLenPtr) => {
+        check();
+        let answer;
+        try {
+          answer = await host.computer(JSON.parse(str(reqPtr, reqLen)), pid);
+        } catch (e) {
+          answer = { error: e?.message || String(e) };
+        }
+        check();
+        const out = enc.encode(JSON.stringify(answer ?? {}));
+        host.http.set(pid, out);
+        view().setUint32(outLenPtr, out.length, true);
+        return 0;
+      }),
+      computer_run: new WebAssembly.Suspending(async (reqPtr, reqLen, statusPtr) => {
+        check();
+        // The command's output goes to this program's standard output as it arrives.
+        const write = (text) => {
+          if (!vm.running(pid)) return;
+          vm.fd_write(pid, 1, enc.encode(text));
+          host.changed();
+        };
+        const code = await host.computerRun(JSON.parse(str(reqPtr, reqLen)), write, pid);
         view().setInt32(statusPtr, code, true);
         return 0;
       }),

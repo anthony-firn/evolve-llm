@@ -1363,7 +1363,7 @@ configureVm();
 import { mountLocalComputer } from './local-computer.mjs';
 const localComputer = mountLocalComputer({
   ready:()=>['ready','preparing'].includes(state.phase)&&Boolean(state.loaded), turn:agentTurn,
-  onConnectionChange:connected=>{$('status-line').textContent=connected?'Computer connected · the chat works on this computer.':'Local computer disconnected.';},
+  onConnectionChange:(connected,building)=>{$('status-line').textContent=building?`Computer paired for building ${building}: cargo, npm and node run there.`:connected?'Computer connected · the chat works on this computer.':'Local computer disconnected.';},
   modelName:()=>state.loaded?.label||'Local model',
   lease:()=>{if(!['ready','preparing'].includes(state.phase)||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?(state.live?.assistant?'preparing':'ready'):'idle');}};}
 });

@@ -30,6 +30,8 @@ extern "C" {
     fn http_read(buf: *mut u8, len: usize) -> u32;
     fn ask_user(q: *const u8, q_len: usize, answer: *mut u32) -> u32;
     fn policy(level: *mut u32) -> u32;
+    fn computer_call(req: *const u8, req_len: usize, resp_len: *mut u32) -> u32;
+    fn computer_run(req: *const u8, req_len: usize, status: *mut i32) -> u32;
 }
 
 const API: &str = "https://api.github.com";
@@ -418,6 +420,94 @@ fn tree_of(owner: &str, repo: &str, commit: &str) -> R<(Vec<(String, String, Str
         }
     }
     Ok((files, tree, skipped))
+}
+
+// ---- builds on the paired computer ----
+
+/// Commands that run on the person's computer when it is paired for building this repository.
+const NATIVE: &[&str] = &["native", "cargo", "npm", "npx", "node"];
+
+/// A request to the paired computer ({type, data}); its answer comes back like an HTTP response.
+fn computer(req: &Value) -> R<Value> {
+    let body = serde_json::to_vec(req).unwrap();
+    let mut len = 0u32;
+    if unsafe { computer_call(body.as_ptr(), body.len(), &mut len) } != 0 {
+        return Err("the paired computer did not answer".into());
+    }
+    let mut buf = vec![0u8; len as usize];
+    unsafe { http_read(buf.as_mut_ptr(), buf.len()) };
+    let v: Value = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
+    match v["error"].as_str() {
+        Some(e) => Err(e.to_string()),
+        None => Ok(v),
+    }
+}
+
+fn shell_quote(a: &str) -> String {
+    if !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || "_./:=,+-@%".contains(c)) {
+        a.to_string()
+    } else {
+        format!("'{}'", a.replace('\'', "'\\''"))
+    }
+}
+
+/// `native COMMAND`, and cargo, npm, npx and node: run on the paired computer, in its own copy of
+/// this repository holding this clone's files (sandboxed there). Output streams here; the exit
+/// status is the command's.
+fn native(name: &str, args: &[String]) -> R<i32> {
+    let command = match (name, args) {
+        // One argument is a command line, so `native "cargo test 2>&1 | tail -20"` works.
+        ("native", [one]) => one.clone(),
+        ("native", rest) => rest.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "),
+        (n, rest) => std::iter::once(n.to_string()).chain(rest.iter().map(|a| shell_quote(a))).collect::<Vec<_>>().join(" "),
+    };
+    if command.trim().is_empty() || command == "--help" {
+        println!("usage: native COMMAND   (cargo, npm, npx and node also run there)\nRuns COMMAND on your computer when it is paired for building this repository, in its own\ncopy with this clone's files: no network there, and only that copy changes.");
+        return Ok(if command.trim().is_empty() { 2 } else { 0 });
+    }
+    let unpaired = "not available in the browser. To build and test, push a branch, then gh run watch shows its CI".to_string();
+    let project = match computer(&json!({ "type": "status" })) {
+        Ok(s) => s["project"].as_str().map(String::from).ok_or(unpaired.clone())?,
+        Err(_) => return Err(unpaired),
+    };
+    let r = Repo::find().map_err(|_| format!("this runs on your paired computer from a clone of {project}: gh repo clone {project}, then cd into it"))?;
+    if r.owner_repo() != project {
+        return Err(format!("your computer is paired for building {project}, and this is {}. To build this one, push a branch, then gh run watch shows its CI", r.owner_repo()));
+    }
+    let commit = r.config["upstream"]["commit"].as_str().ok_or("this clone has no commit")?.to_string();
+    let mut req = json!({ "type": "project-sync", "data": { "repo": project, "commit": commit, "files": r.work()? } });
+    let mut answer = computer(&req)?;
+    for _ in 0..100 {
+        let Some(need) = answer["need"].as_array().cloned() else { break };
+        // At most about 4 MB of files per request.
+        let mut contents = Map::new();
+        let mut size = 0;
+        for p in need.iter().filter_map(|p| p.as_str()) {
+            let full = r.root.join(p);
+            let data = match fs::read_link(&full) {
+                Ok(t) => t.to_string_lossy().into_owned().into_bytes(),
+                Err(_) => fs::read(&full).map_err(|e| format!("{p}: {e}"))?,
+            };
+            size += data.len();
+            contents.insert(p.to_string(), Value::String(B64.encode(&data)));
+            if size > 4 << 20 {
+                break;
+            }
+        }
+        req["data"]["contents"] = Value::Object(contents);
+        answer = computer(&req)?;
+    }
+    if answer["ok"].as_bool() != Some(true) {
+        return Err("the paired computer could not take this clone's files".into());
+    }
+    let here = env::current_dir().map_err(|e| e.to_string())?;
+    let cwd = here.strip_prefix(&r.root).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let body = serde_json::to_vec(&json!({ "cwd": cwd, "command": command })).unwrap();
+    let mut status = 1i32;
+    if unsafe { computer_run(body.as_ptr(), body.len(), &mut status) } != 0 {
+        return Err("the paired computer did not answer".into());
+    }
+    Ok(status)
 }
 
 // ---- commands ----
@@ -1212,6 +1302,15 @@ fn main() {
     }
     let argv: Vec<String> = env::args().collect();
     let name = argv.first().map(|a| Path::new(a).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default();
+    if NATIVE.contains(&name.as_str()) {
+        match native(&name, &argv[1..]) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("{name}: {e}");
+                std::process::exit(127);
+            }
+        }
+    }
     let r = if name == "git" { git(&argv[1..]) } else { gh(&argv[1..]) };
     if let Err(e) = r {
         eprintln!("{name}: {e}");

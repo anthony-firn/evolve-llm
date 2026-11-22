@@ -84,10 +84,19 @@ export function askedSteps(prompt) {
   return { commit, push, pr };
 }
 
-async function preamble(prompt, workspace, cwd) {
+/** OWNER/NAME of the GitHub repositories a request names: after "repository" or github.com/, or
+ *  followed by "on GitHub", "(GitHub)", "(it is on GitHub)" or 's. */
+export function namedRepos(prompt) {
+  const text = String(prompt), out = [];
+  for (const m of text.matchAll(/(?:github\.com\/|\brepo(?:sitory)?\s+)([\w.-]+)\/([\w.-]+?)(?:\.git)?(?=[\s,.;:)'/]|$)/gi)) out.push([m[1], m[2]]);
+  for (const m of text.matchAll(/\b([\w-]+)\/([\w-][\w.-]*?)(?:'s\b|(?=\s+on\s+GitHub\b|\s*\((?:it is |it's )?on GitHub\)|\s*\(GitHub\)))/gi)) out.push([m[1], m[2]]);
+  return out;
+}
+
+async function preamble(prompt, workspace, cwd, building = null) {
   const lines = [`Working directory: ${cwd}.`];
   const repos = [];
-  for (const [, owner, name] of String(prompt).matchAll(/(?:github\.com\/|\brepo(?:sitory)?\s+)([\w.-]+)\/([\w.-]+?)(?:\.git)?(?=[\s,.;:)]|$)/gi)) {
+  for (const [owner, name] of namedRepos(prompt)) {
     const dir = `${cwd.replace(/\/$/, '')}/${name}`;
     const config = await workspace.vm?.read(`${dir}/.evolve-git/config.json`).catch(() => null);
     const here = config?.ok && config.data.includes(`"owner": "${owner}"`) && config.data.includes(`"repo": "${name}"`);
@@ -97,6 +106,9 @@ async function preamble(prompt, workspace, cwd) {
   // One repository: gh pr and gh run work on it from anywhere (GH_REPO, set for each command).
   const repo = new Set(repos).size === 1 ? repos[0] : null;
   if (repo) lines.push(`gh pr and gh run commands work on ${repo} without a clone.`);
+  // The person's computer builds this repository: build and test there instead of waiting on CI.
+  if (repo && repo === building)
+    lines.push(`Your computer is paired for building ${repo}: in its clone, cargo, npm, npx and node run on the computer with the clone's files, and native COMMAND runs any other command there (for example: native python3 tests/test_app.py). Build and test there before you push.`);
   // A request about failing CI: say where the reason is, or a small model guesses at git commands.
   if (/\b(CI|checks?|workflows?|GitHub Actions|builds? (is |are )?(failing|broken|red))\b/i.test(prompt))
     lines.push('To find out why CI fails, run gh run list, then gh run view ID: it shows the failed step and the error with its file and line.');
@@ -427,5 +439,5 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
-  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;pushed=false;const pre=linux?await preamble(prompt,workspace,linux.cwd):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
+  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;pushed=false;const pre=linux?await preamble(prompt,workspace,linux.cwd,linux.building?.()||null):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
 }

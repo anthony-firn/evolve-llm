@@ -143,6 +143,12 @@ compiler or Node, so other builds and tests run in the repository's GitHub Actio
 branch and `gh run watch` shows what failed. That is also how Pi works on Evolve LLM itself, whose
 CI builds the engine and the app and runs the Rust, Node and browser tests (8 to 12 minutes).
 
+On Linux, a computer paired for building one repository (`python3 companion/local.py --project
+OWNER/NAME`, see `companion/README.md`) runs `cargo`, `npm`, `npx`, `node` and `native COMMAND`
+from a clone of that repository in the VM: the clone's files go to the computer's own copy, the
+command runs there in a sandbox without network, and its output streams back. Pi is told when
+the repository it works on is built that way.
+
 Merging works on GitHub, and always asks the person first, whatever the autonomy setting:
 
 ```text
