@@ -216,12 +216,18 @@ impl Session {
         if tokens.len() >= self.engine.context_length() {
             return Err(format!("the prompt has {} tokens; the context holds {}", tokens.len(), self.engine.context_length()));
         }
-        if self.engine.is_recurrent() {
-            return Err("images with recurrent models are not supported yet".into());
-        }
         self.pending = None;
         // Reuse the text before the first image only: another image has the same placeholder ids.
-        let common = self.cached.iter().zip(tokens).take_while(|(a, b)| a == b).count().min(first);
+        let mut common = self.cached.iter().zip(tokens).take_while(|(a, b)| a == b).count().min(first);
+        // A recurrent state cannot be rewound: go back to the snapshot if it is still a prefix,
+        // or start over (as in prefill).
+        let stale = self.engine.is_recurrent() && self.engine.recurrent_position() != self.cached.len();
+        if self.engine.is_recurrent() && (stale || common < self.cached.len()) {
+            common = match self.snapshot.filter(|&p| p <= common) {
+                Some(p) if self.engine.restore() == Some(p) => p,
+                _ => 0,
+            };
+        }
         self.cached.truncate(common);
         self.forget_images(common);
         let rest = &tokens[common..];
@@ -262,6 +268,10 @@ impl Session {
         }
         self.logits = self.engine.forward_hidden_positioned(&hidden, rest.len(), common, &positions, &deep).await?;
         self.cached.extend_from_slice(rest);
+        if self.engine.is_recurrent() {
+            self.engine.snapshot();
+            self.snapshot = Some(self.cached.len());
+        }
         self.image_from = Some(common + rest[..].iter().position(|&t| t == pad).unwrap_or(0));
         // Tokens from here on: rotary position = cache slot + this offset.
         self.engine.set_rope_delta(pos as i32 - self.cached.len() as i32);
