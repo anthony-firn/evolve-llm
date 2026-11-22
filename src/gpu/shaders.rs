@@ -55,7 +55,8 @@ fn gate(g: f32, v: f32) -> f32 {
     return g / (1.0 + exp(-g)) * v;
 }
 
-// Modes: 0 store, 1 add, 2 SiLU gate, 4 situ gate, 5 multiply by sigmoid (an output gate).
+// Modes: 0 store, 1 add, 2 SiLU gate, 4 situ gate, 5 multiply by sigmoid (an output gate),
+// 6 multiply by SiLU (Gated DeltaNet's output gate).
 fn finish(t: u32, r: u32, acc: f32) {
     var v = acc;
     if (p.has_bias == 1u) { v += bias[p.out_offset + r]; }
@@ -66,6 +67,8 @@ fn finish(t: u32, r: u32, acc: f32) {
         y[i] = y[i] + v;
     } else if (p.mode == 5u) {
         y[i] = y[i] / (1.0 + exp(-v));
+    } else if (p.mode == 6u) {
+        y[i] = y[i] * v / (1.0 + exp(-v));
     } else {
         y[i] = gate(y[i], v);
     }
@@ -1324,11 +1327,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 ///   S_ij    = S_ij decay_i + k_i d_j
 ///   o_j     = scale * sum_i S_ij q_i
 pub const KDA: &str = r#"
-struct P { n_head: u32, d: u32, tstride: u32, scale: f32, lb: f32, pad0: u32, pad1: u32, pad2: u32 }
+// mode 0: Kimi delta attention (a decay per key channel: exp(lb * sigmoid(-a * (gate + dt))));
+// mode 1: Gated DeltaNet (one decay per head: exp(a * softplus(gate + dt)), with a = -exp(A_log)).
+// dk: width of the queries and keys; nk: their heads (value head h reads head h % nk).
+// bstride, boff: where a token's beta logits are (merged with the decay gates in some files);
+// gstride, goff: likewise for the per-head decay gates (mode 1).
+struct P { n_head: u32, d: u32, tstride: u32, scale: f32, lb: f32, mode: u32, dk: u32, nk: u32, bstride: u32, boff: u32, gstride: u32, goff: u32 }
 @group(0) @binding(1) var<uniform> p: P;
-// Per token: q (d), k (d), v (d), after the convolution, q and k L2-normalised.
+// Per token: q (dk), k (dk), v (d), after the convolution, q and k L2-normalised.
 @group(0) @binding(2) var<storage, read> qkv: array<f32>;
-// Per token: the decay gate before its bias and activation (d), and beta logits (n_head).
+// Per token: the decay gate before its bias and activation (d, or n_head in mode 1), and beta
+// logits (n_head).
 @group(0) @binding(3) var<storage, read> gk: array<f32>;
 @group(0) @binding(4) var<storage, read> beta: array<f32>;
 @group(0) @binding(5) var<storage, read> dt: array<f32>;
@@ -1344,20 +1353,32 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let h = wg.x / 2u;
     let j = (wg.x % 2u) * 64u + li;
     let hb = h * 128u;
+    let kb = (h % p.nk) * 128u;
     let sb = h * 16384u;
     let ah = -a[h];
     var fresh = step.pos0 == 0u;
     for (var t = 0u; t < step.n_tokens; t++) {
         let tb = t * p.tstride;
+        var head_decay = 0.0;
+        if (p.mode == 1u) {
+            let x = gk[t * p.gstride + p.goff + h] + dt[h];
+            var sp = x;
+            if (x < 20.0) { sp = log(1.0 + exp(x)); }
+            head_decay = exp(a[h] * sp);
+        }
         for (var i = li; i < 128u; i += 64u) {
-            qs[i] = qkv[tb + hb + i];
-            ks[i] = qkv[tb + p.d + hb + i];
-            let g = gk[t * p.d + hb + i] + dt[hb + i];
-            es[i] = exp(p.lb / (1.0 + exp(-ah * g)));
+            qs[i] = qkv[tb + kb + i];
+            ks[i] = qkv[tb + p.dk + kb + i];
+            if (p.mode == 1u) {
+                es[i] = head_decay;
+            } else {
+                let g = gk[t * p.d + hb + i] + dt[hb + i];
+                es[i] = exp(p.lb / (1.0 + exp(-ah * g)));
+            }
         }
         workgroupBarrier();
-        let v = qkv[tb + 2u * p.d + hb + j];
-        let b = 1.0 / (1.0 + exp(-beta[t * p.n_head + h]));
+        let v = qkv[tb + 2u * p.dk + hb + j];
+        let b = 1.0 / (1.0 + exp(-beta[t * p.bstride + p.boff + h]));
         var sk = 0.0;
         if (!fresh) {
             for (var i = 0u; i < 128u; i++) { sk += state[sb + i * 128u + j] * es[i] * ks[i]; }
@@ -1376,6 +1397,39 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
 }
 "#;
+
+/// Qwen3.5's gates: mode 0 splits the query projection (per head: head_dim query values, then
+/// head_dim gate values) into the query and the gate; mode 1 multiplies the attention output by
+/// sigmoid(gate); mode 2 multiplies by SiLU of a gate read from `qg` at (token stride, offset)
+/// (Gated DeltaNet's output gate, merged into its input projection).
+pub const QGATE: &str = r#"
+struct P { q_dim: u32, hd: u32, mode: u32, stride: u32, off: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> qg: array<f32>;
+@group(0) @binding(3) var<storage, read_write> a: array<f32>;
+@group(0) @binding(4) var<storage, read_write> g: array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.y;
+    let j = wg.x * 256u + li;
+    if (j >= p.q_dim) { return; }
+    let i = t * p.q_dim + j;
+    if (p.mode == 0u) {
+        let src = t * 2u * p.q_dim + (j / p.hd) * 2u * p.hd + j % p.hd;
+        a[i] = qg[src];
+        g[i] = qg[src + p.hd];
+    } else if (p.mode == 1u) {
+        a[i] = a[i] / (1.0 + exp(-g[i]));
+    } else {
+        let z = qg[t * p.stride + p.off + j];
+        a[i] = a[i] * z / (1.0 + exp(-z));
+    }
+}
+"#;
+
+pub fn qgate() -> String {
+    format!("{COMMON}{QGATE}")
+}
 
 pub fn res_mix() -> String {
     format!("{COMMON}{RES_MIX}")

@@ -52,6 +52,15 @@ SPECS = {
         rope_theta=10000.0, rope_interleave=True,
         # Saved to config.json as DeepSeek's own checkpoints have it, so the GGUF records sigmoid routing.
         scoring_func="sigmoid", topk_method="noaux_tc")),
+    # Qwen3.5: three Gated DeltaNet layers (two query/key heads shared by four value heads), then
+    # one attention layer with an output gate in its query projection, partial interleaved
+    # multimodal rotary positions.
+    "qwen35": ("Qwen3_5TextConfig", "Qwen3_5ForCausalLM", dict(
+        hidden_size=128, intermediate_size=256, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=64, linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=128,
+        linear_value_head_dim=128, linear_conv_kernel_dim=4, tie_word_embeddings=True,
+        rope_parameters={"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25,
+                         "mrope_section": [3, 3, 2], "mrope_interleaved": True})),
     # DeepSeek V2 Lite layout: no query compression, softmax routing, two shared experts.
     "deepseek2lite": ("DeepseekV2Config", "DeepseekV2ForCausalLM", dict(
         hidden_size=128, intermediate_size=256, moe_intermediate_size=64, num_hidden_layers=3,
@@ -61,6 +70,10 @@ SPECS = {
         qk_rope_head_dim=32, v_head_dim=64, max_position_embeddings=256, tie_word_embeddings=False,
         rope_theta=10000.0)),
 }
+
+
+# Converter options for a model: Qwen3.5 checkpoints normally carry next-token-prediction layers.
+CONVERT_ARGS = {"qwen35": ["--no-mtp"]}
 
 
 def build(name, tokenizer, out_dir):
@@ -109,7 +122,7 @@ def main():
             # Also an 8-bit copy, to run the expert kernels on quantized weights.
             for kind, path in (("f16", out), ("q8_0", a.models / f"tiny-{name}-q8_0.gguf")):
                 subprocess.run([sys.executable, str(a.llama_cpp / "convert_hf_to_gguf.py"), str(tmp), "--outtype",
-                                kind, "--outfile", str(path)], check=True, env=env, stdout=subprocess.DEVNULL,
+                                kind, "--outfile", str(path), *CONVERT_ARGS.get(name, [])], check=True, env=env, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)
         fx = {"file": out.name, "tokens": TOKENS, "positions": [3, len(TOKENS) - 1],
               "logits": [pack(logits[3]), pack(logits[-1])],

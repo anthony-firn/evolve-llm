@@ -296,6 +296,7 @@ enum Kernel {
     ResMix,
     Fill,
     DeepAdd,
+    QGate,
     KdaConv,
     L2Norm,
     Kda,
@@ -325,6 +326,7 @@ struct Layouts {
     res_mix: wgpu::BindGroupLayout,
     fill: wgpu::BindGroupLayout,
     deep_add: wgpu::BindGroupLayout,
+    qgate: wgpu::BindGroupLayout,
     kda_conv: wgpu::BindGroupLayout,
     l2norm: wgpu::BindGroupLayout,
     kda: wgpu::BindGroupLayout,
@@ -875,6 +877,7 @@ impl Engine {
             res_mix: layout(device, "uurrww"),
             fill: layout(device, "uuw"),
             deep_add: layout(device, "uuwr"),
+            qgate: layout(device, "uurww"),
             kda_conv: layout(device, "uurww"),
             l2norm: layout(device, "uuw"),
             kda: layout(device, "uurrrrrww"),
@@ -1047,6 +1050,10 @@ impl Engine {
             let da = self.layouts.deep_add.clone();
             self.pipeline("deep-add".into(), shaders::deep_add(), &da);
         }
+        if self.cfg.q_gate {
+            let qg = self.layouts.qgate.clone();
+            self.pipeline("qgate".into(), shaders::qgate(), &qg);
+        }
         if self.cfg.kda.is_some() {
             self.pipeline("kda-conv".into(), shaders::kda_conv(), &kc);
             self.pipeline("l2norm".into(), shaders::l2norm(), &l2);
@@ -1133,10 +1140,13 @@ impl Engine {
         let mut extra = 0u64;
         if let Some(k) = &cfg.kda {
             let d = k.width();
-            acts += 5 * d + k.head_dim + k.n_head;
+            acts += 2 * d + k.channels() + k.head_dim + k.n_head;
             let layers = k.layers.iter().filter(|&&x| x).count() as u64;
             // State and convolution inputs, twice (the snapshot).
-            extra += layers * (k.n_head * k.head_dim * k.head_dim + 3 * d * 3) as u64 * 4 * 2;
+            extra += layers * (k.n_head * k.head_dim * k.head_dim + (k.conv - 1) * k.channels()) as u64 * 4 * 2;
+        }
+        if cfg.q_gate {
+            acts += 3 * cfg.q_dim();
         }
         if cfg.attn_res_block > 0 {
             acts += cfg.n_embd * (1 + cfg.n_layer.div_ceil(cfg.attn_res_block));
@@ -1193,7 +1203,9 @@ impl Engine {
         // of it keeps its own checkpoints.
         let ck = buf("checkpoints", ck_tokens * n_ckpt.max(1) * c.n_embd);
         // Linear attention: q, k, v per token, the decay gate and its low-rank input, beta.
-        let kqv = buf("kda-qkv", t * 3 * kd);
+        let kqv = buf("kda-qkv", t * kda.as_ref().map_or(0, |k| k.channels() + if k.merged { k.width() } else { 0 }));
+        // Qwen3.5's query projection with its gate, and the gate.
+        let (qg_in, qg) = if c.q_gate { (buf("q-and-gate", t * 2 * c.q_dim()), buf("q-gate", t * c.q_dim())) } else { (buf("unused", 4), buf("unused", 4)) };
         let gk = buf("kda-gate", t * kd);
         let fa = buf("kda-gate-a", t * kda.as_ref().map_or(1, |k| k.head_dim));
         let betab = buf("kda-beta", t * kda.as_ref().map_or(1, |k| k.n_head));
@@ -1345,7 +1357,7 @@ impl Engine {
                 // Layers another device runs keep their state there.
                 let here = self.stage.has_layer(l);
                 let pair = || match here {
-                    true => (buf("kda-state", kk.n_head * kk.head_dim * kk.head_dim), buf("kda-conv", 3 * kd * 3)),
+                    true => (buf("kda-state", kk.n_head * kk.head_dim * kk.head_dim), buf("kda-conv", (kk.conv - 1) * kk.channels())),
                     false => (buf("unused", 4), buf("unused", 4)),
                 };
                 kda_state.push(pair());
@@ -1667,7 +1679,67 @@ impl Engine {
             } else {
                 norm(&mut ops, &x, &self.vecs[&n("attn_norm.weight")], &xn, c.n_embd, false);
             }
-            if c.is_kda(l) {
+            if c.is_kda(l) && kda.as_ref().is_some_and(|k| k.gdn) {
+                // Gated DeltaNet (Qwen3.5): one projection and one convolution for queries, keys
+                // and values; L2-normalised queries and keys; one decay per head; per-head
+                // RMSNorm times SiLU of the output gate.
+                let kk = kda.as_ref().unwrap();
+                let input = Input::rows(c.n_embd);
+                let ch = kk.channels();
+                // A token's queries, keys and values, then (merged files) its output gate.
+                let ts = ch + if kk.merged { kk.width() } else { 0 };
+                let hv = kk.n_head as u32;
+                if kk.merged {
+                    matmul(&mut ops, &n("attn_qkv_gate.weight"), &xn, &kqv, 0, None, false, input);
+                    matmul(&mut ops, &n("ssm_beta_alpha.weight"), &xn, &gk, 0, None, false, input);
+                } else {
+                    matmul(&mut ops, &n("attn_qkv.weight"), &xn, &kqv, 0, None, false, input);
+                    matmul(&mut ops, &n("ssm_alpha.weight"), &xn, &gk, 0, None, false, input);
+                    matmul(&mut ops, &n("ssm_beta.weight"), &xn, &betab, 0, None, false, input);
+                }
+                let (state, conv) = &kda_state[kda_index];
+                kda_index += 1;
+                ops.push(Op {
+                    when: When::Always,
+                    kernel: Kernel::KdaConv,
+                    grid: Grid::Groups(ch.div_ceil(256) as u32),
+                    bind: bind(&self.layouts.kda_conv, "kda-conv", &[&step, &params(&words(&[ch as u32, ts as u32, 0, 0])), &self.vecs[&n("ssm_conv1d.weight")], &kqv, conv]),
+                });
+                let mut d = words(&[kk.head_dim as u32, (2 * kk.n_k_head) as u32, ts as u32]);
+                d.extend(c.rms_eps.to_le_bytes());
+                ops.push(Op {
+                    when: When::Always,
+                    kernel: Kernel::L2Norm,
+                    grid: Grid::Heads((2 * kk.n_k_head) as u32),
+                    bind: bind(&self.layouts.l2norm, "l2norm", &[&step, &params(&d), &kqv]),
+                });
+                let mut d = words(&[hv, kk.width() as u32, ts as u32]);
+                d.extend((1.0 / (kk.head_dim as f32).sqrt()).to_le_bytes());
+                d.extend(0f32.to_le_bytes());
+                d.extend(words(&[1, kk.k_width() as u32, kk.n_k_head as u32]));
+                // Beta and the decay gates: [beta | alpha] per token when merged.
+                let (beta_buf, ba) = if kk.merged { (&gk, [2 * hv, 0, 2 * hv, hv]) } else { (&betab, [hv, 0, hv, 0]) };
+                d.extend(words(&ba));
+                ops.push(Op {
+                    when: When::Always,
+                    kernel: Kernel::Kda,
+                    grid: Grid::Groups((2 * kk.n_head) as u32),
+                    bind: bind(&self.layouts.kda, "kda", &[&step, &params(&d), &kqv, &gk, beta_buf, &self.vecs[&n("ssm_dt.bias")], &self.vecs[&n("ssm_a")], state, &att]),
+                });
+                norm_inplace(&mut ops, &att, &self.vecs[&n("ssm_norm.weight")], kk.head_dim, kk.n_head);
+                if kk.merged {
+                    let w = kk.width() as u32;
+                    ops.push(Op {
+                        when: When::Always,
+                        kernel: Kernel::QGate,
+                        grid: Grid::Width(w),
+                        bind: bind(&self.layouts.qgate, "qgate", &[&step, &params(&words(&[w, kk.head_dim as u32, 2, ts as u32, ch as u32, 0, 0, 0])), &kqv, &att, &qg]),
+                    });
+                } else {
+                    matmul(&mut ops, &n("attn_gate.weight"), &xn, &att, 6, None, false, input);
+                }
+                matmul(&mut ops, &n("ssm_out.weight"), &att, &x, out_mode, None, false, Input::rows(kk.width()));
+            } else if c.is_kda(l) {
                 let kk = kda.as_ref().unwrap();
                 let input = Input::rows(c.n_embd);
                 for (j, w) in ["attn_q", "attn_k", "attn_v"].iter().enumerate() {
@@ -1698,7 +1770,7 @@ impl Engine {
                 let mut d = words(&[kk.n_head as u32, kd as u32, (3 * kd) as u32]);
                 d.extend((1.0 / (kk.head_dim as f32).sqrt()).to_le_bytes());
                 d.extend(kk.gate_lower_bound.to_le_bytes());
-                d.extend(words(&[0, 0, 0]));
+                d.extend(words(&[0, kd as u32, kk.n_head as u32, kk.n_head as u32, 0, 0, 0]));
                 ops.push(Op {
                     when: When::Always,
                     kernel: Kernel::Kda,
@@ -1816,7 +1888,18 @@ impl Engine {
                     }
                 };
                 let input = Input::rows(c.n_embd);
-                matmul(&mut ops, &n("attn_q.weight"), &xn, &q, 0, bias("attn_q.bias"), false, input);
+                let qgate = |mode: u32, a: &wgpu::Buffer| Op {
+                    when: When::Always,
+                    kernel: Kernel::QGate,
+                    grid: Grid::Width(c.q_dim() as u32),
+                    bind: bind(&self.layouts.qgate, "qgate", &[&step, &params(&words(&[c.q_dim() as u32, c.head_dim as u32, mode, 0, 0, 0, 0, 0])), &qg_in, a, &qg]),
+                };
+                if c.q_gate {
+                    matmul(&mut ops, &n("attn_q.weight"), &xn, &qg_in, 0, None, false, input);
+                    ops.push(qgate(0, &q));
+                } else {
+                    matmul(&mut ops, &n("attn_q.weight"), &xn, &q, 0, bias("attn_q.bias"), false, input);
+                }
                 matmul(&mut ops, &n("attn_k.weight"), &xn, &k, 0, bias("attn_k.bias"), false, input);
                 matmul(&mut ops, &n("attn_v.weight"), &xn, &v, 0, bias("attn_v.bias"), false, input);
                 if c.qk_norm_full {
@@ -1838,13 +1921,16 @@ impl Engine {
                     grid: Grid::Heads(c.n_head as u32),
                     bind: bind(&self.layouts.attention, "attention", &[&step, &attn_p, &q, &kc[l], &vc[l], &att]),
                 });
+                if c.q_gate {
+                    ops.push(qgate(1, &att));
+                }
                 matmul(&mut ops, &n("attn_output.weight"), &att, &x, out_mode, None, false, Input::rows(c.q_dim()));
             }
             if bs > 0 {
                 res_mix(&mut ops, &self.vecs[&n("ffn_res_score.weight")], l / bs + 1, false, &xm);
-                norm(&mut ops, &xm, &self.vecs[&n("ffn_norm.weight")], &xn, c.n_embd, false);
+                norm(&mut ops, &xm, &self.vecs[&n(c.ffn_norm())], &xn, c.n_embd, false);
             } else {
-                norm(&mut ops, &x, &self.vecs[&n("ffn_norm.weight")], &xn, c.n_embd, false);
+                norm(&mut ops, &x, &self.vecs[&n(c.ffn_norm())], &xn, c.n_embd, false);
             }
             let input = Input::rows(c.n_embd);
             match moe.as_ref().filter(|_| c.is_moe(l)) {
@@ -2098,6 +2184,7 @@ impl Engine {
             (Kernel::ResMix, Grid::Tokens) => ("res-mix".into(), (t, 1)),
             (Kernel::Fill, Grid::Width(w)) => ("fill".into(), (w.div_ceil(256), t)),
             (Kernel::DeepAdd, Grid::Width(w)) => ("deep-add".into(), (w.div_ceil(256), t)),
+            (Kernel::QGate, Grid::Width(w)) => ("qgate".into(), (w.div_ceil(256), t)),
             (Kernel::KdaConv, Grid::Groups(n)) => ("kda-conv".into(), (n, 1)),
             (Kernel::L2Norm, Grid::Heads(h)) => ("l2norm".into(), (h, t)),
             (Kernel::Kda, Grid::Groups(n)) => ("kda".into(), (n, 1)),
