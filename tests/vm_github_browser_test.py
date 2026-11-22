@@ -267,6 +267,8 @@ def main():
         check(code == 0 and out.endswith("./README.md\n./docs/notes.txt\n./src/main.rs\n"), f"clone downloads the tree ({out!r} {err!r})")
         code, out, _ = sh("cd app && git status")
         check("nothing to commit, working tree clean" in out, "a fresh clone is clean")
+        code, out, _ = sh("gh repo clone demo/app")
+        check(code == 0 and "app/ already holds demo/app (next: cd app)" in out, f"cloning again is harmless ({out!r})")
         code, out, _ = sh("cd app && echo more >> README.md && printf 'new\\n' > new.txt && rm docs/notes.txt && git status && git diff README.md")
         check("modified:   README.md" in out and "new file:   new.txt" in out and "deleted:    docs/notes.txt" in out, "status lists the changes")
         check("+more" in out and "--- a/README.md" in out, "diff shows the edit")

@@ -23,7 +23,8 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 # The model's replies, one per turn: tool calls in Qwen's syntax, then an answer.
 SCRIPT = [
-    {"name": "bash", "arguments": {"command": "gh repo clone demo/app"}},
+    {"name": "bash", "arguments": {"command": "gh repo clone demo/app && cd demo/app"}},  # the folder is app: fails, with notes
+    {"name": "bash", "arguments": {"command": "gh repo clone demo/app"}},  # cloning again is harmless
     {"name": "bash", "arguments": {"command": "cd app"}},  # carries over to the next calls
     {"name": "read", "arguments": {"path": "README.md"}},
     {"name": "edit", "arguments": {"path": "README.md", "oldText": "# Demo", "newText": "# Demo\n\nBuilt by Pi."}},
@@ -94,7 +95,7 @@ def main():
             workspace: new VmWorkspace(vmClient, { cwd: '/home/user' }),
             network: { options: () => ({ enabled: false }) },
             linux: { cwd: '/home/user' },
-            onEvent: (e) => { if (e.type === 'tool-result') events.push([e.isError, JSON.stringify(e.result).slice(0, 300)]); },
+            onEvent: (e) => { if (e.type === 'tool-result') events.push([e.isError, JSON.stringify(e.result).slice(0, 2000)]); },
             turn: async () => {
               const call = script[turn++];
               return call ? { text: `<tool_call>${JSON.stringify(call)}</tool_call>`, reason: 'end' } : { text: 'Opened a pull request.', reason: 'end' };
@@ -104,7 +105,8 @@ def main():
           return { calls: r.calls, events, asked };
         }""", {"origin": origin, "script": SCRIPT})
         failed = [e for e in result["events"] if e[0]]
-        check(result["calls"] == len(SCRIPT) and not failed, f"every tool call ran ({result['calls']} calls; failures {failed})")
+        check(result["calls"] == len(SCRIPT) and len(failed) == 1, f"every tool call ran, one failing on purpose ({result['calls']} calls; failures {failed})")
+        check(failed and "Folders here: app/" in failed[0][1] and "stopped at the first error" in failed[0][1], f"a failed cd and chain say what to do ({failed[:1]})")
         head = gh.FAKE.refs.get("pi-readme")
         tree = gh.FAKE.trees[gh.FAKE.commits[head]["tree"]] if head else {}
         check(head and gh.FAKE.blobs[tree["README.md"]] == b"# Demo\n\nBuilt by Pi.\n", "the branch on GitHub holds Pi's edit")

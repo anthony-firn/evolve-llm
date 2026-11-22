@@ -1028,7 +1028,7 @@ function onWorkerMessage(event) {
   if (msg.requestId) {
     if (!agentRequest || msg.requestId !== agentRequest.id) return;
     if (msg.type === 'agent_event' && msg.event.type === 'token') agentRequest.onToken?.(msg.event.text);
-    else if (msg.type === 'agent_done') finishAgent(agentRequest.aborted ? new Error('Stopped.') : null, msg);
+    else if (msg.type === 'agent_done') finishAgent(agentRequest.aborted ? new Error(agentRequest.timedOut ? `One model turn took more than ${agentRequest.timedOut} minutes, so it was stopped. A smaller model, a faster GPU or a shorter request helps.` : 'Stopped.') : null, msg);
     else if (msg.type === 'error') finishAgent(new Error(msg.message));
     return;
   }
@@ -1255,7 +1255,8 @@ function restartEngine(reason) {
 function piLimits() {
   if (state.loaded?.stream) return { turn: 0, task: 0, stop: 120000 };
   if (state.loaded?.chat?.placement?.streaming) return { turn: 1800000, task: 7200000, stop: 60000 };
-  return { turn: 120000, task: 180000, stop: 10000 };
+  // A 4B model on an integrated GPU reads a long prompt and writes a long reply in minutes, not seconds.
+  return { turn: 600000, task: 180000, stop: 10000 };
 }
 function agentTurn(messages,tools,{signal,onToken,maxTokens=2048,options}={}) {
   if(state.phase!=='agent'||agentRequest)return Promise.reject(new Error('The model is busy.'));
@@ -1264,7 +1265,8 @@ function agentTurn(messages,tools,{signal,onToken,maxTokens=2048,options}={}) {
     const id=++agentSequence;
     const limits=piLimits();
     const abort=()=>{if(agentRequest?.id!==id)return;agentRequest.aborted=true;worker.postMessage({type:'stop'});agentRequest.cancelTimer=setTimeout(()=>restartEngine('Stopping took too long, so the model was unloaded.'),limits.stop)};
-    agentRequest={id,resolve,reject,onToken,signal,abort,timer:limits.turn?setTimeout(()=>restartEngine(`One model turn took more than ${Math.round(limits.turn/60000)} minutes, so the model was unloaded.`),limits.turn):null};
+    // A turn past its limit is stopped like Stop does; the model stays loaded unless stopping hangs.
+    agentRequest={id,resolve,reject,onToken,signal,abort,timer:limits.turn?setTimeout(()=>{if(agentRequest?.id===id){agentRequest.timedOut=Math.round(limits.turn/60000);abort();}},limits.turn):null};
     signal?.addEventListener('abort',abort,{once:true});
     worker.postMessage({type:'agent_turn',requestId:id,messages,tools,options,maxTokens:Math.max(64,Math.min(4096,Number(maxTokens)||2048)),sampler:{temperature:0,top_p:.95,top_k:40,min_p:.05,repeat_penalty:1.1,repeat_last_n:64,seed:1}});
   });

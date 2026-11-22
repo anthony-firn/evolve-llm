@@ -390,7 +390,14 @@ fn clone(args: &[String]) -> R<()> {
     let commit = b["commit"]["sha"].as_str().ok_or("branch without a commit")?.to_string();
     let root = PathBuf::from(&dir);
     if root.exists() && fs::read_dir(&root).map(|mut d| d.next().is_some()).unwrap_or(false) {
-        return Err(format!("{dir} already exists and is not empty"));
+        // Cloning again is harmless: a small model often repeats a clone it already made.
+        let same = fs::read_to_string(root.join(STATE).join("config.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .is_some_and(|c| c["owner"].as_str() == Some(owner) && c["repo"].as_str() == Some(repo));
+        if same {
+            println!("{dir}/ already holds {owner}/{repo} (next: cd {dir})");
+            return Ok(());
+        }
+        return Err(format!("{dir} already exists and is not empty; clone into another folder with: gh repo clone {owner}/{repo} NEW-FOLDER"));
     }
     eprintln!("Cloning {owner}/{repo} ({branch} at {})...", short(&commit));
     let (files, tree, mut skipped) = tree_of(owner, repo, &commit)?;
@@ -406,7 +413,7 @@ fn clone(args: &[String]) -> R<()> {
     r.save_log(&[])?;
     // The tree as cloned: what the first local commit is compared with when pushing.
     fs::write(r.state("upstream.json"), serde_json::to_string(&head).unwrap()).map_err(|e| e.to_string())?;
-    println!("Cloned {n} files into {dir}/");
+    println!("Cloned {n} files into {dir}/ (next: cd {dir})");
     for s in skipped {
         println!("  skipped {s}");
     }

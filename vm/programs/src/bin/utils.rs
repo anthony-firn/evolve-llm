@@ -171,6 +171,9 @@ fn ls(args: &[String], out: &mut dyn Write) -> R {
     let show = |name: &str, path: &Path, out: &mut dyn Write| -> io::Result<()> {
         let meta = fs::symlink_metadata(path)?;
         let ft = meta.file_type();
+        // -p and -F mark directories with a trailing slash.
+        let marked = format!("{name}{}", if (a.has('p') || a.has('F')) && ft.is_dir() { "/" } else { "" });
+        let name = marked.as_str();
         let colored = if !tty {
             name.to_string()
         } else if ft.is_dir() {

@@ -76,11 +76,19 @@ def main():
                         print(trace_line(json.loads(raw), False), flush=True)
                     except ValueError:
                         pass
+            shown, last_peek = "", 0.0
             while page.get_attribute("#app", "data-phase") != "ready":
                 if time.time() - t0 > a.minutes * 60:
                     drain()
                     sys.exit(f"no reply after {a.minutes} minutes")
                 drain()
+                # The reply being written, every 15 s, so a slow turn shows its progress too.
+                if time.time() - last_peek > 15:
+                    last_peek = time.time()
+                    reply = page.evaluate("document.querySelector('.msg.assistant:last-child .bubble')?.innerText || ''")
+                    if reply != shown:
+                        shown = reply
+                        print(f"  … {time.time() - t0:4.0f}s, {len(reply)} characters so far: {reply[-160:]!r}", flush=True)
                 time.sleep(2)
             time.sleep(1)
             drain()
