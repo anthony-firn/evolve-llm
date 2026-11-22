@@ -9,12 +9,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown, wasm32-wasip1
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: npm ci --ignore-scripts
       - run: cargo test --locked --manifest-path sandbox/Cargo.toml
+      - name: Evolve VM kernel tests
+        run: cargo test --locked --manifest-path vm/Cargo.toml
       - name: Unit and fixture tests
         # GPU and model tests skip themselves when no adapter or GGUF file is present.
         run: cargo test --release

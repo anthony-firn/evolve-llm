@@ -13,14 +13,18 @@ GGUF files, single or split. It is tested in Chrome on Linux with NVIDIA and Int
 against reference implementations (see [Verification](#verification)). The largest models in
 the catalog have not been run end to end yet; see [Limits](#limits).
 
-## Browser workspace and Pi
+## One chat that can also do things
 
-Ask the main chat to build an app or game, or open **Terminal** for a persistent WASM text workspace with pipes and file redirects.
-Enter `demo snake` to play the included example, or `preview game.html` to run your own
-single-file HTML app in an isolated frame. Pi can test apps, inspect runtime errors and edit them. Load a
-tool-capable model, then enter `pi <task>` to run Pi agent core with sandbox file and research
-tools. Web access is explicit; there is no host shell or server inference. See
-[commands, limits, permissions and self-hosting](docs/workbench.md).
+Ask the main chat anything, or ask it to make or change something: an app or game (it plays in the
+conversation), files, or work on your GitHub repositories. The model decides when to use tools, and
+its work shows as one collapsed line of plain steps under the reply. Behind it is Pi's agent core
+with the loaded model, working in the Evolve VM: a Rust kernel in WebAssembly with a POSIX-style
+shell, utilities, and `git` and `gh` that work on GitHub through its API (clone, commit, push,
+pull requests, CI results and merging). Pushing follows the autonomy you choose in Settings, and
+merging always asks you. **Terminal** opens the same files in a Linux terminal, where `pi <task>`
+runs the same agent. Browsers without WebAssembly JSPI (Firefox, Safari) use the older browser
+sandbox instead, without `git`. Web access is explicit; there is no host shell or server
+inference. See [commands, limits, permissions and self-hosting](docs/workbench.md).
 
 ## Web browser
 
@@ -276,6 +280,10 @@ python3 tests/pi_real_model_browser_test.py --runtime dist model.gguf [...]     
 python3 tests/swarm_browser_test.py                                                         # two visitors sharing pieces
 python3 tests/devices_browser_test.py [--memory 0.05]                                       # one model on two devices
 python3 tests/remote_browser_test.py [--pi-hf owner/repo/file.gguf]                         # a phone using a computer
+python3 tools/build_vm.py && python3 tests/vm_browser_test.py                               # the Evolve VM
+python3 tests/vm_terminal_browser_test.py                                                   # its terminal, typed into
+python3 tests/vm_github_browser_test.py && python3 tests/vm_pi_browser_test.py               # git, gh and Pi, fake GitHub
+python3 tests/chat_github_real_model_test.py --runtime dist model.gguf                     # a real model in the chat: clone to merge
 ```
 
 GPU and model tests look for GGUF files in `$EVOLVE_LLM_MODELS` (default

@@ -26,3 +26,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+web/vendor/ghostty-web/ is ghostty-web 0.4.0 (https://github.com/coder/ghostty-web),
+Copyright (c) 2025 Coder, MIT License (web/vendor/ghostty-web/LICENSE). Its terminal core,
+ghostty-vt.wasm, is built from Ghostty (https://github.com/ghostty-org/ghostty),
+Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors, MIT License.

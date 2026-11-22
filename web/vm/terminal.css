@@ -1,0 +1,28 @@
+/* The Evolve VM terminal window, in the manner of GNOME Terminal. */
+.vt-window { --vt-bg: #1e1e1e; --vt-fg: #d0cfcc; display: flex; flex-direction: column; min-height: 0; height: 100%; background: var(--vt-bg); color: var(--vt-fg); border-radius: 12px; overflow: hidden; border: 1px solid rgba(127,127,127,.35); position: relative; }
+.vt-header { display: flex; align-items: center; gap: 4px; padding: 4px 6px; background: #2b2b2b; color: #eee; position: relative; min-width: 0; }
+.vt-tabs { display: flex; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.vt-tab { display: inline-flex; align-items: center; gap: 8px; max-width: 220px; padding: 6px 10px; border: 0; border-radius: 8px; background: transparent; color: #ccc; font: 500 .8rem system-ui, sans-serif; cursor: pointer; }
+.vt-tab.active { background: #3d3d3d; color: #fff; }
+.vt-tab-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vt-tab-close { opacity: .6; font-size: .75rem; padding: 0 2px; border-radius: 4px; }
+.vt-tab-close:hover { opacity: 1; background: rgba(255,255,255,.15); }
+.vt-icon { border: 0; background: transparent; color: #ddd; font-size: 1rem; width: 30px; height: 30px; border-radius: 8px; cursor: pointer; flex: none; }
+.vt-icon:hover, .vt-tab:hover { background: rgba(255,255,255,.1); }
+.vt-spacer { flex: 1; }
+.vt-menu { position: absolute; right: 6px; top: 40px; z-index: 5; min-width: 240px; padding: 6px; background: #303030; border-radius: 10px; box-shadow: 0 8px 28px rgba(0,0,0,.45); display: flex; flex-direction: column; }
+.vt-menu[hidden] { display: none; }
+.vt-menu hr { border: 0; border-top: 1px solid rgba(255,255,255,.12); margin: 4px 0; }
+.vt-menu-item { display: flex; justify-content: space-between; gap: 16px; padding: 7px 10px; border: 0; border-radius: 6px; background: transparent; color: #eee; font: .82rem system-ui, sans-serif; text-align: left; cursor: pointer; }
+.vt-menu-item:hover, .vt-menu-item:focus-visible { background: rgba(255,255,255,.1); }
+.vt-menu-item kbd { color: #aaa; font: .75rem system-ui, sans-serif; }
+.vt-find { display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: #2b2b2b; }
+.vt-find[hidden] { display: none; }
+.vt-find input { flex: 1; min-width: 0; padding: 5px 8px; border-radius: 6px; border: 1px solid #555; background: #1f1f1f; color: #eee; font: .82rem system-ui, sans-serif; }
+.vt-find-count { color: #aaa; font: .75rem system-ui, sans-serif; min-width: 70px; text-align: right; }
+.vt-body { flex: 1; min-height: 0; position: relative; padding: 4px 0 0 6px; }
+.vt-term { position: absolute; inset: 4px 0 0 6px; }
+.vt-term[hidden] { display: none; }
+/* terminal.html: the window fills the page. */
+.vt-page { margin: 0; height: 100vh; background: #111; }
+.vt-page #term { position: fixed; inset: 12px; }

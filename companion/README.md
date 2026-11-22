@@ -8,10 +8,9 @@ Install once from this checkout with `python3 companion/install.py`. Open **Evol
 Local** from the application launcher. It starts the user service and opens the
 live site with a private pairing link. Allow the browser's local-device connection
 prompt. Load a tool-capable coding model, then use **Local computer → Ask Pi**.
-**Main chat** uses the connected computer in Auto and Build modes, with tool
-activity shown in each reply and Stop cancelling the active operation. Follow-up
-messages include recent conversation context. Chat mode has no computer tools.
-Disconnect to return Auto/Build to the browser workspace.
+**The main chat** works on the connected computer, with its steps shown under each
+reply and Stop cancelling the active operation. Follow-up messages include recent
+conversation context. Disconnect to return the chat to the workspace in the browser.
 
 **Run command** works without a model. Select **Run direct command as root** only
 for operations that require administrator rights.

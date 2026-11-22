@@ -1,7 +1,9 @@
 import { LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from './models.js';
 import { renderMarkdown, splitThinking } from './markdown.js';
 import { stripToolCalls } from './tools.js';
-import { wantsDevelopment, wantsSnakeStarter, wantsBrowser, developmentSummary, createDevelopmentView } from './chat-development.mjs';
+import { wantsSnakeStarter, wantsBrowser, createWorkView } from './chat-development.mjs';
+import { trace } from './trace.mjs';
+import { newChatId, saveChat, getChat, listChats, deleteChat } from './chats.mjs';
 
 const $ = (id) => document.getElementById(id);
 const app = $('app');
@@ -17,7 +19,7 @@ let worker = newWorker();
 if (REMOTE_CODE) app.dataset.remote = '';
 const IS_MOBILE = navigator.userAgentData?.mobile ?? /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
 
-const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', cacheGb: 10, share: false, shareUpload: 2, internet: false, jinaKey: '' };
+const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', cacheGb: 10, share: false, shareUpload: 2, internet: false, jinaKey: '', githubToken: '', autonomy: 1 };
 const SUGGESTIONS = [
   'Make me a Snake game I can play.',
   'Write a haiku about running AI on my own laptop.',
@@ -32,10 +34,16 @@ const state = {
   loading: null, // { label, id, key }
   loaded: null, // { id, key, label, info, chat }
   messages: [], // { role, content, stats?, error? }
-  developmentActive: false,
+  chatId: newChatId(), // where this conversation is saved (web/chats.mjs)
   live: null, // the assistant message being written
   settings: loadSettings(),
 };
+
+// The Linux terminal's VM takes the GitHub token and autonomy from Settings (when it starts,
+// and on every change); the VM is created only when the terminal opens.
+function configureVm() {
+  import('./vm/client.mjs').then(({ provideConfig }) => provideConfig(() => ({ github: { token: state.settings.githubToken || '', autonomy: Number(state.settings.autonomy ?? 1) } }))).catch(() => {});
+}
 
 function loadSettings() {
   try {
@@ -78,12 +86,11 @@ function setPhase(phase) {
   if (REMOTE_CODE) keepAwake(['loading', 'generating', 'agent', 'preparing'].includes(phase));
   const ready = phase === 'ready';
   const agentBusy = phase === 'agent' || phase === 'preparing';
-  const generating = phase === 'generating' || (agentBusy && Boolean(state.live?.development));
-  $('chat-mode').disabled = agentBusy || phase === 'generating';
+  const generating = phase === 'generating' || (agentBusy && Boolean(state.live?.assistant));
   $('file-input').disabled = agentBusy;
   $('hf-input').disabled = agentBusy;
   $('prompt').disabled = !(ready || phase === 'generating');
-  $('prompt').placeholder = state.loaded ? 'Ask a question or build…' : 'Choose a model to start';
+  $('prompt').placeholder = state.loaded ? 'Ask anything, or describe what to build…' : 'Choose a model to start';
   $('send').disabled = !ready;
   $('send').hidden = generating;
   $('stop').hidden = !generating;
@@ -236,7 +243,7 @@ function renderStorage() {
 let loadStarted = 0;
 
 async function startLoad(source) {
-  if (['agent','preparing'].includes(state.phase)) { $('status-line').textContent = 'Stop the Pi task before loading another model.'; return; }
+  if (['agent','preparing'].includes(state.phase)) { $('status-line').textContent = 'Stop the current reply before loading another model.'; return; }
   if (!state.adapter?.ok) return;
   closeDrawer();
   if (state.phase === 'generating') return;
@@ -246,8 +253,8 @@ async function startLoad(source) {
   const label = known ? known.name : source.kind === 'file' ? first.replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '') : source.name;
   state.loading = { label, key: known ? cacheKey(known.repo, known.file) : source.key, id: known ? known.id : source.id, kind: source.kind, stream: Boolean(source.stream) };
   state.loaded = null;
-  for(const m of state.messages)m.developmentView?.dispose();
-  state.messages = [];state.developmentActive=false;
+  for(const m of state.messages)m.workView?.dispose();
+  state.messages = [];state.chatId=newChatId();assistant?.reset();
   renderMessages();
   $('loading-title').textContent = label;
   for (const li of $('loading-steps').children) li.dataset.state = '';
@@ -639,7 +646,7 @@ function onLoaded(msg) {
   const { model, chat, source } = msg;
   state.lastLoaded = msg;
   const label = state.loading?.label || chat.name;
-  state.loaded = { ...source, key: state.loading?.key ?? source.key, label, info: model, chat, stream: Boolean(state.loading?.stream) };
+  state.loaded = { ...source, key: state.loading?.key ?? source.key, label, info: model, chat, tools: Boolean(msg.tools), stream: Boolean(state.loading?.stream) };
   state.loading = null;
   $('loading-bar').classList.remove('indeterminate');
   const secs = (performance.now() - loadStarted) / 1000;
@@ -706,7 +713,6 @@ function stepNode(step) {
 }
 
 function fillAssistant(bubble, m) {
-  if(m.development){const answer=el('div',{class:'answer'});answer.append(renderMarkdown(document,m.content,copyText));bubble.replaceChildren(answer);return;}
   const parts = splitThinking(stripToolCalls(m.content));
   const nodes = [];
   if (m.steps?.length) nodes.push(el('ul', { class: 'web-steps', 'aria-label': 'Web activity' }, ...m.steps.map(stepNode)));
@@ -743,7 +749,7 @@ function messageNode(m, i) {
   fillAssistant(bubble,m);
   const li=m.element ||= el('li',{class:'msg assistant','data-index':i},el('span',{class:'who',text:state.loaded?.label||'Model'}),bubble);
   li.querySelector(':scope > .msg-foot')?.remove();li.querySelector(':scope > .trimmed')?.remove();
-  if(m.developmentView&&m.developmentView.root.parentElement!==li)li.append(m.developmentView.root);
+  if(m.workView&&m.workView.root.parentElement!==li)li.append(m.workView.root);
   if (m !== state.live) {
     const last = i === state.messages.length - 1;
     li.append(el('div', { class: 'msg-foot' },
@@ -795,67 +801,141 @@ function send(text) {
 
 function regenerate() {
   if (state.phase !== 'ready') return;
-  while (state.messages.length && state.messages[state.messages.length - 1].role !== 'user') state.messages.pop().developmentView?.dispose();
+  while (state.messages.length && state.messages[state.messages.length - 1].role !== 'user') state.messages.pop().workView?.dispose();
   if (state.messages.length) runResponse();
 }
 
+// One chat: a model whose template takes tools answers through the assistant (files, git, the
+// web, app previews), deciding itself whether a message needs them; other models chat plainly.
 function runResponse(){
   const question=state.messages.at(-1)?.content||'';
-  if(localComputer.connected && $('chat-mode').value !== 'chat')runLocalResponse(question);
-  else if(wantsDevelopment(question,$('chat-mode').value,state.developmentActive))runDevelopment(question);
+  if(localComputer.connected&&state.loaded?.tools)runLocalResponse(question);
+  else if(state.loaded?.tools)runAssistant(question);
   else runGeneration();
 }
 
+// With a paired computer connected (web/local-computer.mjs), the same chat works on that computer.
 async function runLocalResponse(question) {
-  const context=state.messages.slice(0,-1).filter(m=>!m.error).slice(-6).map(m=>`${m.role}: ${m.content}`).join('\n').slice(-6000);
-  const m={role:'assistant',content:'Pi is working on this computer…',development:true,localComputer:true,started:performance.now()};
-  const activity=el('pre'),details=el('details',{},el('summary',{text:'Local computer activity'}),activity);
-  m.developmentView={root:details,dispose:()=>details.remove()};
+  const context=state.messages.slice(0,-1).filter(m=>!m.error).slice(-6).map(m=>`${m.role}: ${stripToolCalls(m.content)}`).join('\n').slice(-6000);
+  const m={role:'assistant',content:'',assistant:true,localComputer:true,started:performance.now()};
+  m.workView=createWorkView();
   state.live=m;state.messages.push(m);setPhase('preparing');renderMessages();
   $('scroll').scrollTop=$('scroll').scrollHeight;
+  const t0=performance.now();let calls=0,error=null;
+  trace({type:'run',chat:state.chatId,question,model:state.loaded?.label,computer:true});
   try {
     const result=await localComputer.runTask(question,{context,onEvent:e=>{
-      if(e.type==='tool')activity.textContent=(activity.textContent+'\n'+e.name+' '+JSON.stringify(e.args)).slice(-65536);
-      else if(e.type==='tool-result')activity.textContent=(activity.textContent+'\n'+JSON.stringify(e.result)).slice(-65536);
-      else if(e.type==='answer'){m.content=stripToolCalls(e.text||'').trim()||'Pi is working on this computer…';scheduleLiveRender();}
+      m.workView.event(e);
+      if(e.type==='tool')trace({type:'tool',chat:state.chatId,name:e.name,args:JSON.stringify(e.args)});
+      else if(e.type==='tool-result')trace({type:'result',chat:state.chatId,name:e.name,error:Boolean(e.isError),output:(e.result?.content||[]).map(c=>c.text||'').join('\n')});
+      else if(e.type==='answer'){const t=stripToolCalls(e.text||'').trim();if(t){m.content=t;scheduleLiveRender();}}
     }});
+    calls=result.calls;
     const last=result.messages.filter(m=>m.role==='assistant').at(-1);
-    m.content=stripToolCalls((last?.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('\n')).trim()||'Task ended. Review the local computer activity for results.';
-    m.stats=`Local computer · ${result.calls} tool calls · ${result.errors} tool errors`;
-  } catch(error) {m.content='The local computer task stopped: '+String(error.message||error);}
-  finally {state.live=null;setPhase(state.loaded?'ready':'idle');renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;$('status-line').textContent=localComputer.connected?'Computer connected · Auto and Build can use local tools; Chat has no computer tools.':'Local computer disconnected.';}
+    m.content=stripToolCalls((last?.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('\n')).trim()||m.content||'Done.';
+    m.stats=`On your computer${result.calls?` · ${result.calls} step${result.calls===1?'':'s'}`:''}`;
+  } catch(e) {error=String(e.message||e);m.content=(m.content?m.content+'\n\n':'')+(m.cancelRequested?'Stopped.':`I stopped before finishing: ${error}`);}
+  finally {
+    m.workView.finish();state.live=null;setPhase(state.loaded?'ready':'idle');renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;
+    $('status-line').textContent=localComputer.connected?'Computer connected · the chat works on this computer.':'Local computer disconnected.';
+    trace({type:'done',chat:state.chatId,ms:Math.round(performance.now()-t0),calls,error,stopped:Boolean(m.cancelRequested),answer:m.content});
+    saveCurrentChat();
+  }
 }
 
-async function runDevelopment(question){
-  const context=state.messages.slice(0,-1).filter(m=>!m.error).slice(-6).map(m=>`${m.role}: ${m.content}`).join('\n').slice(-6000);
-  const m={role:'assistant',content:'Preparing your workspace…',development:true,started:performance.now()};
-  m.developmentView=createDevelopmentView({openWorkspace:async()=>{try{await(await ensureWorkbench()).open();}catch(error){$('status-line').textContent=error.message;}}});
-  state.live=m;state.messages.push(m);state.developmentActive=true;setPhase('preparing');renderMessages();
-  $('scroll').scrollTop=$('scroll').scrollHeight;
-  try{
-    const session=await ensureWorkbench();
-    if(m.cancelRequested)throw new Error('Task cancelled.');
-    let starter;
-    if(wantsSnakeStarter(question)){
-      const response=await fetch(new URL('./examples/snake.html',import.meta.url));
-      if(!response.ok)throw new Error('The Snake starter could not be loaded.');
-      starter=await response.text();
-    }
-    if(m.cancelRequested)throw new Error('Task cancelled.');
-    m.content='Pi is working on your request…';scheduleLiveRender();
-    const browsing=wantsBrowser(question)||(state.lastTaskBrowsing&&!starter&&question.length<240&&!/\b(make|build|create|write|code|game|app)\b/i.test(question));state.lastTaskBrowsing=browsing;
-    const result=await session.runTask(question.replace(/^\s*pi\s+/i,''),{context,starter,partial:true,browser:browsing?()=>import('./browser-session.mjs').then(b=>b.ensureBrowser({show:true})):undefined,confirmBrowserAction:t=>Promise.resolve(confirm(t+'\n\nAllow Pi to do this?')),onEvent:e=>{m.developmentView.event(e);if(e.type==='starter'){m.content='Your Snake starter is ready below. Pi is applying your request…';scheduleLiveRender();}},preview:(...args)=>m.developmentView.preview(...args)});
-    m.content=developmentSummary(result,m.developmentView.check);
-    m.stats=`Pi · ${result.calls} tool call${result.calls===1?'':'s'} · ${result.changes} file${result.changes===1?'':'s'} changed · ${result.errors} tool errors`;
-    m.developmentView.finish(result);
-  }catch(error){m.content='The development task stopped: '+String(error.message||error);m.developmentView.finish({error:m.content,artifacts:[]});}
-  finally{state.live=null;setPhase(state.loaded?'ready':'idle');renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;$('status-line').textContent='Files stay in your browser. Ask for changes here, or open the workspace.';}
+let assistant=null;
+async function getAssistant(){
+  if(!assistant){
+    const {createAssistant}=await import('./assistant.mjs');
+    assistant||=createAssistant({
+      turn:async(messages,tools,opts)=>{
+        const t0=performance.now();
+        try{
+          const r=await agentTurn(messages,tools,{...opts,options:{enable_thinking:Boolean(state.settings.thinking)}});
+          trace({type:'turn',chat:state.chatId,ms:Math.round(performance.now()-t0),messages:messages.length,promptTokens:r.promptTokens,tokens:r.n,reason:r.reason,text:r.text});
+          return r;
+        }catch(error){trace({type:'turn-error',chat:state.chatId,ms:Math.round(performance.now()-t0),error:String(error.message||error)});throw error;}
+      },
+      getNetwork:()=>({enabled:Boolean(state.settings.internet),jinaKey:state.settings.jinaKey||''}),
+      sandbox:async()=>(await ensureWorkbench()).sandbox(),
+    });
+  }
+  return assistant;
 }
+
+async function runAssistant(question){
+  // Earlier turns as plain text: their answers, without reasoning or tool markup.
+  const history=state.messages.slice(0,-1).filter(m=>!m.error&&(m.role==='user'||m.role==='assistant')).slice(-8)
+    .map(m=>({role:m.role,content:m.role==='assistant'?stripToolCalls(m.content).replace(/<think>[\s\S]*?<\/think>\s*/g,'').trim():m.content})).filter(m=>m.content);
+  const m={role:'assistant',content:'',assistant:true,started:performance.now()};
+  m.workView=createWorkView();
+  state.live=m;state.messages.push(m);setPhase('agent');renderMessages();
+  $('scroll').scrollTop=$('scroll').scrollHeight;
+  // A short follow-up to a website task ("I logged in") keeps the browser.
+  const browsing=wantsBrowser(question)||(state.lastTaskBrowsing&&question.length<240&&!/\b(make|build|create|write|code|game|app)\b/i.test(question));state.lastTaskBrowsing=browsing;
+  const s=state.settings,t0=performance.now();
+  trace({type:'run',chat:state.chatId,question,model:state.loaded?.label,ctx:Number(s.ctx),thinking:Boolean(s.thinking),web:Boolean(s.internet),autonomy:Number(s.autonomy??1),history:history.length,browser:Boolean(browsing)});
+  let calls=0,error=null;
+  try{
+    const a=await getAssistant();
+    if(m.cancelRequested)throw new Error('Stopped.');
+    const result=await a.run(question,{history,view:m.workView,modelName:state.loaded?.label||'Local model',maxTokens:Math.max(2048,Number(state.settings.maxTokens)||0),
+      starter:wantsSnakeStarter(question),
+      browser:browsing?()=>import('./browser-session.mjs').then(b=>b.ensureBrowser({show:true})):undefined,
+      confirmBrowserAction:t=>Promise.resolve(confirm(t+'\n\nAllow this?')),
+      onText:t=>{m.content=t;scheduleLiveRender();},
+      onEvent:e=>{
+        if(e.type==='tool')trace({type:'tool',chat:state.chatId,name:e.name,args:JSON.stringify(e.args)});
+        else if(e.type==='tool-result')trace({type:'result',chat:state.chatId,name:e.name,error:Boolean(e.isError),output:(e.result?.content||[]).map(c=>c.text||'').join('\n')});
+        else if(e.type==='retry')trace({type:'retry',chat:state.chatId,message:e.message,output:e.output});
+      }});
+    calls=result.calls;error=result.error;
+    m.content=result.answer||m.content||(result.calls?'Done.':'');
+    if(result.error)m.content=(m.content?m.content+'\n\n':'')+(m.cancelRequested?'Stopped.':`I stopped before finishing: ${result.error}`);
+    if(!m.content.trim())m.content='(no reply)';
+    m.stats=result.calls?`${result.calls} step${result.calls===1?'':'s'}`:'';
+  }catch(e){error=String(e.message||e);m.content=(m.content?m.content+'\n\n':'')+(m.cancelRequested?'Stopped.':`I stopped before finishing: ${error}`);}
+  finally{
+    m.workView.finish();state.live=null;setPhase(state.loaded?'ready':'idle');renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;
+    trace({type:'done',chat:state.chatId,ms:Math.round(performance.now()-t0),calls,error,stopped:Boolean(m.cancelRequested),answer:m.content});
+    saveCurrentChat();
+  }
+}
+
+// ---- Saved chats: every finished reply saves the conversation in this browser ----
+function saveCurrentChat(){
+  const messages=state.messages.filter(m=>m!==state.live&&(m.role==='user'||m.role==='assistant'));
+  if(!messages.length)return;
+  const title=(messages.find(m=>m.role==='user')?.content||'Chat').replace(/\s+/g,' ').slice(0,80);
+  saveChat({id:state.chatId,title,updated:Date.now(),model:state.loaded?.label||'',
+    messages:messages.map(m=>({role:m.role,content:m.content,...(m.error&&{error:true}),...(m.stats&&{stats:m.stats}),...(m.workView&&m.workView.record)}))}).catch(()=>{});
+}
+async function openChat(id){
+  if(!['ready','idle'].includes(state.phase))return;
+  const chat=await getChat(id);if(!chat)return;
+  for(const m of state.messages)m.workView?.dispose();
+  const openFile=async path=>(await getAssistant()).read(path);
+  state.messages=chat.messages.map(m=>({...m,steps:undefined,preview:undefined,...(m.role==='assistant'&&(m.steps?.length||m.preview)&&{workView:createWorkView({restore:{steps:m.steps,preview:m.preview},openFile})})}));
+  state.chatId=chat.id;assistant?.reset();
+  setPhase(state.phase);renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;
+}
+async function showChats(){
+  const list=$('chat-list');
+  const chats=await listChats().catch(()=>[]);
+  const when=t=>new Date(t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+  list.replaceChildren(...chats.map(c=>el('li',{class:c.id===state.chatId?'current':''},
+    el('button',{type:'button',class:'chat-open',onclick:()=>{$('chats').close();openChat(c.id);}},el('strong',{text:c.title}),el('small',{text:`${when(c.updated)}${c.model?' · '+c.model:''}`})),
+    el('button',{type:'button',class:'ghost chat-delete','aria-label':`Delete “${c.title}”`,text:'Delete',onclick:async()=>{await deleteChat(c.id).catch(()=>{});showChats();}}))));
+  $('chats-empty').hidden=chats.length>0;
+  if(!$('chats').open)$('chats').showModal();
+}
+$('open-chats').addEventListener('click',()=>{showChats();});
 
 function runGeneration() {
   const now = new Date();
   const s = state.settings;
   const history = conversation();
+  trace({ type: 'chat', chat: state.chatId, question: state.messages.at(-1)?.content || '', model: state.loaded?.label, ctx: Number(s.ctx) });
   state.live = { role: 'assistant', content: '', started: performance.now() };
   state.messages.push(state.live);
   setPhase('generating');
@@ -906,6 +986,8 @@ function onDone(d) {
   m.stats = `${slow}${prompt}${why}${stream}${net}`;
   if (!m.content.trim()) m.content = d.reason === 'stopped' ? '' : '(no reply)';
   state.live = null;
+  trace({ type: 'reply', chat: state.chatId, tokens: d.tokens, ms: Math.round(d.ms), reason: d.reason, text: m.content });
+  saveCurrentChat();
   $('status-line').textContent = `Context: ${d.used.toLocaleString()} of ${d.context.toLocaleString()} tokens used`;
   setPhase('ready');
   renderMessages();
@@ -946,7 +1028,7 @@ function onWorkerMessage(event) {
   if (msg.requestId) {
     if (!agentRequest || msg.requestId !== agentRequest.id) return;
     if (msg.type === 'agent_event' && msg.event.type === 'token') agentRequest.onToken?.(msg.event.text);
-    else if (msg.type === 'agent_done') finishAgent(agentRequest.aborted ? new Error('Pi model turn cancelled.') : null, msg);
+    else if (msg.type === 'agent_done') finishAgent(agentRequest.aborted ? new Error(agentRequest.timedOut ? `One model turn took more than ${agentRequest.timedOut} minutes, so it was stopped. A smaller model, a faster GPU or a shorter request helps.` : 'Stopped.') : null, msg);
     else if (msg.type === 'error') finishAgent(new Error(msg.message));
     return;
   }
@@ -1014,7 +1096,7 @@ $('composer').addEventListener('submit', (e) => {
   autosize();
   send(text);
 });
-function stopCurrent(){if(state.live?.development){state.live.cancelRequested=true;if(state.live.localComputer)localComputer.cancel();else workbench?.cancel();}else worker.postMessage({type:'stop'});}
+function stopCurrent(){if(state.live?.assistant){state.live.cancelRequested=true;if(state.live.localComputer)localComputer.cancel();else assistant?.cancel();}else worker.postMessage({type:'stop'});}
 $('stop').addEventListener('click',stopCurrent);
 $('web-toggle').addEventListener('click', () => {
   state.settings.internet = !state.settings.internet;
@@ -1031,8 +1113,8 @@ document.addEventListener('keydown', (e) => {
 $('cancel-load').addEventListener('click', () => worker.postMessage({ type: 'cancel' }));
 $('new-chat').addEventListener('click', () => {
   if (state.phase !== 'ready') return;
-  for(const m of state.messages)m.developmentView?.dispose();
-  state.messages = [];state.developmentActive=false;
+  for(const m of state.messages)m.workView?.dispose();
+  state.messages = [];state.chatId=newChatId();assistant?.reset();
   worker.postMessage({ type: 'reset' });
   renderMessages();
   setPhase('ready');
@@ -1113,6 +1195,8 @@ function fillSettings() {
   form.elements.thinking.checked = Boolean(s.thinking);
   form.elements.internet.checked = Boolean(s.internet);
   form.elements.jinaKey.value = s.jinaKey || '';
+  form.elements.githubToken.value = s.githubToken || '';
+  form.elements.autonomy.value = String(s.autonomy ?? 1);
 }
 form.addEventListener('input', (e) => {
   const t = e.target;
@@ -1131,6 +1215,7 @@ form.addEventListener('input', (e) => {
   }
   else state.settings[t.name] = t.value;
   saveSettings();
+  if (t.name === 'githubToken' || t.name === 'autonomy') configureVm();
 });
 form.addEventListener('change', (e) => {
   if (['ctx', 'gpu', 'gpuMemory', 'cacheGb', 'share', 'shareUpload'].includes(e.target.name) && state.loaded) $('status-line').textContent = 'This setting applies the next time a model loads.';
@@ -1151,7 +1236,7 @@ syncWebToggle();
 // ---- Terminal and Pi: a lease on the existing model, not a second GPU copy ----
 let workbench=null, workbenchPromise=null, agentRequest=null, agentSequence=0;
 worker.onmessage=onWorkerMessage;worker.onerror=onWorkerError;
-const terminalButton=el('button',{class:'ghost',type:'button',id:'open-terminal',text:'Terminal',title:'WASM terminal and Pi coding agent'});
+const terminalButton=el('button',{class:'ghost',type:'button',id:'open-terminal',text:'Terminal',title:'A Linux terminal on the same files the assistant works on'});
 $('open-settings').before(terminalButton);
 function finishAgent(error,value) {
   const request=agentRequest;if(!request)return;agentRequest=null;clearTimeout(request.timer);clearTimeout(request.cancelTimer);request.signal?.removeEventListener('abort',request.abort);
@@ -1170,18 +1255,20 @@ function restartEngine(reason) {
 function piLimits() {
   if (state.loaded?.stream) return { turn: 0, task: 0, stop: 120000 };
   if (state.loaded?.chat?.placement?.streaming) return { turn: 1800000, task: 7200000, stop: 60000 };
-  return { turn: 120000, task: 180000, stop: 10000 };
+  // A 4B model on an integrated GPU reads a long prompt and writes a long reply in minutes, not seconds.
+  return { turn: 600000, task: 180000, stop: 10000 };
 }
-function agentTurn(messages,tools,{signal,onToken,maxTokens=2048}={}) {
+function agentTurn(messages,tools,{signal,onToken,maxTokens=2048,options}={}) {
   if(state.phase!=='agent'||agentRequest)return Promise.reject(new Error('The model is busy.'));
-  if(signal?.aborted)return Promise.reject(new Error('Pi model turn cancelled.'));
+  if(signal?.aborted)return Promise.reject(new Error('Stopped.'));
   return new Promise((resolve,reject)=>{
     const id=++agentSequence;
     const limits=piLimits();
-    const abort=()=>{if(agentRequest?.id!==id)return;agentRequest.aborted=true;worker.postMessage({type:'stop'});agentRequest.cancelTimer=setTimeout(()=>restartEngine('Pi cancellation released an unresponsive worker.'),limits.stop)};
-    agentRequest={id,resolve,reject,onToken,signal,abort,timer:limits.turn?setTimeout(()=>restartEngine(`Pi model turn exceeded its ${Math.round(limits.turn/60000)}-minute limit.`),limits.turn):null};
+    const abort=()=>{if(agentRequest?.id!==id)return;agentRequest.aborted=true;worker.postMessage({type:'stop'});agentRequest.cancelTimer=setTimeout(()=>restartEngine('Stopping took too long, so the model was unloaded.'),limits.stop)};
+    // A turn past its limit is stopped like Stop does; the model stays loaded unless stopping hangs.
+    agentRequest={id,resolve,reject,onToken,signal,abort,timer:limits.turn?setTimeout(()=>{if(agentRequest?.id===id){agentRequest.timedOut=Math.round(limits.turn/60000);abort();}},limits.turn):null};
     signal?.addEventListener('abort',abort,{once:true});
-    worker.postMessage({type:'agent_turn',requestId:id,messages,tools,maxTokens:Math.max(64,Math.min(4096,Number(maxTokens)||2048)),sampler:{temperature:0,top_p:.95,top_k:40,min_p:.05,repeat_penalty:1.1,repeat_last_n:64,seed:1}});
+    worker.postMessage({type:'agent_turn',requestId:id,messages,tools,options,maxTokens:Math.max(64,Math.min(4096,Number(maxTokens)||2048)),sampler:{temperature:0,top_p:.95,top_k:40,min_p:.05,repeat_penalty:1.1,repeat_last_n:64,seed:1}});
   });
 }
 function networkChanged() {
@@ -1190,7 +1277,7 @@ function networkChanged() {
 async function ensureWorkbench(){
   workbenchPromise ||= import('./workbench.mjs').then(({mountWorkbench})=>mountWorkbench({
     ready:()=>['ready','preparing'].includes(state.phase)&&Boolean(state.loaded),turn:agentTurn,modelName:()=>state.loaded?.label||'Local model',taskTimeLimit:()=>piLimits().task,
-    lease:()=>{if(!['ready','preparing'].includes(state.phase)||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?(state.live?.development?'preparing':'ready'):'idle');}};},
+    lease:()=>{if(state.phase!=='ready'||!state.loaded)throw new Error('The model is busy or not loaded.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?'ready':'idle');}};},
     getNetwork:()=>({enabled:Boolean(state.settings.internet),jinaKey:state.settings.jinaKey||''}),
     setNetwork:enabled=>{state.settings.internet=enabled;saveSettings();syncWebToggle();networkChanged();},
   })).catch(error=>{workbenchPromise=null;throw error;});
@@ -1202,7 +1289,7 @@ terminalButton.addEventListener('click',async()=>{
   finally{terminalButton.disabled=false;}
 });
 // ---- Browser: a web engine compiled to WebAssembly, shared by the person and Pi ----
-const browserButton=el('button',{class:'ghost',type:'button',id:'open-browser',text:'Browser',title:'Web browser engine in WebAssembly, shared with Pi'});
+const browserButton=el('button',{class:'ghost',type:'button',id:'open-browser',text:'Browser',title:'A web browser in this page, shared with the assistant'});
 $('open-settings').before(browserButton);
 browserButton.addEventListener('click',async()=>{
   browserButton.disabled=true;
@@ -1210,11 +1297,9 @@ browserButton.addEventListener('click',async()=>{
   catch(error){$('status-line').textContent=String(error.message||error);}
   finally{browserButton.disabled=false;}
 });
-$('chat-mode').value=recall('evolve-llm-chat-mode')||'auto';
-if(!$('chat-mode').value)$('chat-mode').value='auto';
-$('chat-mode').addEventListener('change',()=>remember('evolve-llm-chat-mode',$('chat-mode').value));
 
 worker.postMessage({ type: 'hello', gpu: state.settings.gpu });
+configureVm();
 {
   const code = new URLSearchParams(location.hash.slice(1)).get('pair');
   if (REMOTE_CODE) {
@@ -1240,7 +1325,7 @@ worker.postMessage({ type: 'hello', gpu: state.settings.gpu });
 import { mountLocalComputer } from './local-computer.mjs';
 const localComputer = mountLocalComputer({
   ready:()=>['ready','preparing'].includes(state.phase)&&Boolean(state.loaded), turn:agentTurn,
-  onConnectionChange:connected=>{$('status-line').textContent=connected?'Computer connected · main chat can use local tools in Auto and Build.':'Local computer disconnected.';},
+  onConnectionChange:connected=>{$('status-line').textContent=connected?'Computer connected · the chat works on this computer.':'Local computer disconnected.';},
   modelName:()=>state.loaded?.label||'Local model',
-  lease:()=>{if(!['ready','preparing'].includes(state.phase)||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?(state.live?.development?'preparing':'ready'):'idle');}};}
+  lease:()=>{if(!['ready','preparing'].includes(state.phase)||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?(state.live?.assistant?'preparing':'ready'):'idle');}};}
 });

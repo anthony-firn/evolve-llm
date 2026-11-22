@@ -52,13 +52,13 @@ test('malformed output gets bounded model feedback and can recover without execu
   return {text:'Read the file.',reason:'end'};
  }});const result=await task.run('Read game.html');assert.equal(result.repairs,1);assert.equal(result.turns,3);assert.equal(executed,1);assert.equal(events.filter(e=>e.type==='retry').length,1);
 });
-test('edits require a prior read and an exact nonempty string; failures return to Pi for correction',async()=>{
+test('edits require a prior read and an exact nonempty string; a failed edit shows the file for correction',async()=>{
  let n=0;const operations=[];
  const task=createPiTask({workspace:{request:async(name,args)=>{operations.push(name);return name==='read'?{text:'background:red;'}:{ok:true}}},network:{options:()=>({enabled:false})},turn:async(messages)=>{
  n++;const call=n===1?{name:'edit',arguments:{path:'/workspace/game.html',oldText:'',newText:'blue'}}:n===2?{name:'read',arguments:{path:'/workspace/game.html'}}:n===3?{name:'edit',arguments:{path:'/workspace/game.html',oldText:'background:red;',newText:'background:blue;'}}:null;
- if(n===2)assert(messages.some(m=>m.role==='tool'&&m.content.includes('Read this file first')));
+ if(n===2)assert(messages.some(m=>m.role==='tool'&&m.content.includes('had not been read yet')&&m.content.includes('background:red;')));
  return {text:call?'<tool_call>'+JSON.stringify(call)+'</tool_call>':'Changed.',reason:'end'};
- }});const result=await task.run('Make the file blue');assert.deepEqual(operations,['read','edit']);assert.equal(result.changes,1);assert.equal(result.errors,1);assert.equal(result.lastToolFailed,false);
+ }});const result=await task.run('Make the file blue');assert.deepEqual(operations,['read','read','edit']);assert.equal(result.changes,1);assert.equal(result.errors,1);assert.equal(result.lastToolFailed,false);
 });
 
 test('a failed tool followed by a confident answer still reports zero changes and a tool error',async()=>{

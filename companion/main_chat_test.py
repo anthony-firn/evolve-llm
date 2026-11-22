@@ -58,28 +58,26 @@ with tempfile.TemporaryDirectory() as tmp:
                 return page.locator('.msg.assistant').last.inner_text()
             result=send('Create chat.txt on this computer')
             assert 'Created chat.txt' in result,result
-            assert 'Local computer activity' in result,result
+            assert 'Worked · 1 step' in result and 'On your computer' in result,result
             assert Path(tmp,'chat.txt').read_text()=='main-chat-ok'
             assert 'Previous task context received.' in send('Describe the previous task')
-            page.locator('#chat-mode').select_option('chat')
-            assert 'A scripted chat answer.' in send('Create another file')
-            page.locator('#chat-mode').select_option('build')
+            assert page.locator('#chat-mode').count()==0
             c.approve=lambda _:False
             result=send('Create a file again')
-            assert 'denied' in result.lower() and '1 tool errors' in result,result
+            assert 'denied' in result.lower() and '1 failed' in result,result
             page.locator('#prompt').fill('long task');page.locator('#send').click()
             page.wait_for_selector('#app[data-phase=agent]')
             page.locator('#stop').click()
             page.wait_for_selector('#app[data-phase=ready]',timeout=15000)
-            assert 'cancel' in page.locator('.msg.assistant').last.inner_text().lower()
+            assert 'stopped' in page.locator('.msg.assistant').last.inner_text().lower()
             page.locator('#open-local-computer').click()
             page.get_by_role('button',name='Disconnect',exact=True).click()
             page.locator('#local-status').filter(has_text='Disconnected').wait_for()
             page.locator('#local-computer').get_by_role('button',name='Close',exact=True).click()
-            page.locator('#chat-mode').select_option('auto')
-            assert 'A scripted chat answer.' in send('Hello')
+            Path(tmp,'chat.txt').unlink()
+            assert 'On your computer' not in send('Hello') and not Path(tmp,'chat.txt').exists()  # back in the browser
             assert not errors,errors
             browser.close()
-            print('PASS: main-chat native tools, activity, follow-up context, Chat exclusion, denial, Stop and disconnect.')
+            print('PASS: the main chat on the connected computer: tools, steps, follow-up context, denial, Stop and disconnect.')
     finally:
         server.shutdown();server.server_close()

@@ -2443,6 +2443,10 @@ impl Engine {
             self.gpu.queue.submit([cmd]);
             if hand_on {
                 hidden.extend(self.read_hidden(n, k_out, &st.x, 0, 0).await?);
+            } else if !last {
+                // One chunk at a time: drivers cancel queued work that waits too long (Linux i915
+                // after about 10 s), and a long prompt on a slow GPU queues far more than that.
+                super::wait_idle(&self.gpu).await?;
             }
         }
         if !self.stage.head {

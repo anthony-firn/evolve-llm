@@ -33,10 +33,9 @@ with sync_playwright() as p:
         pp.wait_for_selector('#gpu-chip[data-state=ok]',state='attached',timeout=45000)
         pp.wait_for_selector('#ready:not([hidden])',timeout=15000)
         assert pp.locator('#gpu-name').inner_text().startswith('Your computer')
-        pp.locator('#chat-mode').select_option('chat')
         pp.locator('#prompt').fill('Name three planets');pp.locator('#send').click()
         pp.wait_for_selector('#app[data-phase=ready]',timeout=15000)
-        assert 'A scripted chat answer.' in pp.locator('.msg.assistant').last.inner_text()
+        assert 'A scripted assistant answer.' in pp.locator('.msg.assistant').last.inner_text()
         print(f'PASS: public-relay Android pairing and laptop-worker reply, connection {attempt+1}',flush=True)
         if attempt<2:pp.reload(wait_until='domcontentloaded')
     assert not errors,errors

@@ -22,6 +22,7 @@
       </a>
       <p class="gpu-chip" id="gpu-chip" data-state="checking"><i aria-hidden="true"></i><span id="gpu-name">Checking for WebGPU…</span></p>
       <div class="top-actions">
+        <button class="ghost" type="button" id="open-chats" aria-haspopup="dialog">Chats</button>
         <button class="ghost" type="button" id="new-chat" disabled>New chat</button>
         <button class="ghost" type="button" id="open-settings" aria-haspopup="dialog">Settings</button>
         <button class="ghost models-toggle" type="button" id="open-models" aria-controls="sidebar" aria-expanded="false">Models</button>
@@ -98,13 +99,6 @@
       </div>
 
       <form class="composer" id="composer">
-        <label class="chat-mode-label" for="chat-mode">Mode
-          <select id="chat-mode" title="Auto uses Pi for development requests. Build always uses workspace tools.">
-            <option value="auto">Auto</option>
-            <option value="chat">Chat</option>
-            <option value="build">Build</option>
-          </select>
-        </label>
         <label class="sr-only" for="prompt">Message</label>
         <textarea id="prompt" rows="1" placeholder="Choose a model to start" disabled enterkeyhint="send"></textarea>
         <button class="web-toggle" type="button" id="web-toggle" aria-pressed="false" title="Let the model search the web">
@@ -204,7 +198,7 @@
           <ul class="pair-list" id="pair-list"></ul>
           <button type="button" class="ghost" id="pair-stop">Stop pairing</button>
         </div>
-        <small>Or chat and code from your phone with models running on this computer: the phone shows the conversation and Pi's work, and this computer's GPU runs the model. Best on the same Wi-Fi.</small>
+        <small>Or chat and code from your phone with models running on this computer: the phone shows the conversation and the assistant's work, and this computer's GPU runs the model. Best on the same Wi-Fi.</small>
         <button type="button" class="ghost" id="host-start">Use this computer from your phone</button>
         <div id="host-info" hidden>
           <div class="qr" id="host-qr"></div>
@@ -214,6 +208,21 @@
           <small>Keep this tab open. The link stays the same, so a bookmark on your phone reconnects later.</small>
           <button type="button" class="ghost" id="host-stop">Stop letting my phone use this computer</button>
         </div>
+      </fieldset>
+      <fieldset class="block web">
+        <legend>GitHub</legend>
+        <small>The assistant can work on your GitHub repositories with git and gh, through GitHub's API: clone, change files, commit, push, open pull requests, read CI results and merge. Builds and tests run in your repositories' GitHub Actions. Merging always asks you first.</small>
+        <label class="block">What the assistant may do on GitHub
+          <select name="autonomy">
+            <option value="0">Commit locally only; never push or merge</option>
+            <option value="1">Ask me before pushing, opening a pull request or merging</option>
+            <option value="2">Push branches and open pull requests freely (still asks before merging or touching the default branch)</option>
+          </select>
+        </label>
+        <label class="block">GitHub token (optional)
+          <input type="password" name="githubToken" autocomplete="off" spellcheck="false" placeholder="github_pat_…">
+          <small>A fine-grained token with Contents and Pull requests (read and write), and Actions (read), on the repositories the assistant may change. Kept only in this browser and sent only to api.github.com; programs in the terminal never see it. Without one, it can clone public repositories.</small>
+        </label>
       </fieldset>
       <label class="check"><input type="checkbox" name="thinking"> Let reasoning models think before answering</label>
       <fieldset class="block web">
@@ -226,6 +235,15 @@
         </label>
       </fieldset>
       <footer><button class="ghost" type="button" id="reset-settings">Restore defaults</button><button class="primary" value="close">Done</button></footer>
+    </form>
+  </dialog>
+
+  <dialog class="settings chats" id="chats" aria-labelledby="chats-title">
+    <form method="dialog">
+      <header><h2 id="chats-title">Chats</h2><button class="ghost" value="close">Close</button></header>
+      <p><small>Your conversations are saved in this browser only. Open one to read it or carry on.</small></p>
+      <p id="chats-empty">No saved chats yet.</p>
+      <ol class="chat-list" id="chat-list"></ol>
     </form>
   </dialog>
 

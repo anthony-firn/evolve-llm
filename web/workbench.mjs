@@ -15,10 +15,13 @@ async function database(mode, value) {
 }
 export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwork, modelName, taskTimeLimit = () => 180000 }) {
   const root=node('section',undefined,'workbench');root.id='workbench';root.hidden=true;root.setAttribute('aria-label','WASM terminal and Pi agent');
-  const head=node('header'),title=node('div');title.append(node('strong','Terminal & Pi'),node('small','WASM workspace · local model'));
+  const head=node('header'),title=node('div');title.append(node('strong','Terminal'),node('small','The assistant\u2019s files · runs in this page'));
   const tokenLabel=node('label'),tokenLimit=node('select');tokenLimit.id='pi-output-tokens';for(const value of [1024,2048,4096]){const option=node('option',String(value));option.value=value;tokenLimit.append(option)}tokenLimit.value='2048';tokenLabel.append(node('span','Pi tokens'),tokenLimit);
   const webLabel=node('label'),webToggle=node('input');webToggle.type='checkbox';webToggle.id='terminal-web';webLabel.append(webToggle,node('span','Web access'));
-  const close=button('Close',()=>{if(!externalTask)cancel();preview.stop();previewPanel.hidden=true;console.classList.remove('preview-expanded');root.hidden=true});head.append(title,tokenLabel,webLabel,close);
+  const close=button('Close',()=>{if(!externalTask)cancel();preview.stop();previewPanel.hidden=true;console.classList.remove('preview-expanded');root.hidden=true});
+  // The Linux terminal: the Evolve VM (web/vm/) in a GNOME-style window, in place of the console.
+  const linuxToggle=button('Browser sandbox',()=>toggleLinux());linuxToggle.id='linux-terminal-toggle';linuxToggle.title='Switch between the Linux terminal (the assistant\u2019s files, git and gh) and the older browser sandbox';
+  head.append(title,tokenLabel,webLabel,linuxToggle,close);
   const notice=node('p','Commands and files stay in a browser-only /workspace. Web searches and page URLs go to external services when enabled. This supports a shell subset, not host Bash.','workbench-note');
   const layout=node('div',undefined,'workbench-layout'),aside=node('aside'),files=node('div',undefined,'workbench-files');files.id='workspace-files';
   const actions=node('div',undefined,'workspace-actions');
@@ -34,7 +37,26 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   previewPanel.append(previewTitle,previewActions,previewHost);
   const preview=new AppPreview({container:previewHost,onResult:result=>{if(result.late)record('Preview runtime error',result.errors.join('\n'),'error')}});let previewPath=null;
   const console=node('div',undefined,'terminal-console');console.append(log,previewPanel,form,status);
-  aside.append(node('h2','Workspace files'),actions,files);layout.append(aside,console);root.append(head,notice,layout,filePicker,restorePicker);document.body.append(root);
+  const vmHost=node('div',undefined,'vm-console');vmHost.hidden=true;
+  aside.append(node('h2','Workspace files'),actions,files);layout.append(aside,console,vmHost);root.append(head,notice,layout,filePicker,restorePicker);document.body.append(root);
+  let vmWindow=null;
+  // The Linux terminal needs WebAssembly JSPI (Chrome, Edge); elsewhere the sandbox is the terminal.
+  let linuxAvailable=typeof WebAssembly.Suspending==='function';linuxToggle.hidden=!linuxAvailable;
+  function showLinux(on){vmHost.hidden=!on;aside.hidden=on;console.hidden=on;notice.hidden=on;layout.classList.toggle('vm-mode',on);linuxToggle.textContent=on?'Browser sandbox':'Linux terminal';}
+  async function toggleLinux(){
+    const on=vmHost.hidden;showLinux(on);
+    if(on&&!vmWindow){
+      if(!document.querySelector('link[href$="vm/terminal.css"]')){const l=document.createElement('link');l.rel='stylesheet';l.href=new URL('./vm/terminal.css',import.meta.url).href;document.head.append(l)}
+      const [{sharedVm},{TerminalWindow}]=await Promise.all([import('./vm/client.mjs'),import('./vm/terminal.mjs')]);
+      const vm=sharedVm();
+      // A build without the VM (or one that fails to start): the sandbox is the terminal.
+      try{await vm.ready}catch{linuxAvailable=false;linuxToggle.hidden=true;showLinux(false);await boot();input.focus();return}
+      vm.onAgent=runLinuxTask;
+      vmWindow=new TerminalWindow({vm,container:vmHost});await vmWindow.open();
+    }
+    if(on)vmWindow?.active?.term.focus();
+    else{await boot();input.focus()}
+  }
   let initialized=false, initialization=null, task=null, busy=false, externalTask=false, saving=Promise.resolve(), agent=null, abortWeb=new AbortController(), history=[],cursor=0;
   function record(label,text='',className='') {
     const row=node('section',undefined,'terminal-entry '+className),labelNode=node('strong',label),output=node('pre',String(text).slice(0,65536));row.append(labelNode,output);log.append(row);
@@ -88,6 +110,39 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
       const result=await workspace.request('exec',{command:line,network:network.options()},{signal:task.signal});
       record('exit '+result.code,(result.stdout||'')+(result.stderr||''),result.code?'error':'');
     }
+  }
+  // `pi TASK` typed in the Linux terminal: Pi works in that directory with the VM's shell, files,
+  // git and gh, and writes its progress to the terminal.
+  async function runLinuxTask(question,cwd,write,signal){
+    if(!ready()){write('\x1b[33mpi: load a tool-capable model first (Models), then run pi again.\x1b[0m\n');return 1}
+    if(busy||agent){write('pi: Pi is already working on a task.\n');return 1}
+    busy=true;const release=lease();const controller=new AbortController();
+    const cancel=()=>{controller.abort();agent?.abort()};signal?.addEventListener('abort',cancel,{once:true});
+    const limit=taskTimeLimit();const timer=limit?setTimeout(cancel,Math.max(limit*5,15*60000)):null;
+    const dim=s=>`\x1b[2m${s}\x1b[0m`;
+    let calls=0,errors=0,turns=0;
+    const show=r=>{const t=(r?.content||[]).map(c=>c.text||'').join('\n')||JSON.stringify(r);const lines=t.split('\n');return lines.slice(0,12).join('\n')+(lines.length>12?`\n… ${lines.length-12} more lines`:'')};
+    const onEvent=e=>{
+      if(e.type==='token')write(dim(e.text));
+      else if(e.type==='tool'){calls++;const a=e.args||{};write(`\n\x1b[1;36m● ${e.name}\x1b[0m ${e.name==='bash'?'$ '+a.command:a.path||a.query||a.url||''}\n`)}
+      else if(e.type==='tool-result'){if(e.isError)errors++;write((e.isError?'\x1b[31m':'\x1b[2m')+show(e.result)+'\x1b[0m\n')}
+      else if(e.type==='retry')write('\x1b[33m(the model\'s tool call was invalid; asking again)\x1b[0m\n');
+      else if(e.type==='answer')turns++;
+    };
+    try{
+      const [{createPiTask},{VmWorkspace},{sharedVm}]=await Promise.all([import('./pi-agent.bundle.mjs'),import('./vm/workspace.mjs'),import('./vm/client.mjs')]);
+      write(dim(`Pi · ${modelName()} · ${cwd}\n`));
+      agent=createPiTask({turn,workspace:new VmWorkspace(sharedVm(),{cwd}),network,maxTokens:Number(tokenLimit.value),modelName:modelName(),onEvent,linux:{cwd}});
+      if(controller.signal.aborted)throw new Error('cancelled');
+      const result=await agent.run(question);
+      const last=result?.messages?.filter(m=>m.role==='assistant').at(-1);
+      const answer=stripToolCalls((last?.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('\n')).trim();
+      if(answer)write(`\n${answer}\n`);
+      write(dim(`\n${turns} model turns · ${calls} tool calls · ${errors} tool errors\n`));
+      return errors&&!answer?1:0;
+    }catch(error){
+      write(`\n\x1b[31mpi: ${controller.signal.aborted?'stopped':error.message||error}\x1b[0m\n`);return 1;
+    }finally{clearTimeout(timer);signal?.removeEventListener('abort',cancel);agent=null;busy=false;release();}
   }
   async function performTask(question,options={}){
     if(!ready())throw new Error('Load a model and wait until it is ready before running Pi.');
@@ -170,5 +225,7 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   form.addEventListener('submit',e=>{e.preventDefault();const line=input.value.trim();if(!line||busy)return;input.value='';history.push(line);history=history.slice(-50);cursor=history.length;run(()=>command(line))});
   input.addEventListener('keydown',e=>{if(e.key==='ArrowUp'||e.key==='ArrowDown'){e.preventDefault();cursor=Math.max(0,Math.min(history.length,cursor+(e.key==='ArrowUp'?-1:1)));input.value=history[cursor]||''}if(e.ctrlKey&&e.key.toLowerCase()==='c'){e.preventDefault();cancel()}});
   webToggle.addEventListener('change',()=>setNetwork(webToggle.checked));
-  return {runTask:(question,options)=>run(()=>performTask(question,options),{rethrow:true}),cancel,async open(){root.hidden=false;webToggle.checked=getNetwork().enabled;await boot();input.focus()},setNetwork(){if(busy)cancel();abortWeb.abort();abortWeb=new AbortController();webToggle.checked=getNetwork().enabled},dispose(){cancel();workspace.dispose();preview.dispose();root.remove()}};
+  return {runTask:(question,options)=>run(()=>performTask(question,options),{rethrow:true}),cancel,
+    /** The sandbox's /workspace, saved in this browser: the assistant's files where the Linux VM cannot run. */
+    async sandbox(){await boot();return workspace},async open(){root.hidden=false;webToggle.checked=getNetwork().enabled;if(linuxAvailable&&!vmWindow&&vmHost.hidden){await toggleLinux();return}if(vmHost.hidden){await boot();input.focus()}else vmWindow?.active?.term.focus()},setNetwork(){if(busy)cancel();abortWeb.abort();abortWeb=new AbortController();webToggle.checked=getNetwork().enabled},dispose(){cancel();workspace.dispose();preview.dispose();root.remove()}};
 }
