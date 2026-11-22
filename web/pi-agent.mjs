@@ -69,6 +69,17 @@ const shellText = r => [`exit code ${r.code}${r.timedOut?' (timed out)':''}, in 
 /** What a request in the Linux workspace starts with: the working directory and, for a GitHub
  *  repository the request names, where it is cloned or the exact command to clone it. Small
  *  models otherwise skip the clone or copy a placeholder like OWNER/REPO. */
+/** The file a sed substitution reads without -i (so it changes nothing), if a command has one. */
+export function sedWithoutInPlace(command) {
+  for (const part of String(command).split(/&&|\|\||;|\|/)) {
+    const m = /^\s*sed\s+(.*)$/.exec(part);
+    if (!m || /(^|\s)-[a-zA-Z]*i|--in-place|>/.test(m[1]) || !/(^|['"\s;])\d*,?\d*s([^\w\s])/.test(m[1])) continue;
+    const file = /\s([\w./-]+)\s*$/.exec(m[1]);
+    if (file) return file[1];
+  }
+  return null;
+}
+
 /** Whether a request places a line relative to another ("right after the line ..."). */
 export function wantsPlacement(prompt) {
   return /\b(right )?(after|before|below|above|under) the line\b/i.test(String(prompt));
@@ -342,6 +353,9 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       if(/declined by the person/.test(`${result.stdout||''}${result.stderr||''}`))declined=true;
       // A line asked for after (or before) another line, appended to the end instead.
       const appended=linux&&!result.code&&wantsPlacement(currentPrompt)?/>>\s*['"]?([\w./-]+)/.exec(String(args.command||'')):null;
+      // sed with a substitution on a file but no -i prints the result and leaves the file as it was.
+      const printed=linux&&!result.code?sedWithoutInPlace(String(args.command||'')):null;
+      if(printed)result.notes=[...(result.notes||[]),`sed without -i only printed the result; ${printed} is unchanged. To change the file: sed -i 's/old/new/' ${printed} (or edit ${printed} 'old text' 'new text')`];
       if(appended)result.notes=[...(result.notes||[]),`>> added the text at the end of ${appended[1]}, but the request asks for it next to a particular line. Undo it with: git restore ${appended[1]}, then: edit ${appended[1]} 'that line' 'that line\nnew line'`];
       if(/^To github\.com\/|^Everything up-to-date/m.test(result.stdout||''))pushed=true;
     }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement } from '../web/pi-agent.mjs';
+import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement, sedWithoutInPlace } from '../web/pi-agent.mjs';
 
 test('real Pi agent loop invokes sandbox tools and feeds their results back to the local transport',async()=>{
  const files=new Map(),events=[];let round=0;
@@ -420,4 +420,13 @@ test('a line asked for after another line but appended with >> gets a note on ho
  }});
  await task.run('In README.md of demo/app, right after the line "npm test", add the line "npm run lint".');
  assert.match(results[0],/>> added the text at the end of README\.md, but the request asks for it next to a particular line\. Undo it with: git restore README\.md/);
+});
+
+test('sedWithoutInPlace finds a substitution that leaves its file unchanged',()=>{
+ assert.equal(sedWithoutInPlace("cd app && sed -n '1s/def add(a, b):/x/' calc.py"),'calc.py');
+ assert.equal(sedWithoutInPlace("sed 's/a - b/a + b/' calc.py"),'calc.py');
+ assert.equal(sedWithoutInPlace("sed -i 's/a - b/a + b/' calc.py"),null);
+ assert.equal(sedWithoutInPlace("sed 's/a/b/' calc.py > new.py"),null);
+ assert.equal(sedWithoutInPlace("sed -n '1,20p' calc.py"),null);
+ assert.equal(sedWithoutInPlace("cat calc.py | sed 's/a/b/'"),null);
 });
