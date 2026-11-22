@@ -335,6 +335,8 @@ def main():
         check("fix.txt" in fixed and FAKE.pulls[1].get("merged"), "main on GitHub holds the fix")
         code, out, _ = sh("cd app && gh pr merge 2")
         check(code == 0 and "already merged" in out, "merging a merged pull request says so")
+        code, out, err = sh("cd / && gh pr view 2 -R demo/app && gh pr merge 2 --repo demo/app")
+        check(code == 0 and "#2 Fix it" in out and "already merged" in out, f"gh pr works outside a clone with -R ({out!r} {err!r})")
 
         # A conflict: nothing changes, and the message says what to do.
         c = FAKE.refs["main"]

@@ -1029,12 +1029,29 @@ const GH_HELP: &str = "gh here works on GitHub through its API.
 
   gh repo clone OWNER/REPO [DIR] [--branch B]    gh repo list [OWNER]    gh auth status
   gh pr create --title \"TITLE\" --body \"TEXT\" [--base BRANCH]   (push first; may ask the person)
-  gh pr list            gh pr view [NUMBER]       gh pr checks [NUMBER]
+  gh pr list            gh pr view [NUMBER]       gh pr checks [NUMBER]   (add -R OWNER/REPO outside a clone)
   gh pr merge [NUMBER] [--squash|--rebase]        (always asks the person; no NUMBER = this branch's pull request)
   gh run list [--branch B]    gh run view RUN_ID  (CI results: failed steps and errors)
   gh api PATH
 
 Local work (git status, diff, commit, push, pull, checkout, merge): git help";
+
+/// The repository for gh pr and gh run: `-R OWNER/REPO` (or `--repo`), as in GitHub's gh, works
+/// anywhere; otherwise the clone around the working directory. Returns it and the other args.
+fn repo_or_flag(args: &[String]) -> R<(Repo, Vec<String>)> {
+    let Some(i) = args.iter().position(|a| a == "-R" || a == "--repo") else {
+        return Ok((Repo::find()?, args.to_vec()));
+    };
+    let spec = args.get(i + 1).ok_or("usage: -R OWNER/REPO")?;
+    let spec = spec.trim_start_matches("https://github.com/").trim_end_matches(".git");
+    let (owner, repo) = spec.split_once('/').ok_or("expected -R OWNER/REPO")?;
+    let info = api("GET", &format!("/repos/{owner}/{repo}"), None)?;
+    let default = info["default_branch"].as_str().unwrap_or("main").to_string();
+    // Not a clone: no local commits, and the branch is the default one unless --head says.
+    let r = Repo { root: PathBuf::from("/nonexistent-clone"), config: json!({ "owner": owner, "repo": repo, "default_branch": default, "branch": default }) };
+    let rest = args.iter().enumerate().filter(|(j, _)| *j != i && *j != i + 1).map(|(_, a)| a.clone()).collect();
+    Ok((r, rest))
+}
 
 fn gh(args: &[String]) -> R<()> {
     match (args.first().map(|s| s.as_str()), args.get(1).map(|s| s.as_str())) {
@@ -1058,8 +1075,14 @@ fn gh(args: &[String]) -> R<()> {
             println!("Autonomy: {}", names[level().min(2) as usize]);
             Ok(())
         }
-        (Some("pr"), _) => pr(&Repo::find()?, &args[1..]),
-        (Some("run"), _) => run_cmd(&Repo::find()?, &args[1..]),
+        (Some("pr"), _) => {
+            let (r, rest) = repo_or_flag(&args[1..])?;
+            pr(&r, &rest)
+        }
+        (Some("run"), _) => {
+            let (r, rest) = repo_or_flag(&args[1..])?;
+            run_cmd(&r, &rest)
+        }
         (Some("api"), Some(path)) => {
             let method = args.iter().position(|a| a == "-X").and_then(|i| args.get(i + 1)).map(|s| s.as_str()).unwrap_or("GET");
             if method != "GET" {
