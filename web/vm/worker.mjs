@@ -10,12 +10,12 @@
 
 import init, { Vm } from './kernel/evolve_vm.js';
 globalThis.VM_TRACE = new URL(location.href).searchParams.has('trace');
-import { Host } from './host.mjs';
+import { Host, LAZY } from './host.mjs';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const SNAPSHOT = 'evolve-vm-home.snap';
-const ENV = ['HOME=/home/user', 'USER=user', 'PATH=/bin:/usr/bin', 'TERM=xterm-256color', 'LANG=C.UTF-8', 'SHELL=/bin/sh'];
+const ENV = ['HOME=/home/user', 'USER=user', 'PATH=/bin:/usr/bin', 'TERM=xterm-256color', 'LANG=C.UTF-8', 'SHELL=/bin/sh', 'PYTHONDONTWRITEBYTECODE=1'];
 
 let vm;
 let host;
@@ -74,6 +74,9 @@ async function boot() {
   for (const name of list.utils) vm.symlink('/usr/lib/evolve/utils', `/bin/${name}`);
   for (const name of ['gh', 'git']) vm.symlink('/usr/lib/evolve/gh', `/bin/${name}`);
   vm.write_file('/bin/pi', new Uint8Array(pi));
+  // python3 is 33 MB: /bin/python3 names it, and the host loads it the first time it runs.
+  vm.write_file('/usr/lib/evolve/python3', enc.encode(`${LAZY}python.wasm`));
+  for (const name of ['python3', 'python']) vm.symlink('/usr/lib/evolve/python3', `/bin/${name}`);
   await restore();
   // A process that owns the pipes of commands run for the page.
   const t = vm.create_tty();

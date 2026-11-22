@@ -125,6 +125,12 @@ gh pr create --title "Fix a typo" --body "…"
 gh run list --branch fix-typo; gh run view RUN_ID  # CI results: failed steps and annotations
 ```
 
+`python3` runs Python there: RustPython 0.6.0 (a Python 3 interpreter written in Rust, with its
+standard library inside), built from its crates.io release by `tools/build_vm.py` and loaded the
+first time it runs (33 MB). Scripts, the standard library and `unittest` work; there is no pip,
+and C extensions such as numpy are not available. Bytecode caches are not written, so `git`
+does not pick up `__pycache__`.
+
 `pi TASK` in the Linux terminal gives the task to Pi with the loaded model. Pi works in the
 current directory with the VM's shell, files, `git` and `gh`, writes its progress to the
 terminal, and stops on Ctrl+C. A task allows 40 model turns and 80 tool calls. The VM has no

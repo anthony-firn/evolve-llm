@@ -6,6 +6,9 @@
 // WebAssembly.promising) while the others keep running. The `evolve` imports give the shell
 // what WASI lacks: starting programs, waiting for them, pipes and the terminal's foreground.
 
+/** The start of a program file that is fetched the first time it runs (see module()). */
+export const LAZY = '#!evolve-lazy '; // `#!` so the kernel counts it as a program
+
 const E = { SUCCESS: 0, AGAIN: 6, BADF: 8, CHILD: 12, INVAL: 28, NOENT: 44, NOSYS: 52, NOTSUP: 58, FAULT: 21 };
 const ALL_RIGHTS = 0x1fffffffn;
 const enc = new TextEncoder();
@@ -88,8 +91,17 @@ export class Host {
   }
 
   async module(path) {
-    const bytes = this.vm.read_file(path);
+    let bytes = this.vm.read_file(path);
     if (!bytes) throw new Error(`${path}: not found`);
+    // A program loaded on first use (python3): the file names it in bin/ next to this script.
+    const lazy = dec.decode(bytes.subarray(0, 64));
+    if (lazy.startsWith(LAZY)) {
+      const name = lazy.slice(LAZY.length).trim();
+      const r = await fetch(new URL(`./bin/${name}`, import.meta.url));
+      if (!r.ok) throw new Error(`${name} is not part of this build (HTTP ${r.status})`);
+      bytes = new Uint8Array(await r.arrayBuffer());
+      this.vm.write_file(path, bytes);
+    }
     const key = `${path}:${bytes.length}:${bytes[bytes.length - 1]}`;
     let m = this.modules.get(key);
     if (!m) {
@@ -108,6 +120,7 @@ export class Host {
     const path = this.vm.which(pid, argv[0], pathVar);
     if (!path) return null;
     const head = this.vm.read_file(path).subarray(0, 256);
+    if (dec.decode(head).startsWith(LAZY)) return [path, argv]; // fetched when it runs (module())
     if (head[0] === 0x23 && head[1] === 0x21) {
       const line = dec.decode(head).split('\n')[0].slice(2).trim().split(/\s+/);
       let interp = line[0];

@@ -37,6 +37,9 @@ CASES = [
     ("printf 'a\\nb\\nb2\\n' > e.txt && edit e.txt a 'a\\nx' && edit e.txt zz q 2>&1; edit e.txt b q 2>&1; cat e.txt && rm e.txt", 0,
      "edited e.txt\nedit: e.txt: the text to replace is not there. Find the exact line with: grep -n \"SOME WORDS\" e.txt\nedit: e.txt: the text to replace is in 2 places; include more of the surrounding text\na\nx\nb\nb2\n"),
     ("read notes.txt 2>&1; echo status=$?", 0, "read: notes.txt is not a variable name (read takes a line of input; to show a file, use: cat notes.txt)\nstatus=2\n"),
+    # python3: RustPython, loaded on first use; scripts, the standard library and unittest.
+    ("python3 -c 'import json; print(json.dumps({\"sum\": 2 + 3}))'", 0, '{"sum": 5}\n'),
+    ("printf 'def add(a, b):\\n    return a + b\\n' > calc.py && printf 'import unittest\\nfrom calc import add\\nclass T(unittest.TestCase):\\n    def test_add(self):\\n        self.assertEqual(add(2, 3), 5)\\nunittest.main()\\n' > test_calc.py && python3 test_calc.py 2>&1 | tail -1; rm calc.py test_calc.py", 0, "OK\n"),
     ("rm -r proj f1 f2 link.rs s.sh && ls", 0, "README\n"),
 ]
 
