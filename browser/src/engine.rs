@@ -829,6 +829,7 @@ impl Engine {
             "scrollY": page.doc.viewport_scroll().y,
             "pageHeight": height,
             "viewportHeight": self.css_height,
+            "viewportWidth": self.css_width,
             "text": snap.text,
             "refs": self.snapshot_refs.len(),
             "version": self.version,
@@ -872,6 +873,30 @@ impl Engine {
         self.pointer("down", x, y, 0, 1, 0);
         self.pointer("up", x, y, 0, 0, 0);
         self.version = v;
+    }
+
+    /// The number [n] in the latest snapshot of the element at (x, y), viewport CSS px: the
+    /// smallest numbered element whose box holds the point. Models that point at a screenshot
+    /// act through it, so the checks on numbered elements apply to them too.
+    pub fn agent_ref_at(&mut self, x: f32, y: f32) -> serde_json::Value {
+        self.ensure_layout();
+        let Some(page) = &self.page else {
+            return serde_json::json!({ "ok": false, "error": "no page" });
+        };
+        if self.snapshot_version != self.version || page.id != self.snapshot_page {
+            return serde_json::json!({ "ok": false, "error": "stale" });
+        }
+        let mut best: Option<(usize, f32)> = None;
+        for (i, &node) in self.snapshot_refs.iter().enumerate() {
+            let Some((bx, by, w, h)) = agent::element_box(&page.doc, node) else { continue };
+            if x >= bx && x <= bx + w && y >= by && y <= by + h && best.is_none_or(|(_, a)| w * h < a) {
+                best = Some((i + 1, w * h));
+            }
+        }
+        match best {
+            Some((r, _)) => serde_json::json!({ "ok": true, "ref": r }),
+            None => serde_json::json!({ "ok": false, "error": "There is nothing to click or type into at that point." }),
+        }
     }
 
     pub fn agent_click(&mut self, r: usize) -> serde_json::Value {

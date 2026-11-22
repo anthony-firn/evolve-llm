@@ -11,7 +11,7 @@ const BROWSER_SNAPSHOT_CHARS = 2600;
 // Real projects in the Linux terminal take many more steps.
 // Results stay short: every character is read again by the model on each later turn.
 const LINUX_LIMITS = { turns: 40, repairs: 3, calls: 80, result: 4000 };
-const BROWSER = new Set(['browser_open','browser_snapshot','browser_click','browser_type','browser_select','browser_scroll','browser_key','browser_back']);
+const BROWSER = new Set(['browser_open','browser_snapshot','browser_click','browser_click_at','browser_type','browser_select','browser_scroll','browser_key','browser_back']);
 const names = new Set(['bash','read','write','edit','web_search','open_url','preview','browser_test',...BROWSER]);
 // Clicks Pi must not make on its own: anything that buys, sends, posts, deletes or changes an account.
 const RISKY = /\b(buy|purchase|pay|payment|checkout|check out|place (?:the |my |your )?order|order now|subscribe|donate|transfer|send|post|publish|tweet|reply|comment|submit|delete|remove|erase|destroy|unsubscribe|cancel (?:my |the |your )?(?:account|subscription|order|plan)|close (?:my |the )?account|confirm|authorize|approve|grant|sign up|register|create (?:an |my )?account|book|reserve|upgrade|downgrade|save changes|update (?:account|password|email|payment))\b/i;
@@ -258,9 +258,20 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
     ['browser_key','Press a key on the focused element: Enter, Escape, Tab, ArrowDown, ArrowUp, Backspace, PageDown, PageUp.',fields({key:{type:'string',enum:['Enter','Escape','Tab','ArrowDown','ArrowUp','ArrowLeft','ArrowRight','Backspace','PageDown','PageUp','Home','End','Space'],description:'Key name'}})],
     ['browser_back','Go back to the previous page.',fields({})],
   ];
+  // Models that see the page can also point at it (Qwen-VL models give points as 0-1000 of the
+  // image's width and height); the point becomes the numbered element under it.
+  if(vision)declarations.push(['browser_click_at','Click what is at a point of the latest screenshot, given as x and y from 0 to 1000 of its width and height.',{type:'object',properties:{x:intArg('0-1000 across the screenshot'),y:intArg('0-1000 down the screenshot')},required:['x','y']}]);
   async function run(name,args,signal){
     const b=await getClient();
     signal?.throwIfAborted();
+    if(name==='browser_click_at'){
+      if(!last)return {ok:false,text:'Take a browser_snapshot (or browser_open a page) first.'};
+      const [x,y]=[Number(args.x),Number(args.y)];
+      if(!(x>=0&&x<=1000&&y>=0&&y<=1000))return {ok:false,text:'x and y go from 0 to 1000 (fractions of the screenshot\'s width and height).'};
+      const at=typeof b.refAt==='function'?await b.refAt(x/1000*(Number(last.viewportWidth)||1280),y/1000*(Number(last.viewportHeight)||800)):{ok:false,error:'This browser cannot find elements by position.'};
+      if(!at?.ok)return {ok:false,text:failure('Click at that point',at?.error),snap:last};
+      return run('browser_click',{ref:at.ref},signal);
+    }
     const ref=Number(args.ref);
     if(['browser_click','browser_type','browser_select'].includes(name)&&!(Number.isInteger(ref)&&ref>0))return {ok:false,text:'ref must be an element number [n] from the latest snapshot. Take a browser_snapshot first.'};
     if(['browser_click','browser_type','browser_select'].includes(name)&&!last)return {ok:false,text:'Take a browser_snapshot (or browser_open a page) first, then use its element numbers.'};

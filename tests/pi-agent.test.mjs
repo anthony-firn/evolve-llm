@@ -501,3 +501,29 @@ test('a model that reads images gets the newest page screenshot with the browser
   await createPiTask({ browser: plain, workspace: { request: async () => ({}) }, network, turn: async (messages) => { m++; prompt = messages[0].content; return m === 1 ? call('browser_open', { url: 'https://shop.example/' }) : { text: 'ok', reason: 'end' }; } }).run('Look');
   assert.doesNotMatch(prompt, /screenshot of the page/);
 });
+
+test('vision models can click a point of the screenshot: it becomes the element there, with the same checks', async () => {
+  const pages = { 'https://shop.example/': '# Shop\n[1] button "Add Kettle to cart"  [2] button "Place order"' };
+  const browser = fakeBrowser(pages);
+  browser.screenshot = async ({ unit }) => ({ rgb: new Uint8Array(unit * unit * 3), width: unit, height: unit });
+  const asked = [];
+  browser.refAt = async (x, y) => { asked.push([x, y]); return y < 400 ? { ok: true, ref: 1 } : { ok: true, ref: 2 }; };
+  const snapshot = browser.snapshot;
+  browser.snapshot = async (max) => ({ ...(await snapshot(max)), viewportWidth: 1000, viewportHeight: 800 });
+  let n = 0; const seen = []; let tools = [];
+  const task = createPiTask({ browser, vision: { unit: 32 }, workspace: { request: async () => ({}) }, network, turn: async (messages, schemas) => {
+    if (n) seen.push(JSON.stringify(messages.at(-1).content)); else tools = schemas.map((t) => t.function?.name || t.name);
+    n++;
+    if (n === 1) return call('browser_open', { url: 'https://shop.example/' });
+    if (n === 2) return call('browser_click_at', { x: 500, y: 250 });
+    if (n === 3) return call('browser_click_at', { x: 500, y: 900 });
+    if (n === 4) return call('browser_click_at', { x: 1500, y: 10 });
+    return { text: 'Done.', reason: 'end' };
+  } });
+  await task.run('Add the kettle');
+  assert(tools.includes('browser_click_at'));
+  assert.deepEqual(asked, [[500, 200], [500, 720]]);
+  assert.deepEqual(browser.log.filter((l) => l[0] === 'click').map((l) => l[1]), [1]);
+  assert.match(seen[2], /needs the person's approval/);
+  assert.match(seen[3], /x and y go from 0 to 1000/);
+});

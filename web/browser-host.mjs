@@ -145,6 +145,7 @@ export function createBrowserHost({ load, post, now = () => performance.now(), s
     agentSelect: (b, m) => JSON.parse(b.agentSelect(m.ref, String(m.value))),
     agentScroll: (b, m) => JSON.parse(b.agentScroll(m.dy)),
     agentKey: (b, m) => JSON.parse(b.agentKey(String(m.key))),
+    agentRefAt: (b, m) => JSON.parse(b.agentRefAt(Number(m.x), Number(m.y))),
     // The page as drawn, sized for a vision model: { rgb, width, height }.
     screenshot: (b, m) => {
       draw();
