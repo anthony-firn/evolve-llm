@@ -39,11 +39,11 @@ C0 = "0f3c1a7e9b2d4c6e8a0b1c2d3e4f5a6b7c8d9e0f"  # the original commit
 class Fake:
     """One repository, demo/app, with branches, trees (path -> blob sha) and blobs."""
 
-    def __init__(self):
+    def __init__(self, files=None):
         self.blobs = {}
         self.trees = {}
         self.commits = {}
-        files = {"README.md": b"# Demo\n", "src/main.rs": b"fn main() {}\n", "docs/notes.txt": b"a\nb\n"}
+        files = files or {"README.md": b"# Demo\n", "src/main.rs": b"fn main() {}\n", "docs/notes.txt": b"a\nb\n"}
         tree = {p: self.put(d) for p, d in files.items()}
         self.commits[C0] = {"tree": self.tree_id(tree), "parents": [], "message": "Initial commit"}
         self.refs = {"main": C0}

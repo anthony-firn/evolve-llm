@@ -1150,7 +1150,8 @@ $('new-chat').addEventListener('click', () => {
   if (state.phase !== 'ready') return;
   for(const m of state.messages)m.workView?.dispose();
   state.messages = [];state.chatId=newChatId();assistant?.reset();
-  worker.postMessage({ type: 'reset' });
+  // The engine keeps what it computed: a new conversation starts with the same system prompt and
+  // tools, which it then reuses (it compares tokens, so a different start is simply recomputed).
   renderMessages();
   setPhase('ready');
   $('status-line').textContent = 'Started a new conversation.';
