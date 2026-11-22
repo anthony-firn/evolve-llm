@@ -502,20 +502,32 @@ export class RemoteWorker {
     this.onerror = null;
     this.queue = [];
     this.link = null;
+    this.ready = false;
+    this.hello = null;
   }
 
   attach(link) {
     this.link = link;
+    this.ready = false;
     link.onMessage = (m) => {
+      if (this.link !== link) return;
       if (m.t === 'w' && m.m) this.emit(m.m);
-      else if (m.t === 'host') this.onConnection('connected', { loaded: m.loaded || null });
+      else if (m.t === 'host') {
+        // The host announces itself only after its message handler is installed.
+        // Sending hello on the data channel's open event can race that handler.
+        this.ready = true;
+        const queued = this.queue.splice(0);
+        if (this.hello && !queued.some(msg => msg.type === 'hello')) queued.unshift(this.hello);
+        for (const msg of queued) link.send({ t: 'w', m: msg }).catch(() => {});
+        this.onConnection('connected', { loaded: m.loaded || null });
+      }
     };
-    for (const msg of this.queue.splice(0)) link.send({ t: 'w', m: msg }).catch(() => {});
   }
 
   detach(link) {
     if (this.link !== link) return;
     this.link = null;
+    this.ready = false;
     this.onConnection('disconnected', {});
   }
 
@@ -532,7 +544,8 @@ export class RemoteWorker {
     }
     // Only plain data crosses (transfers and files do not).
     const plain = JSON.parse(JSON.stringify(msg));
-    if (this.link?.open) this.link.send({ t: 'w', m: plain }).catch(() => this.queue.push(plain));
+    if (plain.type === 'hello') this.hello = plain;
+    if (this.link?.open && this.ready) this.link.send({ t: 'w', m: plain }).catch(() => this.queue.push(plain));
     else this.queue.push(plain);
   }
 

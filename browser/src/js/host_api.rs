@@ -16,6 +16,7 @@ type HostFn = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
 
 pub fn install(ctx: &mut Context) -> JsResult<()> {
     let fns: &[(&str, HostFn, usize)] = &[
+        ("identity", identity, 0),
         ("info", info, 1),
         ("parent", parent, 1),
         ("children", children, 1),
@@ -27,6 +28,7 @@ pub fn install(ctx: &mut Context) -> JsResult<()> {
         ("removeAttr", remove_attr, 2),
         ("attrs", attrs, 1),
         ("create", create, 2),
+        ("scriptAsync", script_async, 1),
         ("createText", create_text, 1),
         ("createComment", create_comment, 1),
         ("append", append, 2),
@@ -97,6 +99,10 @@ pub fn install(ctx: &mut Context) -> JsResult<()> {
 }
 
 // ---- argument helpers ----
+
+fn identity(_: &JsValue, _: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    Ok(js_str(&with_host(|_, s| s.identity.navigator_json()).unwrap_or_default()))
+}
 
 fn arg_num(args: &[JsValue], i: usize) -> f64 {
     args.get(i).and_then(|v| v.as_number()).unwrap_or(f64::NAN)
@@ -347,7 +353,24 @@ fn create(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue>
         "http://www.w3.org/1998/Math/MathML" | "math" => QualName::new(None, ns!(mathml), LocalName::from(tag.as_str())),
         _ => html_name(&tag.to_ascii_lowercase()),
     };
-    host(|doc, _| JsValue::from(doc.mutate().create_element(name, vec![]).as_u64() as f64))
+    host(|doc, state| {
+        let is_script = name.ns == ns!(html) && name.local == local_name!("script");
+        let id = doc.mutate().create_element(name, vec![]);
+        if is_script { state.force_async_scripts.insert(id); }
+        JsValue::from(id.as_u64() as f64)
+    })
+}
+
+fn script_async(_: &JsValue, args: &[JsValue], _: &mut Context) -> JsResult<JsValue> {
+    let id = arg_id(args, 0)?;
+    host(|doc, state| {
+        node_exists(doc, id)?;
+        if args.len() > 1 {
+            if arg_bool(args, 1) { state.force_async_scripts.insert(id); }
+            else { state.force_async_scripts.remove(&id); }
+        }
+        Ok(JsValue::from(state.force_async_scripts.contains(&id)))
+    })?
 }
 
 fn create_text(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {

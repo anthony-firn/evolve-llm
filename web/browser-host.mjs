@@ -97,6 +97,8 @@ export function createBrowserHost({ load, post, now = () => performance.now(), s
     if (message.width) size = { width: message.width, height: message.height, dpr: message.dpr || 1 };
     const { Browser, fonts } = await load();
     browser = new Browser(fonts, message.relayUrl, message.cookies ?? null, message.storage ?? null, wake);
+    if (message.identityProfile && message.identityProfile !== 'legacy') browser.setIdentity(message.identityProfile);
+    if (message.tlsProfile && message.tlsProfile !== 'default') browser.setTlsProfile(message.tlsProfile);
     browser.setTorConsensus?.(torConsensusSources(message.torConsensus));
     if (message.torLog) browser.enableTorLog?.();
     browser.resize(size.width, size.height, size.dpr);

@@ -26,6 +26,7 @@ pub const PRELUDE: &str = include_str!("prelude.js");
 
 /// Per-page state the host API reads and writes while script runs.
 pub struct PageState {
+    pub identity: crate::identity::Identity,
     pub id: u64,
     pub url: Url,
     pub referrer: String,
@@ -36,6 +37,8 @@ pub struct PageState {
     pub listened: HashSet<String>,
     /// `<script>` elements inserted by script, waiting to run
     pub dynamic_scripts: Vec<NodeId>,
+    /// Script-created elements start with force-async set, until the async setter clears it.
+    pub force_async_scripts: HashSet<NodeId>,
     /// Navigations requested by script: (url, replace)
     pub navigations: Vec<(String, bool)>,
     /// history.pushState/replaceState: (url, replace, state json)
@@ -60,6 +63,7 @@ pub enum HistoryOp {
 impl PageState {
     pub fn new(id: u64, url: Url, referrer: String, local: Rc<RefCell<HashMap<String, String>>>, session: Rc<RefCell<HashMap<String, String>>>) -> Self {
         PageState {
+            identity: crate::identity::Identity::default(),
             id,
             url,
             referrer,
@@ -68,6 +72,7 @@ impl PageState {
             animation_frame: false,
             listened: HashSet::new(),
             dynamic_scripts: vec![],
+            force_async_scripts: HashSet::new(),
             navigations: vec![],
             history: vec![],
             layout_dirty: true,

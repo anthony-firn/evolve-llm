@@ -8,6 +8,29 @@ fn h() -> Harness {
 }
 
 #[test]
+fn identities_are_selected_before_navigation_and_survive_later_navigations() {
+    use evolve_browser::identity::Identity;
+    for profile in ["legacy", "firefox-esr", "firefox", "chrome", "evolve"] {
+        let mut t = h();
+        t.engine.set_identity(profile).unwrap();
+        t.site.add("https://a.test/", "text/html", "<script>window.initialUA = navigator.userAgent</script>");
+        t.site.add("https://b.test/", "text/html", "<p>another origin</p>");
+        t.open("https://a.test/");
+        let expected = serde_json::to_string(Identity::parse(profile).unwrap().user_agent()).unwrap();
+        assert_eq!(t.eval("initialUA"), expected);
+        assert!(t.engine.set_identity("evolve").is_err());
+        if profile.starts_with("firefox") {
+            assert_eq!(t.eval("navigator.vendor"), "\"\"");
+            assert_eq!(t.eval("'userAgentData' in navigator || 'deviceMemory' in navigator || 'connection' in navigator"), "false");
+            assert_eq!(t.eval("navigator.appVersion"), "\"5.0 (X11)\"");
+        }
+        t.open("https://b.test/");
+        assert_eq!(t.eval("navigator.userAgent"), expected);
+    }
+    assert!(Identity::parse("invalid\r\nInjected: yes").is_err());
+}
+
+#[test]
 fn renders_a_styled_page() {
     let mut t = h();
     t.site.add("https://a.test/", "text/html", "<!doctype html><title>Hello</title><style>body{background:#204080;margin:0} h1{color:white}</style><h1>Hi there</h1>");
@@ -22,6 +45,24 @@ fn renders_a_styled_page() {
     let white = frame.chunks(4).take(800 * 60).filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200).count();
     assert!(white > 50, "expected heading text, found {white} white pixels");
     assert!(t.events.iter().any(|e| matches!(e, evolve_browser::host::OutEvent::Title { title } if title == "Hello")));
+}
+
+#[test]
+fn noscript_fallbacks_are_inert_in_documents_and_html_fragments() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", r#"<!doctype html><head>
+      <noscript><style>body { opacity: 0; }</style><link rel=stylesheet href=/fallback.css></noscript>
+      </head><body><p>Visible sign-in page</p><div id=host></div>
+      <noscript><script>window.fallbackRan = true</script><img src=/fallback.png></noscript>
+      <script>window.scriptRan = true</script></body>"#);
+    t.open("https://a.test/");
+    assert_eq!(t.eval("getComputedStyle(document.body).opacity"), "\"1\"");
+    assert_eq!(t.eval("scriptRan && !window.fallbackRan"), "true");
+    assert_eq!(t.eval("document.querySelectorAll('noscript style, noscript img, noscript script').length"), "0");
+    assert!(!t.site.requests.borrow().iter().any(|r| r.url.path().starts_with("/fallback")));
+    t.eval("document.getElementById('host').innerHTML = '<noscript><style>body { opacity: 0; }</style></noscript>'");
+    assert_eq!(t.eval("getComputedStyle(document.body).opacity"), "\"1\"");
+    assert_eq!(t.eval("document.querySelectorAll('noscript style').length"), "0");
 }
 
 #[test]
@@ -73,6 +114,89 @@ fn dom_apis_behave_like_a_browser() {
     for (code, want) in checks {
         assert_eq!(t.eval(code), want, "{code}");
     }
+}
+
+#[test]
+fn constructed_stylesheets_update_rendered_layout_and_live_rule_lists() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", "<style>#box { width: 10px; height: 10px; }</style><div id=box></div>");
+    t.open("https://a.test/");
+    t.eval("window.sheet = new CSSStyleSheet(); window.rules = sheet.cssRules; sheet.replaceSync('#box { width: 123px; }'); document.adoptedStyleSheets = [sheet]");
+    assert_eq!(t.eval("document.getElementById('box').getBoundingClientRect().width"), "123");
+    assert_eq!(t.eval("rules.length === 1 && rules[0] instanceof CSSRule && rules[0].parentStyleSheet === sheet"), "true");
+    assert_eq!(t.eval("document.styleSheets.length"), "1");
+    t.eval("sheet.insertRule('#box { height: 45px; }', 1)");
+    assert_eq!(t.eval("document.getElementById('box').getBoundingClientRect().height"), "45");
+    assert_eq!(t.eval("rules.length"), "2");
+    t.eval("sheet.deleteRule(1); sheet.replace('#box { width: 88px; }').then(s => window.replaced = s === sheet)");
+    assert_eq!(t.eval("replaced"), "true");
+    assert_eq!(t.eval("document.getElementById('box').getBoundingClientRect().width"), "88");
+    t.eval("sheet.disabled = true");
+    assert_eq!(t.eval("document.getElementById('box').getBoundingClientRect().width"), "10");
+    t.eval("sheet.disabled = false");
+    assert_eq!(t.eval("document.getElementById('box').getBoundingClientRect().width"), "88");
+    t.eval("document.adoptedStyleSheets.pop()");
+    assert_eq!(t.eval("document.getElementById('box').getBoundingClientRect().width"), "10");
+}
+
+#[test]
+fn constructed_stylesheets_handle_css_boundaries_and_atomic_adoption() {
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", "<div id=host></div>");
+    t.open("https://a.test/");
+    t.eval(r#"window.sheet = new CSSStyleSheet(); sheet.replaceSync('/* heading */ @import "skip.css"; @media screen { p { color: red; } } p::before { content: "};{"; }'); window.rules = sheet.cssRules"#);
+    assert_eq!(t.eval("rules.length"), "2");
+    assert_eq!(t.eval("(() => { try { sheet.insertRule('p{} q{}'); } catch (e) { return e.name; } })()"), "\"SyntaxError\"");
+    assert_eq!(t.eval("(() => { try { sheet.insertRule('@import \"x.css\";'); } catch (e) { return e.name; } })()"), "\"SyntaxError\"");
+    assert_eq!(t.eval("(() => { try { sheet.deleteRule(2); } catch (e) { return e.name; } })()"), "\"IndexSizeError\"");
+    t.eval("document.adoptedStyleSheets.push(sheet); window.shadow = document.getElementById('host').attachShadow({mode:'open'}); shadow.adoptedStyleSheets = [sheet]");
+    assert_eq!(t.eval("document.adoptedStyleSheets[0] === sheet && shadow.adoptedStyleSheets[0] === sheet"), "true");
+    assert_eq!(t.eval("(() => { try { document.adoptedStyleSheets = [sheet, {}]; } catch (e) { return e.name; } })()"), "\"NotAllowedError\"");
+    assert_eq!(t.eval("document.adoptedStyleSheets.length"), "1");
+    assert_eq!(t.eval("(() => { try { document.adoptedStyleSheets.push({}); } catch (e) { return e.name; } })()"), "\"NotAllowedError\"");
+    assert_eq!(t.eval("document.adoptedStyleSheets.length"), "1");
+}
+
+#[test]
+fn dynamic_async_false_scripts_wait_for_dependencies_but_async_scripts_do_not() {
+    use evolve_browser::{host::{self, Loader}, net::{FetchRequest, FetchResponse}, testing::SiteLoader};
+    use std::{cell::RefCell, rc::Rc};
+    type Completion = Box<dyn FnOnce(Result<FetchResponse, String>)>;
+    struct Delayed {
+        site: SiteLoader,
+        pending: RefCell<Option<(FetchRequest, Completion)>>,
+    }
+    impl Loader for Delayed {
+        fn fetch(&self, req: FetchRequest, done: Completion) {
+            if req.url.path() == "/slow.js" { *self.pending.borrow_mut() = Some((req, done)); }
+            else { self.site.fetch(req, done); }
+        }
+        fn script_cookies(&self, url: &url::Url) -> String { self.site.script_cookies(url) }
+        fn set_script_cookie(&self, url: &url::Url, value: &str) { self.site.set_script_cookie(url, value); }
+    }
+    let mut t = h();
+    t.site.add("https://a.test/", "text/html", r#"<script>
+      window.order = []; window.defaults = document.createElement('script').async;
+      for (const [src, ordered] of [['/slow.js', true], ['/dependent.js', true], ['/async.js', false]]) {
+        const s = document.createElement('script'); s.src = src;
+        if (ordered) s.async = false;
+        document.head.appendChild(s);
+      }
+    </script>"#);
+    t.site.add("https://a.test/slow.js", "text/javascript", "window.Dependency = function() {}; order.push('first')");
+    t.site.add("https://a.test/dependent.js", "text/javascript", "new Dependency(); order.push('second')");
+    t.site.add("https://a.test/async.js", "text/javascript", "order.push('async')");
+    let loader = Rc::new(Delayed { site: SiteLoader(t.site.clone()), pending: RefCell::new(None) });
+    host::LOADER.with(|l| *l.borrow_mut() = Some(loader.clone()));
+    t.open("https://a.test/");
+    assert_eq!(t.eval("defaults"), "true");
+    assert_eq!(t.eval("document.querySelector('script').async"), "false");
+    assert_eq!(t.eval("order.join(',')"), "\"async\"");
+    let (req, done) = loader.pending.borrow_mut().take().unwrap();
+    loader.site.fetch(req, done);
+    t.settle();
+    assert_eq!(t.eval("order.join(',')"), "\"async,first,second\"");
+    assert!(!t.console().iter().any(|s| s.contains("ReferenceError")), "{:?}", t.console());
 }
 
 #[test]

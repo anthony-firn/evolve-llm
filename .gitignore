@@ -18,3 +18,5 @@ node_modules
 /web/vm/kernel/
 /web/vm/bin/
 /web/vm/programs.json
+
+/web/local-pi-agent.bundle.mjs

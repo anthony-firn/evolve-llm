@@ -130,6 +130,17 @@ A deployment can preset the default route in `web/browser-config.json`
   back after a reload. There is no profile sync.
 - The engine has no access to the workbench page, your real browser's cookies or saved passwords.
 
+HTML parsing uses scripting-enabled rules, including for `innerHTML`: markup inside `noscript`
+stays inert. In particular, a site's no-JavaScript fallback stylesheet cannot hide its scripted
+sign-in page. Dynamically inserted scripts with `async = false` download concurrently and run
+in insertion order; ordinary async scripts can still run while those scripts wait.
+
+Constructed `CSSStyleSheet` objects support `replaceSync`, `replace`, `insertRule`, `deleteRule`,
+disabling, media conditions and adoption by a document or shadow root. Shared sheets update all
+adopters. Rules are exposed as a live list of `CSSRule` objects with `cssText`; editing individual
+rule declarations and a complete grouping-rule CSSOM are not implemented. Shadow-root adoption
+uses the same light-DOM approximation as the rest of this engine.
+
 ## What works
 
 Measured in Chrome on Linux (1280×900 panel), over the **Tor route** with nothing installed
@@ -167,13 +178,89 @@ Diagnostics: setting `localStorage['evolve-browser-tor-log'] = '1'` logs the Tor
 (circuits, extends, streams) to the worker console, and `getBrowser().request('torStats')`
 returns byte and frame counters for each Snowflake layer.
 
-Tests: 16 engine tests (`cargo test --manifest-path browser/Cargo.toml --test engine`: scripts,
+Tests: 20 engine tests (`cargo test --manifest-path browser/Cargo.toml --test engine`: scripts,
 modules and import maps, DOM APIs, events, forms, timers, fetch, cookies, history, the select
 menu, the agent sharing a page), 16 unit tests for HTTP, Wisp, cookie and CORS rules and the
 snapshot, 29 relay tests (Wisp, limits, Nostr announcements with the BIP-340 vectors), 6 tests for
 finding community relays (`tests/relay-directory.test.mjs`), `tests/browser_view_browser_test.py`,
 which drives the real engine in Chrome through the relay with the agent and the person on the same
 page, and `tests/browser_tor_live_test.py`, which loads real sites over the live Tor network.
+
+`python3 -B tests/browser_google_live_test.py --runtime web --screens /tmp/google-ui` checks
+Google's public sign-in page over Tor: visible canvas pixels and the response to clicking Next
+with an empty identifier. It uses a temporary Chrome profile and never supplies account details.
+Passing this test establishes UI compatibility, not authenticated sign-in or Google approval of
+this client. Google can still reject an embedded browser or a Tor exit during authentication.
+The modern Google page rendered and responded to empty-field validation in 17.2 seconds in the
+2026-11-19 UTC run. No Google-specific CSS override or new browser-identity spoof was needed:
+the fixes are the parser's scripting flag, ordered dynamic scripts and constructed stylesheets.
+
+**Google account authentication is currently unsupported in this panel.** A later nonempty
+identifier test reproduced a stalled modern form. Google's basic form completed the identifier
+request, but an owner-authorized real-account attempt returned “This browser or app may not be
+secure” before a password prompt. No password or verification code was entered. This follows
+Google's [supported-browser guidance](https://support.google.com/accounts/answer/7675428?hl=en).
+The notice on ordinary Google sign-in and rejection pages offers **Open Google in new tab**.
+It starts a separate sign-in in the visitor's regular browser, retaining only the service,
+language and return destination. It does not copy panel session tokens or sign the panel in,
+and it does not rewrite OAuth grant URLs or account challenges.
+
+## User-agent and TLS experiments
+
+Open the route button (Tor/Relay) and use **Compatibility experiments**. The user-agent
+profiles are the existing Chrome 131 + Evolve identity (default), plain Chrome 131,
+Firefox ESR 153, Firefox 160 and EvolveBrowser only. Firefox version labels were checked
+against [Mozilla's release data](https://product-details.mozilla.org/1.0/firefox_versions.json)
+on 2026-11-19. The HTTP User-Agent and `navigator.userAgent` use the same profile;
+Firefox profiles also omit Chromium client hints, deviceMemory and navigator.connection.
+These are content-negotiation experiments, not implementations of those browsers.
+
+**Apply profiles and reload** restarts only this panel and reloads its current URL. Cookies
+and localStorage survive; page state, history and sessionStorage do not. Defaults remain
+unchanged. The same controls are available with `BrowserClient.setProfiles(identity, tls)`.
+
+The `firefox-order` TLS experiment orders only the AEAD suites our existing rustls/ring stack
+supports according to [NSS's preference list](https://github.com/nss-dev/nss/blob/master/lib/ssl/ssl3con.c).
+It retains certificate and hostname verification, TLS 1.2/1.3 and HTTP/1.1. It does **not**
+match Firefox's complete ClientHello: extension ordering, key shares, ECH, certificate
+compression and resumption differ, and HTTP/2 is not implemented. We do not advertise h2
+without an HTTP/2 implementation. rustls does not expose general browser fingerprint
+emulation through its standard configuration API.
+
+The opt-in comparison below records real TLS fingerprints and submits only a synthetic
+nonexistent identifier to Google's modern and basic forms. It never enters a real account,
+password or verification code. Real-account acceptance is a separate, unverified question.
+The diagnostic service receives the request's Tor exit address and user-agent; saved results
+omit IPs, cookies and Google session URLs.
+
+```sh
+python3 -B tests/browser_identity_live_test.py --runtime web --output /tmp/browser-identities.json
+```
+
+The 2026-11-19 run used fresh browser profiles over Tor and a synthetic `example.invalid`
+identifier. Every basic-form run returned account-not-found. Modern-form observations:
+
+| Identity | TLS | Modern form |
+| --- | --- | --- |
+| Existing Chrome + Evolve | Default | Stalled for 15 seconds after Next |
+| Firefox ESR 153 | Default | Stalled for 15 seconds after Next |
+| Firefox 160 | Default | Form-load timeout |
+| Plain Chrome 131 | Default | Stalled for 15 seconds after Next |
+| EvolveBrowser only | Default | Stalled for 15 seconds after Next |
+| Firefox ESR 153 | NSS cipher order | Stalled for 15 seconds after Next |
+
+The external TLS diagnostic confirmed the NSS cipher ordering on the wire and matching HTTP
+and JavaScript UA strings. All engine cases negotiated HTTP/1.1; installed Chrome negotiated
+HTTP/2 and had a different ClientHello. The native Chrome baseline used a direct connection,
+and Tor exit addresses were not held constant across engine cases, so this is exploratory
+evidence, not an isolated study of Google's checks. No profile demonstrated authentication.
+The live bad-certificate endpoint was unreachable through the test Tor exit; an in-memory
+client/server handshake test verifies that both TLS profiles reject an untrusted certificate.
+
+Google's [browser requirements](https://developers.googleblog.com/guidance-to-developers-affected-by-our-effort-to-block-less-secure-browsers-and-applications/)
+require a clear browser identity and prohibit using another browser's user-agent on its
+account host. Experimental UA results do not establish support or make this panel a supported
+Google authentication client.
 
 ## Limits
 
@@ -185,7 +272,8 @@ page, and `tests/browser_tor_live_test.py`, which loads real sites over the live
   (cookies and storage survive). Reload or navigate again.
 - **Missing web APIs:** canvas 2D and WebGL, audio and video playback, Web Workers, page
   WebSockets, IndexedDB, Service Workers and WebAuthn. Shadow DOM is approximated in the light
-  DOM. `Intl` is a small built-in subset (no ICU data).
+  DOM. Embedded-frame scripts do not run, and `iframe.contentWindow` is not implemented.
+  `Intl` is a small built-in subset (no ICU data).
 - **HTTP/1.1 only**, six connections per host, with stylesheets and documents first. Pages with
   hundreds of scripts load slowly, more so over Tor, where each connection is a Tor stream with
   its own TLS handshake; HTTP/2 would help.
@@ -194,7 +282,7 @@ page, and `tests/browser_tor_live_test.py`, which loads real sites over the live
   manager do not reach pages inside the engine.
 - **Rendering:** Blitz 0.3 is a beta. Some whitespace between inline elements collapses, icon
   spacing in flex layouts can differ, and there is no printing.
-- **Size:** the engine is 18.6 MB of WebAssembly after `wasm-opt`, plus 8.6 MB of fonts, both
+- **Size:** the engine is 21.0 MB of WebAssembly after `wasm-opt`, plus 8.6 MB of fonts, both
   downloaded once.
 
 ## Build and test

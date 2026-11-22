@@ -68,6 +68,23 @@ impl Browser {
         self.engine.resize(css_width, css_height, dpr);
     }
 
+    /// Diagnostic content-negotiation profile; must be selected before the first navigation.
+    #[wasm_bindgen(js_name = setIdentity)]
+    pub fn set_identity(&mut self, profile: &str) -> Result<(), JsValue> {
+        let identity = crate::identity::Identity::parse(profile).map_err(JsValue::from_str)?;
+        self.engine.set_identity(profile).map_err(JsValue::from_str)?;
+        *self.client.user_agent.borrow_mut() = identity.user_agent().into();
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = setTlsProfile)]
+    pub fn set_tls_profile(&self, profile: &str) -> Result<(), JsValue> {
+        if !self.engine.can_configure() {
+            return Err(JsValue::from_str("Select the TLS profile before navigating; restart the browser to change it"));
+        }
+        self.client.set_tls_profile(profile).map_err(JsValue::from_str)
+    }
+
     /// The route to websites: `"tor:"` for the Tor network, or a Wisp relay's ws(s):// URL.
     #[wasm_bindgen(js_name = setRelay)]
     pub fn set_relay(&self, url: &str) {

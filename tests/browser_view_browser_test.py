@@ -108,6 +108,42 @@ def check(runtime):
             page.locator("#open-browser").click()
             page.wait_for_selector("#browser-panel:not([hidden])")
 
+            # The Google notice offers a normal new tab without copying panel session tokens.
+            # Simulate only the URL event; no requests to Google are made by this component check.
+            page.evaluate("async()=>{const {getBrowser}=await import('./browser-session.mjs');getBrowser()._apply({type:'url',url:'https://accounts.google.com/v3/signin/rejected?flowName=GlifWebSignIn&service=mail&hl=en&TL=private-panel-token',canBack:false,canForward:false})}")
+            notice = page.locator('.browser-signin-help')
+            assert notice.is_visible()
+            link = notice.get_by_role('link', name='Open Google in new tab')
+            assert link.get_attribute('href') == 'https://accounts.google.com/ServiceLogin?service=mail&hl=en'
+            assert link.get_attribute('target') == '_blank'
+            assert set(link.get_attribute('rel').split()) == {'noopener', 'noreferrer'}
+            assert 'does not sign this panel in' in notice.inner_text()
+            # Exercise the user click, with a local fixture response instead of an account request.
+            external_requests = []
+            def external_fixture(route):
+                external_requests.append(route.request)
+                route.fulfill(status=200, content_type='text/html', body='<p>External sign-in destination</p>')
+            page.context.route('https://accounts.google.com/ServiceLogin*', external_fixture)
+            try:
+                with page.expect_popup() as opened:
+                    link.click()
+                popup = opened.value
+                popup.wait_for_load_state('domcontentloaded')
+                assert popup.url == link.get_attribute('href')
+                assert popup.evaluate('window.opener === null')
+                assert 'referer' not in external_requests[0].headers
+                popup.close()
+            finally:
+                page.context.unroute('https://accounts.google.com/ServiceLogin*', external_fixture)
+            page.set_viewport_size({'width': 390, 'height': 850})
+            page.wait_for_timeout(150)
+            assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            assert link.is_visible()
+            page.set_viewport_size({'width': 1440, 'height': 850})
+            page.evaluate("async()=>{const {getBrowser}=await import('./browser-session.mjs');getBrowser()._apply({type:'url',url:'about:blank',canBack:false,canForward:false})}")
+            assert notice.is_hidden()
+            assert notice.locator('a').get_attribute('href') is None
+
             if not engine_built:
                 page.wait_for_function("() => /not built/.test(document.querySelector('.browser-status-text')?.textContent || '')", timeout=15000)
                 assert not errors, errors
@@ -115,6 +151,29 @@ def check(runtime):
                       f"{runtime}/browser-pkg/browser.js is missing (run `node tools/build_workbench.mjs`).")
                 browser.close()
                 return
+
+            # Profile controls restart the actual WASM worker and reload the page.
+            client_call(page, "b.ready")
+            client_call(page, "b.navigate('about:blank')")
+            client_call(page, "b.waitForIdle()")
+            page.locator('.browser-relay').click()
+            page.get_by_label('User-agent profile', exact=True).select_option('firefox-esr')
+            page.get_by_label('TLS profile', exact=True).select_option('firefox-order')
+            page.get_by_role('button', name='Apply profiles and reload').click()
+            page.wait_for_selector('.browser-relay-settings', state='hidden', timeout=60000)
+            client_call(page, "b.waitForIdle()")
+            assert 'Firefox/153.0' in client_call(page, "b.evaluate('navigator.userAgent')")
+            assert client_call(page, "b.evaluate('typeof navigator.userAgentData')") == '\"undefined\"'
+            assert page.locator('.browser-canvas').count() == 1
+            page.set_viewport_size({'width': 390, 'height': 850})
+            page.locator('.browser-relay').click()
+            assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            page.get_by_label('User-agent profile', exact=True).select_option('legacy')
+            page.get_by_label('TLS profile', exact=True).select_option('default')
+            page.get_by_role('button', name='Apply profiles and reload').click()
+            page.wait_for_selector('.browser-relay-settings', state='hidden', timeout=60000)
+            page.set_viewport_size({'width': 1440, 'height': 850})
+            assert not errors, errors
 
             site = fixture_server()
             site_url = f"http://127.0.0.1:{site.server_address[1]}/"

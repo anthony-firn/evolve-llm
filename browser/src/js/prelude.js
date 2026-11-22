@@ -7,7 +7,8 @@
   delete globalThis.__h;
   const G = globalThis;
   const ID = Symbol('node');
-  const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 EvolveBrowser/0.1';
+  const identity = JSON.parse(H.identity());
+  const UA = identity.userAgent;
   const define = (obj, props) => { for (const k of Object.keys(props)) Object.defineProperty(obj, k, { value: props[k], writable: true, configurable: true, enumerable: false }); };
   const getters = (obj, props) => { for (const k of Object.keys(props)) { const d = props[k]; Object.defineProperty(obj, k, typeof d === 'function' ? { get: d, configurable: true, enumerable: true } : Object.assign({ configurable: true, enumerable: true }, d)); } };
   const fmt = (v, depth = 0) => {
@@ -443,6 +444,140 @@
     });
   }
   class CSSStyleDeclaration {}
+  // Constructed stylesheets are backed by real style elements so replacement, insertion,
+  // adoption and removal go through Stylo and affect layout, rather than just feature tests.
+  // Shadow DOM currently uses the engine's light-DOM approximation (see docs/browser.md).
+  const adoptedSheets = new WeakMap();
+  const adoptedNodes = new WeakSet();
+  function cssRuleTexts(text) {
+    const rules = [];
+    let start = 0, depth = 0, parens = 0, quote = '', comment = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i], next = text[i + 1];
+      if (comment) { if (c === '*' && next === '/') { comment = false; i++; } continue; }
+      if (quote) { if (c === '\\') i++; else if (c === quote) quote = ''; continue; }
+      if (c === '/' && next === '*') { comment = true; i++; continue; }
+      if (c === '\\') { i++; continue; }
+      if (c === '"' || c === "'") { quote = c; continue; }
+      if (c === '(' || c === '[') parens++;
+      if (c === ')' || c === ']') parens--;
+      if (parens) continue;
+      if (c === '{') depth++;
+      if (c === '}') depth--;
+      if (depth < 0) { start = i + 1; depth = 0; continue; }
+      if ((!depth && c === '}') || (!depth && c === ';')) {
+        const rule = text.slice(start, i + 1).replace(/^(?:\s|\/\*[\s\S]*?\*\/)+/, '').trim();
+        if (rule && (rule.includes('{') || rule.startsWith('@'))) rules.push(rule);
+        start = i + 1;
+      }
+    }
+    return rules;
+  }
+  class CSSRule {
+    constructor(text, sheet) { this.cssText = text; this.parentStyleSheet = sheet; this.parentRule = null; }
+    get type() { return this.cssText.startsWith('@') ? 0 : 1; }
+  }
+  define(CSSRule, { STYLE_RULE: 1, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5, KEYFRAMES_RULE: 7, SUPPORTS_RULE: 12 });
+  class StyleSheet {
+    get type() { return 'text/css'; }
+  }
+  class CSSStyleSheet extends StyleSheet {
+    constructor(options = {}) {
+      super();
+      this.ownerNode = null; this.href = null; this.ownerRule = null; this.parentStyleSheet = null; this.title = '';
+      this._rules = []; this._copies = new Map(); this._disabled = !!options.disabled;
+      const sheet = this;
+      this.media = {
+        _text: String(options.media || ''),
+        get mediaText() { return this._text; },
+        set mediaText(v) { this._text = String(v); sheet._sync(); },
+        toString() { return this.mediaText; },
+      };
+      this._ruleList = new Proxy([], {
+        get(_, k) {
+          if (k === 'item') return i => sheet._rules[i] || null;
+          const value = Reflect.get(sheet._rules, k);
+          return typeof value === 'function' ? value.bind(sheet._rules) : value;
+        },
+        set() { return false; },
+      });
+    }
+    get cssRules() { return this._ruleList; }
+    get rules() { return this.cssRules; }
+    get disabled() { return this._disabled; }
+    set disabled(v) { this._disabled = !!v; this._sync(); }
+    replaceSync(text) {
+      this._rules = cssRuleTexts(String(text)).filter(r => !/^@import\b/i.test(r)).map(r => new CSSRule(r, this));
+      this._sync();
+    }
+    replace(text) { try { this.replaceSync(text); return Promise.resolve(this); } catch (e) { return Promise.reject(e); } }
+    insertRule(text, index = 0) {
+      index = Number(index) >>> 0;
+      if (index > this._rules.length) throw new DOMException('Rule index is out of range', 'IndexSizeError');
+      const rules = cssRuleTexts(String(text));
+      if (rules.length !== 1) throw new DOMException('Expected one CSS rule', 'SyntaxError');
+      if (/^@import\b/i.test(rules[0])) throw new DOMException('Constructed sheets cannot import stylesheets', 'SyntaxError');
+      this._rules.splice(index, 0, new CSSRule(rules[0], this));
+      this._sync(); return index;
+    }
+    deleteRule(index) {
+      index = Number(index) >>> 0;
+      if (index >= this._rules.length) throw new DOMException('Rule index is out of range', 'IndexSizeError');
+      this._rules.splice(index, 1); this._sync();
+    }
+    addRule(selector, style, index = this._rules.length) { this.insertRule(String(selector) + '{' + String(style) + '}', index); return -1; }
+    removeRule(index = 0) { this.deleteRule(index); }
+    _sync() {
+      let text = this._rules.map(r => r.cssText).join('\n');
+      // Blitz does not yet restyle a <style> when only its media attribute changes.
+      // Put the condition in the stylesheet so Stylo evaluates it on every update.
+      if (this.media.mediaText) text = '@media ' + this.media.mediaText + '{' + text + '}';
+      if (this.disabled) text = '';
+      for (const node of this._copies.values()) {
+        node.setAttribute('media', this.disabled ? 'not all' : this.media.mediaText);
+        node.textContent = text;
+      }
+    }
+  }
+  function adoptedList(root) {
+    let state = adoptedSheets.get(root);
+    if (state) return state.proxy;
+    state = { list: [], active: new Set() };
+    const validate = list => {
+      for (const sheet of list) if (!(sheet instanceof CSSStyleSheet)) throw new DOMException('Only constructed stylesheets can be adopted', 'NotAllowedError');
+    };
+    const sync = () => {
+      const wanted = new Set(state.list);
+      for (const sheet of state.active) if (!wanted.has(sheet)) { sheet._copies.get(root)?.remove(); sheet._copies.delete(root); }
+      const parent = root.nodeType === 9 ? root.head || root.documentElement : root;
+      for (const sheet of state.list) {
+        let node = sheet._copies.get(root);
+        if (!node) { node = document.createElement('style'); adoptedNodes.add(node); sheet._copies.set(root, node); }
+        parent.appendChild(node); sheet._sync();
+      }
+      state.active = wanted;
+    };
+    const mutators = new Set(['push', 'pop', 'shift', 'unshift', 'splice', 'sort', 'reverse', 'copyWithin', 'fill']);
+    state.proxy = new Proxy(state.list, {
+      get(list, k, receiver) {
+        if (mutators.has(k)) return (...args) => {
+          const next = list.slice(), result = Array.prototype[k].apply(next, args);
+          validate(next); list.splice(0, list.length, ...next); sync();
+          return result === next ? state.proxy : result;
+        };
+        return Reflect.get(list, k, receiver);
+      },
+      set(list, k, value) {
+        const next = list.slice(); Reflect.set(next, k, value); validate(next);
+        Reflect.set(list, k, value); sync(); return true;
+      },
+      deleteProperty() { throw new TypeError('An adopted stylesheet list cannot contain holes'); },
+    });
+    state.replace = list => { const next = Array.from(list); validate(next); state.list.splice(0, state.list.length, ...next); sync(); };
+    adoptedSheets.set(root, state);
+    return state.proxy;
+  }
+  function setAdoptedSheets(root, value) { adoptedList(root); adoptedSheets.get(root).replace(value); }
   function computedProxy(el) {
     const id = el[ID];
     const read = (p) => H.computed(id, p.startsWith('--') ? p : kebab(p));
@@ -591,7 +726,7 @@
     getElementById(i) { return this.querySelector('#' + cssEscape(i)); }
     get children() { return makeCollection(H.children(this[ID]).map(wrap).filter(n => n.nodeType === 1)); }
     append(...n) { for (const x of n) this.appendChild(toNode(x)); }
-    get activeElement() { return document.activeElement; } get adoptedStyleSheets() { return []; } set adoptedStyleSheets(v) {}
+    get activeElement() { return document.activeElement; } get adoptedStyleSheets() { return adoptedList(this); } set adoptedStyleSheets(v) { setAdoptedSheets(this, v); }
   }
 
   // reflected attributes
@@ -735,6 +870,12 @@
   // script
   reflect(C.HTMLScriptElement, [['src', 'src', 'url'], 'type', 'charset', ['async', 'async', 'bool'], ['defer', 'defer', 'bool'], ['noModule', 'nomodule', 'bool'], ['crossOrigin', 'crossorigin', 'string'], 'integrity', ['referrerPolicy', 'referrerpolicy', 'string'], 'nonce', 'event', ['htmlFor', 'for', 'string']]);
   getters(C.HTMLScriptElement.prototype, { text: { get() { return this.textContent; }, set(v) { this.textContent = v; } } });
+  getters(C.HTMLScriptElement.prototype, {
+    async: {
+      get() { return this.hasAttribute('async') || H.scriptAsync(this[ID]); },
+      set(v) { H.scriptAsync(this[ID], false); this.toggleAttribute('async', !!v); },
+    },
+  });
   // link, style, meta, base, iframe, canvas, media, source, track
   reflect(C.HTMLLinkElement, [['href', 'href', 'url'], 'rel', 'as', 'media', 'type', 'sizes', 'hreflang', ['crossOrigin', 'crossorigin', 'string'], 'integrity', ['disabled', 'disabled', 'bool'], ['imageSrcset', 'imagesrcset', 'string']]);
   getters(C.HTMLLinkElement.prototype, { relList() { return new DOMTokenList(this, 'rel'); }, sheet() { return null; } });
@@ -918,14 +1059,14 @@
     get forms() { return makeCollection([...this.querySelectorAll('form')]); } get images() { return makeCollection([...this.querySelectorAll('img')]); }
     get links() { return makeCollection([...this.querySelectorAll('a[href], area[href]')]); } get scripts() { return makeCollection([...this.querySelectorAll('script')]); }
     get anchors() { return makeCollection([...this.querySelectorAll('a[name]')]); } get embeds() { return makeCollection([...this.querySelectorAll('embed')]); }
-    get styleSheets() { return Object.assign([...this.querySelectorAll('style, link[rel~=stylesheet]')].map(el => ({ ownerNode: el, href: el.href || null, cssRules: [], rules: [], disabled: false, media: { mediaText: '' }, insertRule() { return 0; }, deleteRule() {} })), { item(i) { return this[i] || null; } }); }
+    get styleSheets() { return Object.assign([...this.querySelectorAll('style, link[rel~=stylesheet]')].filter(el => !adoptedNodes.has(el)).map(el => ({ ownerNode: el, href: el.href || null, cssRules: [], rules: [], disabled: false, media: { mediaText: '' }, insertRule() { return 0; }, deleteRule() {} })), { item(i) { return this[i] || null; } }); }
     get fonts() { return fontFaceSet; } get timeline() { return { currentTime: performance.now() }; }
     get fullscreenElement() { return null; } get fullscreenEnabled() { return false; } get pictureInPictureEnabled() { return false; } get pointerLockElement() { return null; }
     get designMode() { return 'off'; } set designMode(v) {}
     get children() { return makeCollection([this.documentElement].filter(Boolean)); } get childElementCount() { return this.documentElement ? 1 : 0; }
     get firstElementChild() { return this.documentElement; } get lastElementChild() { return this.documentElement; }
     get implementation() { return { hasFeature: () => true, createHTMLDocument: (t) => createDetachedDocument('<title>' + (t || '') + '</title>'), createDocument: () => createDetachedDocument(''), createDocumentType: (n) => ({ name: n }) }; }
-    get adoptedStyleSheets() { return []; } set adoptedStyleSheets(v) {}
+    get adoptedStyleSheets() { return adoptedList(this); } set adoptedStyleSheets(v) { setAdoptedSheets(this, v); }
     createElement(tag, opts) {
       tag = String(tag).toLowerCase();
       if (!/^[a-z][a-z0-9._\-]*$/.test(tag) && !/^[a-z][^\s>/]*$/.test(tag)) throw new DOMException("The tag name provided ('" + tag + "') is not a valid name.", 'InvalidCharacterError');
@@ -1526,7 +1667,7 @@
     back() { H.history(2, '-1', ''); }, forward() { H.history(2, '1', ''); }, go(n = 0) { H.history(2, String(n | 0), ''); },
   };
   const navigator = {
-    userAgent: UA, appVersion: UA.slice(8), appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko', productSub: '20030107', vendor: 'Google Inc.', vendorSub: '',
+    userAgent: UA, appVersion: identity.appVersion, appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko', productSub: '20030107', vendor: identity.vendor, vendorSub: '',
     platform: 'Linux x86_64', language: 'en-US', languages: ['en-US', 'en'], onLine: true, cookieEnabled: true, doNotTrack: null, hardwareConcurrency: 4, deviceMemory: 8, maxTouchPoints: 0,
     webdriver: false, pdfViewerEnabled: false, plugins: Object.assign([], { item() { return null; }, namedItem() { return null; }, refresh() {} }), mimeTypes: Object.assign([], { item() { return null; }, namedItem() { return null; } }),
     javaEnabled: () => false, sendBeacon(url, data) { const h = new Headers(); const b = bodyToHost(data == null ? null : data, h); const l = []; h.forEach((v, k) => l.push([k, v])); H.fetch(fetchSeq++, 'POST', new URL(String(url), document.baseURI).href, l, b, 'include', 'follow'); return true; },
@@ -1541,6 +1682,11 @@
     getGamepads: () => [], requestMediaKeySystemAccess: () => Promise.reject(new DOMException('Not supported', 'NotSupportedError')),
     registerProtocolHandler() {}, getBattery: () => Promise.resolve({ charging: true, level: 1, chargingTime: 0, dischargingTime: Infinity, addEventListener() {} }),
   };
+  if (!identity.chromium) {
+    delete navigator.userAgentData;
+    delete navigator.deviceMemory;
+    delete navigator.connection;
+  }
   const screen = {
     get width() { return Math.max(H.viewport()[0], 1280); }, get height() { return Math.max(H.viewport()[1], 800); }, get availWidth() { return this.width; }, get availHeight() { return this.height; },
     availLeft: 0, availTop: 0, colorDepth: 24, pixelDepth: 24, isExtended: false,
@@ -1733,7 +1879,7 @@
     Event, CustomEvent, UIEvent, FocusEvent, MouseEvent, PointerEvent, WheelEvent, KeyboardEvent, InputEvent, CompositionEvent, SubmitEvent, ErrorEvent, ProgressEvent, MessageEvent,
     PopStateEvent, HashChangeEvent, PageTransitionEvent, StorageEvent, PromiseRejectionEvent, AnimationEvent, TransitionEvent, ClipboardEvent, DragEvent, TouchEvent, CloseEvent,
     EventTarget, Node, Element, HTMLElement, SVGElement, SVGSVGElement, CharacterData, Text, Comment, CDATASection, ProcessingInstruction, Document, HTMLDocument, XMLDocument, DocumentFragment, ShadowRoot,
-    Attr, NamedNodeMap, DOMTokenList, NodeList, HTMLCollection, CSSStyleDeclaration, DOMRect, DOMRectReadOnly, DOMPoint, DOMPointReadOnly: DOMPoint, DOMMatrix, DOMMatrixReadOnly: DOMMatrix, DOMException,
+    Attr, NamedNodeMap, DOMTokenList, NodeList, HTMLCollection, CSSStyleDeclaration, CSSStyleSheet, StyleSheet, CSSRule, DOMRect, DOMRectReadOnly, DOMPoint, DOMPointReadOnly: DOMPoint, DOMMatrix, DOMMatrixReadOnly: DOMMatrix, DOMException,
     DOMParser, XMLSerializer, Range, TreeWalker, NodeFilter, Animation, KeyframeEffect, MutationObserver, IntersectionObserver, ResizeObserver, PerformanceObserver,
     TextEncoder, TextDecoder, URL, URLSearchParams, Blob, File, FileReader, FormData, Headers, Request, Response, AbortController, AbortSignal, XMLHttpRequest,
     ReadableStream, WritableStream, TransformStream, WebSocket, EventSource, BroadcastChannel, MessageChannel, MessagePort, Worker, Storage, Location, MediaQueryList, FontFace,

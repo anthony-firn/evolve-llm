@@ -8,7 +8,6 @@ use crate::net::{Credentials, FetchRequest, FetchResponse, Mode, Redirect};
 use anyrender::{ImageRenderer, PaintScene};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
 use blitz_dom::{local_name, BaseDocument, DocumentConfig, EventDriver, EventHandler, NodeData, NodeId, ScrollBehavior, ScrollLogicalPosition};
-use blitz_html::HtmlDocument;
 use blitz_traits::events::{
     BlitzImeEvent, BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, DomEvent, DomEventData, EventState, KeyState,
     MouseEventButton, MouseEventButtons, PointerCoords, PointerDetails, UiEvent,
@@ -53,11 +52,12 @@ struct ScriptItem {
     kind: ScriptKind,
     url: Option<Url>,
     status: ScriptStatus,
+    ordered_dynamic: bool,
 }
 
 pub struct Page {
     pub id: u64,
-    pub doc: Box<HtmlDocument>,
+    pub doc: Box<BaseDocument>,
     pub state: PageState,
     pub js: Option<JsRuntime>,
     /// Parser-inserted scripts that must run in order (sync, then deferred and modules)
@@ -89,6 +89,7 @@ struct HistoryEntry {
 }
 
 pub struct Engine {
+    identity: crate::identity::Identity,
     pub css_width: u32,
     pub css_height: u32,
     pub dpr: f32,
@@ -117,6 +118,18 @@ pub struct Engine {
 }
 
 impl Engine {
+    pub fn can_configure(&self) -> bool { self.page.is_none() && self.pending.is_none() }
+
+    /// Select an identity before navigation so every realm uses the same profile.
+    pub fn set_identity(&mut self, profile: &str) -> Result<(), &'static str> {
+        let identity = crate::identity::Identity::parse(profile)?;
+        if !self.can_configure() {
+            return Err("Select the browser identity before navigating; restart the browser to change it");
+        }
+        self.identity = identity;
+        Ok(())
+    }
+
     pub fn new(fonts: parley::FontContext, storage_json: Option<&str>) -> Self {
         let mut local = HashMap::new();
         if let Some(json) = storage_json {
@@ -151,6 +164,7 @@ impl Engine {
             suppress_text: None,
             last_url_event: String::new(),
             last_title: String::new(),
+            identity: crate::identity::Identity::default(),
         }
     }
 
@@ -434,15 +448,16 @@ impl Engine {
             net_provider: Some(Arc::new(PageNet { page: id, initiator: url.clone() })),
             navigation_provider: Some(Arc::new(PageNavigation)),
             shell_provider: Some(Arc::new(PageShell)),
-            html_parser_provider: Some(Arc::new(blitz_html::HtmlProvider)),
+            html_parser_provider: Some(Arc::new(crate::html::ScriptHtmlProvider)),
             font_ctx: Some(self.fonts.clone()),
             ..Default::default()
         };
-        let mut doc = Box::new(HtmlDocument::from_html(html, config));
+        let mut doc = Box::new(crate::html::document(html, config));
         let origin = url.origin().ascii_serialization();
         let local = self.local.entry(origin.clone()).or_default().clone();
         let session = self.session.entry(origin).or_default().clone();
         let mut state = PageState::new(id, url.clone(), referrer, local, session);
+        state.identity = self.identity;
         state.viewport = (self.css_width as f32, self.css_height as f32, self.dpr);
         state.now = crate::clock::now();
         let js = match JsRuntime::new(id, &url).and_then(|js| {
@@ -1048,11 +1063,11 @@ fn prepare_script(doc: &mut BaseDocument, id: NodeId, base: &Url) -> Option<Scri
     match node.attr(local_name!("src")) {
         Some(src) => {
             let url = base.join(src.trim()).ok()?;
-            Some(ScriptItem { node: id, kind, url: Some(url), status: ScriptStatus::Fetching })
+            Some(ScriptItem { node: id, kind, url: Some(url), status: ScriptStatus::Fetching, ordered_dynamic: false })
         }
         None => {
             let code = node.text_content();
-            Some(ScriptItem { node: id, kind, url: None, status: ScriptStatus::Ready(code) })
+            Some(ScriptItem { node: id, kind, url: None, status: ScriptStatus::Ready(code), ordered_dynamic: false })
         }
     }
 }
@@ -1191,7 +1206,10 @@ fn run_scripts(page: &mut Page) {
         if !page.started.insert(id) {
             continue;
         }
-        if let Some(item) = prepare_script(&mut page.doc, id, &base) {
+        if let Some(mut item) = prepare_script(&mut page.doc, id, &base) {
+            item.ordered_dynamic = item.url.is_some()
+                && !page.state.force_async_scripts.contains(&id)
+                && !page.doc.get_node(id).is_some_and(|n| n.data.has_attr(local_name!("async")));
             let index = page.unordered.len();
             if let Some(url) = &item.url {
                 fetch_script(page.id, index + (1 << 20), url.clone(), item.kind, page.state.url.clone());
@@ -1221,7 +1239,17 @@ fn run_scripts(page: &mut Page) {
         }
     }
     // Unordered scripts
+    // Explicit async=false scripts download concurrently but execute in insertion order.
+    // A waiting ordered script must not block the ordinary async scripts in the same list.
+    let mut ordered_blocked = false;
     for i in 0..page.unordered.len() {
+        if page.unordered[i].ordered_dynamic {
+            if ordered_blocked { continue; }
+            if page.unordered[i].status == ScriptStatus::Fetching {
+                ordered_blocked = true;
+                continue;
+            }
+        }
         match page.unordered[i].status.clone() {
             ScriptStatus::Ready(code) => {
                 let (node, kind, url) = (page.unordered[i].node, page.unordered[i].kind, page.unordered[i].url.clone());

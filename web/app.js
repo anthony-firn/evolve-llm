@@ -809,8 +809,38 @@ function regenerate() {
 // web, app previews), deciding itself whether a message needs them; other models chat plainly.
 function runResponse(){
   const question=state.messages.at(-1)?.content||'';
-  if(state.loaded?.tools)runAssistant(question);
+  if(localComputer.connected&&state.loaded?.tools)runLocalResponse(question);
+  else if(state.loaded?.tools)runAssistant(question);
   else runGeneration();
+}
+
+// With a paired computer connected (web/local-computer.mjs), the same chat works on that computer.
+async function runLocalResponse(question) {
+  const context=state.messages.slice(0,-1).filter(m=>!m.error).slice(-6).map(m=>`${m.role}: ${stripToolCalls(m.content)}`).join('\n').slice(-6000);
+  const m={role:'assistant',content:'',assistant:true,localComputer:true,started:performance.now()};
+  m.workView=createWorkView();
+  state.live=m;state.messages.push(m);setPhase('preparing');renderMessages();
+  $('scroll').scrollTop=$('scroll').scrollHeight;
+  const t0=performance.now();let calls=0,error=null;
+  trace({type:'run',chat:state.chatId,question,model:state.loaded?.label,computer:true});
+  try {
+    const result=await localComputer.runTask(question,{context,onEvent:e=>{
+      m.workView.event(e);
+      if(e.type==='tool')trace({type:'tool',chat:state.chatId,name:e.name,args:JSON.stringify(e.args)});
+      else if(e.type==='tool-result')trace({type:'result',chat:state.chatId,name:e.name,error:Boolean(e.isError),output:(e.result?.content||[]).map(c=>c.text||'').join('\n')});
+      else if(e.type==='answer'){const t=stripToolCalls(e.text||'').trim();if(t){m.content=t;scheduleLiveRender();}}
+    }});
+    calls=result.calls;
+    const last=result.messages.filter(m=>m.role==='assistant').at(-1);
+    m.content=stripToolCalls((last?.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('\n')).trim()||m.content||'Done.';
+    m.stats=`On your computer${result.calls?` · ${result.calls} step${result.calls===1?'':'s'}`:''}`;
+  } catch(e) {error=String(e.message||e);m.content=(m.content?m.content+'\n\n':'')+(m.cancelRequested?'Stopped.':`I stopped before finishing: ${error}`);}
+  finally {
+    m.workView.finish();state.live=null;setPhase(state.loaded?'ready':'idle');renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;
+    $('status-line').textContent=localComputer.connected?'Computer connected · the chat works on this computer.':'Local computer disconnected.';
+    trace({type:'done',chat:state.chatId,ms:Math.round(performance.now()-t0),calls,error,stopped:Boolean(m.cancelRequested),answer:m.content});
+    saveCurrentChat();
+  }
 }
 
 let assistant=null;
@@ -1066,7 +1096,7 @@ $('composer').addEventListener('submit', (e) => {
   autosize();
   send(text);
 });
-function stopCurrent(){if(state.live?.assistant){state.live.cancelRequested=true;assistant?.cancel();}else worker.postMessage({type:'stop'});}
+function stopCurrent(){if(state.live?.assistant){state.live.cancelRequested=true;if(state.live.localComputer)localComputer.cancel();else assistant?.cancel();}else worker.postMessage({type:'stop'});}
 $('stop').addEventListener('click',stopCurrent);
 $('web-toggle').addEventListener('click', () => {
   state.settings.internet = !state.settings.internet;
@@ -1288,3 +1318,12 @@ configureVm();
   $('pair-stop').addEventListener('click', stopPairing);
   $('pair-copy').addEventListener('click', () => navigator.clipboard?.writeText($('pair-link').value).catch(() => {}));
 }
+
+// Local tools are opt-in and use the existing loaded model.
+import { mountLocalComputer } from './local-computer.mjs';
+const localComputer = mountLocalComputer({
+  ready:()=>['ready','preparing'].includes(state.phase)&&Boolean(state.loaded), turn:agentTurn,
+  onConnectionChange:connected=>{$('status-line').textContent=connected?'Computer connected · the chat works on this computer.':'Local computer disconnected.';},
+  modelName:()=>state.loaded?.label||'Local model',
+  lease:()=>{if(!['ready','preparing'].includes(state.phase)||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?(state.live?.assistant?'preparing':'ready'):'idle');}};}
+});

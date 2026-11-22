@@ -1,7 +1,7 @@
 // The WASM browser's main-thread client and worker host, with a fake worker and a fake engine.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BrowserClient, addressToUrl, modifierBits, isLocalOrigin, routeLabel, TOR_ROUTE, AUTO_ROUTE, DEFAULT_RELAY } from '../web/browser-client.mjs';
+import { BrowserClient, addressToUrl, externalGoogleSignInUrl, modifierBits, isLocalOrigin, routeLabel, TOR_ROUTE, AUTO_ROUTE, DEFAULT_RELAY } from '../web/browser-client.mjs';
 import { createBrowserHost, torConsensusSources } from '../web/browser-host.mjs';
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -33,6 +33,54 @@ function memoryPersistence(initial = {}) {
 }
 
 const client = (opts = {}) => new BrowserClient({ probe: async () => true, persistence: memoryPersistence(opts.saved), ...opts });
+
+test('profile changes restart the worker and restore cookies and localStorage before navigation', async () => {
+  const { workers, factory } = fakeWorkers(m => m.type === 'cookiesJson' ? 'C' : m.type === 'storageJson' ? 'S' : null);
+  const persistence = memoryPersistence();
+  const c = client({ workerFactory: factory, persistence });
+  await c.ready;
+  workers[0].emit([{ type: 'url', url: 'https://example.com/', canBack: false, canForward: false }]);
+  await c.setProfiles('firefox-esr', 'firefox-order');
+  assert.equal(workers[0].terminated, true);
+  const init = workers[1].messages[0];
+  assert.equal(init.identityProfile, 'firefox-esr');
+  assert.equal(init.tlsProfile, 'firefox-order');
+  assert.deepEqual([init.cookies, init.storage], ['C', 'S']);
+  assert.equal(workers[1].messages.find(m => m.type === 'navigate').url, 'https://example.com/');
+  assert.equal(c.identityProfile, 'firefox-esr');
+  await assert.rejects(c.setProfiles('invalid'), /Unknown/);
+  assert.equal(workers.length, 2);
+  c.dispose();
+});
+
+test('worker selects identity and TLS before it starts loading any page', async () => {
+  const engine = fakeEngine();
+  const h = hostHarness(engine);
+  await h.host.handle({ id: 1, type: 'init', relayUrl: 'tor:', identityProfile: 'firefox-esr', tlsProfile: 'firefox-order' });
+  assert.deepEqual(engine.calls.slice(1, 3), [['identity', 'firefox-esr'], ['tls', 'firefox-order']]);
+});
+
+test('external Google sign-in keeps the destination but starts a separate browser session', () => {
+  for (const path of ['/v3/signin/identifier', '/v3/signin/rejected']) {
+    const original = new URL(`https://accounts.google.com${path}?hl=en&flowName=GlifWebSignIn&service=mail&continue=https%3A%2F%2Fmail.google.com%2Fmail%2F&dsh=session&TL=token&idnf=private-identifier&epd=session-data`);
+    const external = new URL(externalGoogleSignInUrl(original.href));
+    assert.equal(external.origin, original.origin);
+    assert.equal(external.pathname, '/ServiceLogin');
+    for (const key of ['hl', 'service', 'continue']) assert.equal(external.searchParams.get(key), original.searchParams.get(key));
+    assert.deepEqual([...external.searchParams.keys()].sort(), ['continue', 'hl', 'service']);
+  }
+  assert.equal(externalGoogleSignInUrl('https://accounts.google.com/'), 'https://accounts.google.com/ServiceLogin');
+});
+
+test('external sign-in does not rewrite lookalikes, OAuth grants or account challenges', () => {
+  for (const url of [
+    'not a URL', 'http://accounts.google.com/', 'https://accounts.google.com.evil.test/',
+    'https://accounts.google.com:8443/', 'https://person:password@accounts.google.com/',
+    'https://accounts.google.com/v3/signin/challenge/pwd', 'https://accounts.google.com/o/oauth2/v2/auth',
+    'https://accounts.google.com/v3/signin/identifier?flowName=GeneralOAuthFlow',
+    ...['client_id', 'redirect_uri', 'scope', 'state'].map(key => `https://accounts.google.com/ServiceLogin?${key}=value`),
+  ]) assert.equal(externalGoogleSignInUrl(url), null, url);
+});
 
 test('address bar text becomes a URL or a search', () => {
   assert.equal(addressToUrl('example.com'), 'https://example.com');
@@ -240,6 +288,8 @@ function fakeEngine({ panicOn } = {}) {
   class Browser {
     constructor(fonts, relay, cookies, storage, wake) { calls.push(['new', fonts.length, relay, cookies, storage]); this.wake = wake; this.frames = 0; }
     resize(...a) { calls.push(['resize', ...a]); }
+    setIdentity(value) { calls.push(['identity', value]); }
+    setTlsProfile(value) { calls.push(['tls', value]); }
     tick() { calls.push(['tick']); if (panicOn === 'tick') throw new Error('RuntimeError: unreachable'); return this.frames++ === 0 ? 16 : -1; }
     takeFrame() { return this.frames === 1 ? new Uint8Array(2 * 1 * 4).fill(255) : undefined; }
     frameWidth() { return 2; } frameHeight() { return 1; }
