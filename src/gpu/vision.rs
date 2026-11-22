@@ -7,7 +7,7 @@
 
 use super::{read_back, wait_idle, Gpu};
 use crate::gguf::{parse, Gguf};
-use crate::vision::{Patches, Projector, VisionConfig};
+use crate::vision::{Encoded, Patches, VisionConfig};
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
@@ -73,6 +73,38 @@ fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_index) li
     }
     let inv = 1.0 / sqrt(part[0] / f32(p.d) + p.eps);
     for (var j = li; j < p.d; j += 64u) { y[r * p.d + j] = x[r * p.d + j] * inv * w[j]; }
+}
+"#;
+
+const LAYER_NORM: &str = r#"
+struct P { n: u32, d: u32, eps: f32, pad: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+@group(0) @binding(3) var<storage, read> b: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+var<workgroup> part: array<f32, 64>;
+fn total(v: f32, li: u32) -> f32 {
+    part[li] = v;
+    workgroupBarrier();
+    for (var st = 32u; st > 0u; st >>= 1u) {
+        if (li < st) { part[li] += part[li + st]; }
+        workgroupBarrier();
+    }
+    let t = part[0];
+    workgroupBarrier();
+    return t;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let r = g.x;
+    var s = 0.0;
+    for (var j = li; j < p.d; j += 64u) { s += x[r * p.d + j]; }
+    let mean = total(s, li) / f32(p.d);
+    var q = 0.0;
+    for (var j = li; j < p.d; j += 64u) { let c = x[r * p.d + j] - mean; q += c * c; }
+    let inv = 1.0 / sqrt(total(q, li) / f32(p.d) + p.eps);
+    for (var j = li; j < p.d; j += 64u) { y[r * p.d + j] = (x[r * p.d + j] - mean) * inv * w[j] + b[j]; }
 }
 "#;
 
@@ -168,14 +200,17 @@ fn erf(z: f32) -> f32 {
         + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
     return select(-y, y, z >= 0.0);
 }
-// kind 0: x = silu(x) * u (SwiGLU); kind 1: x = gelu(x) (exact, with erf).
+// kind 0: x = silu(x) * u (SwiGLU); 1: gelu(x) (exact, with erf); 2: gelu(x) (tanh
+// approximation); 3: x + u.
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) g: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let i = (g.x + g.y * nw.x) * 64u + li;
     if (i >= p.total) { return; }
     let v = x[i];
     if (p.kind == 0u) { x[i] = v / (1.0 + exp(-v)) * u[i]; }
-    else { x[i] = 0.5 * v * (1.0 + erf(v * 0.70710678118654752)); }
+    else if (p.kind == 1u) { x[i] = 0.5 * v * (1.0 + erf(v * 0.70710678118654752)); }
+    else if (p.kind == 2u) { x[i] = 0.5 * v * (1.0 + tanh(0.7978845608 * (v + 0.044715 * v * v * v))); }
+    else { x[i] = v + u[i]; }
 }
 "#;
 
@@ -192,6 +227,8 @@ pub struct VisionGpu<'g> {
     vecs: HashMap<String, wgpu::Buffer>,
     pipes: HashMap<&'static str, wgpu::ComputePipeline>,
     zero: wgpu::Buffer,
+    /// The learned position table (Qwen3-VL), resized per image on the CPU.
+    positions: Option<Vec<f32>>,
 }
 
 fn f32s(b: &[u8]) -> Vec<f32> {
@@ -215,9 +252,6 @@ impl<'g> VisionGpu<'g> {
     pub fn load(gpu: &'g Gpu, bytes_all: &[u8]) -> Result<Self, String> {
         let g: Gguf = parse(bytes_all).map_err(|e| e.to_string())?;
         let cfg = VisionConfig::read(&g)?;
-        if cfg.kind != Projector::Qwen25Vl {
-            return Err("the GPU vision encoder runs Qwen2.5-VL so far; Qwen3-VL runs on the CPU".into());
-        }
         let dev = &gpu.device;
         let raw = |name: &str| -> Result<(&[u8], &crate::gguf::TensorInfo), String> {
             let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
@@ -237,20 +271,42 @@ impl<'g> VisionGpu<'g> {
         };
         let mut mats = HashMap::new();
         let mut vecs = HashMap::new();
+        let mut positions = None;
+        let as_f32 = |data: &[u8], t: u32| -> Vec<f32> {
+            if t == 0 { f32s(data) } else { data.chunks_exact(2).map(|c| crate::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect() }
+        };
         for t in &g.tensors {
             let name = t.name.as_str();
-            if name.starts_with("v.patch_embd") {
+            if name == "v.patch_embd.weight" || name == "v.patch_embd.weight.1" {
                 continue;
             }
             let (data, info) = raw(name)?;
-            if info.dims.len() >= 2 {
+            if name == "v.position_embd.weight" {
+                positions = Some(as_f32(data, info.ggml_type));
+            } else if info.dims.len() >= 2 {
                 if info.ggml_type != 1 {
                     return Err(format!("{name} must be F16"));
                 }
-                mats.insert(name.to_string(), Mat { buf: storage(name, data), k: info.dims[0] as usize, m: info.dims[1] as usize });
+                let (k, m) = (info.dims[0] as usize, info.dims[1] as usize);
+                // A fused QKV projection becomes three: its rows are Q, then K, then V.
+                if let Some(base) = name.strip_suffix("attn_qkv.weight") {
+                    for (j, part) in ["attn_q", "attn_k", "attn_v"].iter().enumerate() {
+                        let rows = m / 3;
+                        mats.insert(format!("{base}{part}.weight"), Mat { buf: storage(name, &data[j * rows * k * 2..(j + 1) * rows * k * 2]), k, m: rows });
+                    }
+                } else {
+                    mats.insert(name.to_string(), Mat { buf: storage(name, data), k, m });
+                }
             } else {
-                let v: Vec<f32> = if info.ggml_type == 0 { f32s(data) } else { data.chunks_exact(2).map(|c| crate::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect() };
-                vecs.insert(name.to_string(), storage(name, &bytes(&v)));
+                let v = as_f32(data, info.ggml_type);
+                if let Some(base) = name.strip_suffix("attn_qkv.bias") {
+                    let n = v.len() / 3;
+                    for (j, part) in ["attn_q", "attn_k", "attn_v"].iter().enumerate() {
+                        vecs.insert(format!("{base}{part}.bias"), storage(name, &bytes(&v[j * n..(j + 1) * n])));
+                    }
+                } else {
+                    vecs.insert(name.to_string(), storage(name, &bytes(&v)));
+                }
             }
         }
         // The patch embedding as one matrix over the (channel, frame, y, x) patch rows.
@@ -269,7 +325,7 @@ impl<'g> VisionGpu<'g> {
         }
         mats.insert("patch".into(), Mat { buf: storage("patch", &wc), k: 3 * 2 * pp, m: d });
         let mut pipes = HashMap::new();
-        for (key, src) in [("matmul", MATMUL), ("rms", RMS_NORM), ("rotate", ROTATE), ("attend", ATTEND), ("act", ACTIVATE)] {
+        for (key, src) in [("matmul", MATMUL), ("rms", RMS_NORM), ("layer_norm", LAYER_NORM), ("rotate", ROTATE), ("attend", ATTEND), ("act", ACTIVATE)] {
             let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(key), source: wgpu::ShaderSource::Wgsl(src.into()) });
             let pipe = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(key), layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
             pipes.insert(key, pipe);
@@ -278,7 +334,7 @@ impl<'g> VisionGpu<'g> {
         if let Some(e) = gpu.take_error() {
             return Err(format!("GPU error while loading the vision encoder: {e}"));
         }
-        Ok(Self { gpu, cfg, mats, vecs, pipes, zero })
+        Ok(Self { gpu, cfg, mats, vecs, pipes, zero, positions })
     }
 
     fn buffer(&self, label: &str, floats: usize) -> wgpu::Buffer {
@@ -308,12 +364,34 @@ impl<'g> VisionGpu<'g> {
         self.dispatch(enc, "matmul", [n as u32, m.k as u32, m.m as u32, flags], &[x, &m.buf, b, y], (m.m.div_ceil(16) as u32, n.div_ceil(16) as u32));
     }
 
-    fn rms(&self, enc: &mut wgpu::CommandEncoder, w: &str, x: &wgpu::Buffer, y: &wgpu::Buffer, n: usize, d: usize) {
-        self.dispatch(enc, "rms", [n as u32, d as u32, self.cfg.eps.to_bits(), 0], &[x, &self.vecs[w], y], (n as u32, 1));
+    /// LayerNorm when the norm has a bias (Qwen3-VL), else RMSNorm; `name` without `.weight`.
+    fn norm(&self, enc: &mut wgpu::CommandEncoder, name: &str, x: &wgpu::Buffer, y: &wgpu::Buffer, n: usize, d: usize) {
+        let w = &self.vecs[&format!("{name}.weight")];
+        let u = [n as u32, d as u32, self.cfg.eps.to_bits(), 0];
+        match self.vecs.get(&format!("{name}.bias")) {
+            Some(b) => self.dispatch(enc, "layer_norm", u, &[x, w, b, y], (n as u32, 1)),
+            None => self.dispatch(enc, "rms", u, &[x, w, y], (n as u32, 1)),
+        }
     }
 
-    /// Image embeddings for the language model, as `crate::vision::Vision::encode` gives them.
-    pub async fn encode(&self, px: &Patches) -> Result<Vec<f32>, String> {
+    /// A merger: `x` (patches) as rows of four patches, normalized before (`pre`, per patch) or
+    /// after (`post`, per row of four), then linear, exact GELU, linear into `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn merger(&self, enc: &mut wgpu::CommandEncoder, x: &wgpu::Buffer, tmp: &wgpu::Buffer, mid: &wgpu::Buffer, out: &wgpu::Buffer, n: usize, pre: Option<&str>, post: Option<&str>, fc: (&str, &str)) {
+        let (d, tokens) = (self.cfg.dim, n / 4);
+        let src = match (pre, post) {
+            (Some(nm), _) => { self.norm(enc, nm, x, tmp, n, d); tmp }
+            (None, Some(nm)) => { self.norm(enc, nm, x, tmp, tokens, 4 * d); tmp }
+            (None, None) => x,
+        };
+        let wide = self.mats[&format!("{}.weight", fc.0)].m;
+        self.linear(enc, &format!("{}.weight", fc.0), Some(&format!("{}.bias", fc.0)), src, mid, tokens, false);
+        self.dispatch(enc, "act", [(tokens * wide) as u32, 1, 0, 0], &[mid, &self.zero], groups(tokens * wide));
+        self.linear(enc, &format!("{}.weight", fc.1), Some(&format!("{}.bias", fc.1)), mid, out, tokens, false);
+    }
+
+    /// The image's embeddings for the language model, as `crate::vision::Vision::encode` gives them.
+    pub async fn encode(&self, px: &Patches) -> Result<Encoded, String> {
         let c = &self.cfg;
         let (d, hd, heads) = (c.dim, c.dim / c.heads, c.heads);
         if hd > 128 {
@@ -353,13 +431,30 @@ impl<'g> VisionGpu<'g> {
         let (q, k, v, a) = (self.buffer("q", n * d), self.buffer("k", n * d), self.buffer("v", n * d), self.buffer("a", n * d));
         let (gate, up) = (self.buffer("gate", n * c.ff), self.buffer("up", n * c.ff));
         let mut enc = dev.create_command_encoder(&Default::default());
-        self.linear(&mut enc, "patch", None, &input, &x, n, false);
+        let patch_bias = self.vecs.contains_key("v.patch_embd.bias").then_some("v.patch_embd.bias");
+        self.linear(&mut enc, "patch", patch_bias, &input, &x, n, false);
+        let pos_buf;
+        if let Some(table) = &self.positions {
+            let pe = crate::vision::position_embeddings(table, d, px.grid_h, px.grid_w);
+            let mut permuted = vec![0f32; pe.len()];
+            for (k, &u) in order.iter().enumerate() {
+                permuted[k * unit * d..(k + 1) * unit * d].copy_from_slice(&pe[u * unit * d..(u + 1) * unit * d]);
+            }
+            pos_buf = upload("positions", &bytes(&permuted));
+            self.dispatch(&mut enc, "act", [(n * d) as u32, 3, 0, 0], &[&x, &pos_buf], groups(n * d));
+        }
         self.gpu.queue.submit([enc.finish()]);
+        let tokens = n / unit;
+        let mid = self.mats["mm.0.weight"].m;
+        let out_dim = self.mats["mm.2.weight"].m;
+        let wide_tmp = self.buffer("wide", n * d);
+        let m0 = self.buffer("merge", tokens * mid);
+        let deep_out: Vec<wgpu::Buffer> = c.deepstack.iter().map(|_| self.buffer("deepstack", tokens * out_dim)).collect();
         let rot = (n * heads * hd / 2) as u32;
         for l in 0..c.layers {
             let b = |s: &str| format!("v.blk.{l}.{s}");
             let mut enc = dev.create_command_encoder(&Default::default());
-            self.rms(&mut enc, &b("ln1.weight"), &x, &h, n, d);
+            self.norm(&mut enc, &b("ln1"), &x, &h, n, d);
             for (w, out) in [("attn_q", &q), ("attn_k", &k), ("attn_v", &v)] {
                 self.linear(&mut enc, &b(&format!("{w}.weight")), Some(&b(&format!("{w}.bias"))), &h, out, n, false);
             }
@@ -370,34 +465,43 @@ impl<'g> VisionGpu<'g> {
             let scale = (1.0 / (hd as f32).sqrt()).to_bits();
             self.dispatch(&mut enc, "attend", [heads as u32, hd as u32, d as u32, scale], &[&q, &k, &v, &a, blocks], ((list.len() / 4) as u32, heads as u32));
             self.linear(&mut enc, &b("attn_out.weight"), Some(&b("attn_out.bias")), &a, &x, n, true);
-            self.rms(&mut enc, &b("ln2.weight"), &x, &h, n, d);
-            self.linear(&mut enc, &b("ffn_gate.weight"), Some(&b("ffn_gate.bias")), &h, &gate, n, false);
-            self.linear(&mut enc, &b("ffn_up.weight"), Some(&b("ffn_up.bias")), &h, &up, n, false);
-            self.dispatch(&mut enc, "act", [(n * c.ff) as u32, 0, 0, 0], &[&gate, &up], groups(n * c.ff));
+            self.norm(&mut enc, &b("ln2"), &x, &h, n, d);
+            if self.mats.contains_key(&b("ffn_gate.weight")) {
+                self.linear(&mut enc, &b("ffn_gate.weight"), Some(&b("ffn_gate.bias")), &h, &gate, n, false);
+                self.linear(&mut enc, &b("ffn_up.weight"), Some(&b("ffn_up.bias")), &h, &up, n, false);
+                self.dispatch(&mut enc, "act", [(n * c.ff) as u32, 0, 0, 0], &[&gate, &up], groups(n * c.ff));
+            } else {
+                self.linear(&mut enc, &b("ffn_up.weight"), Some(&b("ffn_up.bias")), &h, &gate, n, false);
+                self.dispatch(&mut enc, "act", [(n * c.ff) as u32, 2, 0, 0], &[&gate, &self.zero], groups(n * c.ff));
+            }
             self.linear(&mut enc, &b("ffn_down.weight"), Some(&b("ffn_down.bias")), &gate, &x, n, true);
+            if let Some(j) = c.deepstack.iter().position(|&dl| dl == l) {
+                let p = format!("v.deepstack.{l}");
+                self.merger(&mut enc, &x, &wide_tmp, &m0, &deep_out[j], n, None, Some(&format!("{p}.norm")), (&format!("{p}.fc1"), &format!("{p}.fc2")));
+            }
             self.gpu.queue.submit([enc.finish()]);
             wait_idle(self.gpu).await?;
         }
-        // Merger: RMSNorm, four patches side by side, linear, GELU, linear.
-        let tokens = n / unit;
-        let mid = self.mats["mm.0.weight"].m;
-        let out_dim = self.mats["mm.2.weight"].m;
-        let m0 = self.buffer("merge", tokens * mid);
+        // The merger: normalized patches, four side by side, linear, GELU, linear.
         let out = self.buffer("out", tokens * out_dim);
         let mut enc = dev.create_command_encoder(&Default::default());
-        self.rms(&mut enc, "v.post_ln.weight", &x, &h, n, d);
-        self.linear(&mut enc, "mm.0.weight", Some("mm.0.bias"), &h, &m0, tokens, false);
-        self.dispatch(&mut enc, "act", [(tokens * mid) as u32, 1, 0, 0], &[&m0, &self.zero], groups(tokens * mid));
-        self.linear(&mut enc, "mm.2.weight", Some("mm.2.bias"), &m0, &out, tokens, false);
-        let staging = dev.create_buffer(&wgpu::BufferDescriptor { label: Some("vision out"), size: (tokens * out_dim * 4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        enc.copy_buffer_to_buffer(&out, 0, &staging, 0, (tokens * out_dim * 4) as u64);
-        self.gpu.queue.submit([enc.finish()]);
-        let merged = f32s(&read_back(self.gpu, &staging, (tokens * out_dim * 4) as u64).await?);
-        let mut result = vec![0f32; merged.len()];
-        for (k, &u) in order.iter().enumerate() {
-            result[u * out_dim..(u + 1) * out_dim].copy_from_slice(&merged[k * out_dim..(k + 1) * out_dim]);
+        self.merger(&mut enc, &x, &h, &m0, &out, n, Some("v.post_ln"), None, ("mm.0", "mm.2"));
+        let size = (tokens * out_dim * 4) as u64;
+        let staging = dev.create_buffer(&wgpu::BufferDescriptor { label: Some("vision out"), size: size * (1 + deep_out.len() as u64), usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        for (j, b) in std::iter::once(&out).chain(deep_out.iter()).enumerate() {
+            enc.copy_buffer_to_buffer(b, 0, &staging, j as u64 * size, size);
         }
-        Ok(result)
+        self.gpu.queue.submit([enc.finish()]);
+        let all = f32s(&read_back(self.gpu, &staging, size * (1 + deep_out.len() as u64)).await?);
+        let raster = |merged: &[f32]| {
+            let mut r = vec![0f32; merged.len()];
+            for (k, &u) in order.iter().enumerate() {
+                r[u * out_dim..(u + 1) * out_dim].copy_from_slice(&merged[k * out_dim..(k + 1) * out_dim]);
+            }
+            r
+        };
+        let per = tokens * out_dim;
+        Ok(Encoded { embeddings: raster(&all[..per]), deepstack: (0..deep_out.len()).map(|j| raster(&all[(j + 1) * per..(j + 2) * per])).collect() })
     }
 }
 
@@ -405,22 +509,31 @@ impl<'g> VisionGpu<'g> {
 mod tests {
     #[test]
     fn gpu_encoder_matches_the_cpu_reference() {
+        for fixture in ["tiny-qwen25vl-vision.json", "tiny-qwen3vl-vision.json"] {
+            check(fixture);
+        }
+    }
+
+    fn check(fixture: &str) {
         let Ok(gpu) = pollster::block_on(super::super::init()) else {
             eprintln!("skipping: no GPU adapter");
             return;
         };
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let fx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("tiny-qwen25vl-vision.json")).unwrap()).unwrap();
+        let fx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join(fixture)).unwrap()).unwrap();
         let bytes = crate::vision::tests_base64(fx["gguf"].as_str().unwrap());
         let rgb = crate::vision::tests_base64(fx["rgb"].as_str().unwrap());
         let cpu = crate::vision::Vision::load(&bytes).unwrap();
         let px = cpu.patches(&rgb, fx["width"].as_u64().unwrap() as usize, fx["height"].as_u64().unwrap() as usize).unwrap();
-        let want = cpu.encode(&px).unwrap().embeddings;
+        let want = cpu.encode(&px).unwrap();
         let v = super::VisionGpu::load(&gpu, &bytes).unwrap();
         let got = pollster::block_on(v.encode(&px)).unwrap();
-        assert_eq!(got.len(), want.len());
-        let scale = want.iter().fold(0f32, |m, x| m.max(x.abs()));
-        let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        assert!(worst <= 1e-4 * scale.max(1.0), "GPU differs from the CPU reference by {worst} (values up to {scale})");
+        assert_eq!(got.deepstack.len(), want.deepstack.len(), "{fixture}");
+        for (g, w) in std::iter::once((&got.embeddings, &want.embeddings)).chain(got.deepstack.iter().zip(&want.deepstack)) {
+            assert_eq!(g.len(), w.len());
+            let scale = w.iter().fold(0f32, |m, x| m.max(x.abs()));
+            let worst = g.iter().zip(w).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(worst <= 1e-4 * scale.max(1.0), "{fixture}: GPU differs from the CPU reference by {worst} (values up to {scale})");
+        }
     }
 }

@@ -306,7 +306,7 @@ impl Vision {
 
 /// The learned position table (a square grid of positions) resized to the image's patch grid by
 /// bilinear interpolation with aligned corners, in merge-unit order (Qwen3-VL).
-fn position_embeddings(table: &[f32], d: usize, gh: usize, gw: usize) -> Vec<f32> {
+pub(crate) fn position_embeddings(table: &[f32], d: usize, gh: usize, gw: usize) -> Vec<f32> {
     let side = ((table.len() / d) as f64).sqrt() as usize;
     let span = |n: usize, i: usize| if n > 1 { i as f32 * (side - 1) as f32 / (n - 1) as f32 } else { 0.0 };
     let mut out = vec![0f32; gh * gw * d];
