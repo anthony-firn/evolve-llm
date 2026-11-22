@@ -304,3 +304,12 @@ test('write does not replace an existing file the task has not read; it may afte
  assert.equal(results[1][0],false);assert.equal(files.get('/workspace/new.txt'),'fresh');
  assert.equal(results[3][0],false);assert.equal(files.get('/workspace/calc.py'),'whole new file');
 });
+
+test('the same failing command a third time stops the task with the reason',async()=>{
+ let n=0;
+ const task=createPiTask({linux:{cwd:'/home/user'},workspace:{cwd:'/home/user',request:async(name)=>name==='exec'?{code:1,stdout:'',stderr:'boom',cwd:'/home/user'}:{}},network:{options:()=>({enabled:false})},turn:async()=>{
+  n++;return{text:'<tool_call>'+JSON.stringify({name:'bash',arguments:{command:'make it work'}})+'</tool_call>',reason:'end'};
+ }});
+ await assert.rejects(task.run('Do it'),/The same command failed 3 times, so the task stopped: make it work/);
+ assert.equal(n,3);
+});

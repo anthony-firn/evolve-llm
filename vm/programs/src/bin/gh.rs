@@ -113,7 +113,7 @@ fn allowed(action: &str, always_ask: bool) -> R<()> {
             if ask(&format!("{action}?")) {
                 Ok(())
             } else {
-                Err(format!("{action}: declined by the person, so nothing changed on GitHub"))
+                Err(format!("{action}: declined by the person, so nothing changed on GitHub. Do not try again; tell the person what you did"))
             }
         }
     }

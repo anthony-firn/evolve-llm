@@ -41,7 +41,7 @@ git and gh work on GitHub repositories. Use them in this order, one step per bas
 3. Change files with write or edit, then check with git status and git diff
 4. git commit -m "What changed" (it includes every change; git add is not needed)
 5. git push, then gh pr create --title "Title" --body "What and why"
-6. To merge the pull request, run gh pr merge. Merging always asks the person. If they decline, stop and tell them.
+6. Only if the person asked you to merge: run gh pr merge. Merging always asks the person. If they decline, stop and tell them.
 Also: git pull (newest version of this branch), git checkout BRANCH (switch branch), git merge BRANCH (bring BRANCH into this branch; asks the person), git log --oneline, git branch, gh pr list, gh pr view, gh run list, gh run view ID. git help and gh help list everything.
 
 For a long file, do not read it all: find the line with grep -n "SOME WORDS" FILE, then edit with the exact text of that line.
@@ -88,13 +88,24 @@ async function preamble(prompt, workspace, cwd) {
 /** Small models write each command as if it started where the task began ("cd app && ..."),
  *  though a cd carries over. A leading cd to a folder that is not here, but is where the task
  *  began, goes there: [command to run, note or null]. */
-async function fromStart(command, workspace, start) {
+async function fromStart(command, workspace, start, noted) {
   const lead = /^\s*cd\s+([^\s;&|]+)/.exec(command);
   if (!lead || /^[\/~]/.test(lead[1]) || !workspace.vm || workspace.cwd === start) return [command, null];
   if ((await workspace.vm.read(workspace.path(lead[1]))).kind === 3) return [command, null];
   const there = workspace.path(`${start}/${lead[1]}`);
   if ((await workspace.vm.read(there)).kind !== 3) return [command, null];
-  return [command.replace(lead[0], lead[0].replace(lead[1], there)), `there is no ${lead[1]} in ${workspace.cwd}, so this ran cd ${there} (where the task began). A cd carries over: you are now in ${there}.`];
+  const note = noted.has('cd') ? null : `there is no ${lead[1]} in ${workspace.cwd}, so this ran cd ${there} (where the task began). A cd carries over: you are now in ${there}.`;
+  noted.add('cd');
+  return [command.replace(lead[0], lead[0].replace(lead[1], there)), note];
+}
+
+/** A relative file path that is not in the working directory but is where the task began
+ *  (`app/calc.py` from inside app) means that file. */
+async function pathFromStart(path, workspace, start) {
+  if (!workspace.vm || /^[\/~]/.test(String(path)) || workspace.cwd === start) return path;
+  if ((await workspace.vm.read(workspace.path(path))).ok) return path;
+  const there = workspace.path(`${start}/${path}`);
+  return (await workspace.vm.read(there)).ok ? there : path;
 }
 
 async function shellNotes(command, r, workspace, failed, signal) {
@@ -112,8 +123,11 @@ async function shellNotes(command, r, workspace, failed, signal) {
   if (misused) notes.push(`${misused[1]} is a tool, not a shell command. Call the ${misused[1]} tool instead.`);
   if (/&&/.test(command)) notes.push('the command stopped at the first error, so the steps after it did not run. Run one step per command.');
   const key = command.trim();
-  if (failed.has(key)) notes.push('this exact command failed before. Do something different.');
-  failed.add(key);
+  const times = (failed.get(key) || 0) + 1;
+  failed.set(key, times);
+  // A model that keeps sending the same failing command is stuck: stop instead of burning turns.
+  if (times >= 3) throw new Error(`The same command failed ${times} times, so the task stopped: ${key.slice(0, 160)}`);
+  if (times > 1) notes.push('this exact command failed before. Do something different.');
   return notes;
 }
 function systemPrompt(browserTools, limits, linux) {
@@ -220,7 +234,7 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
 export function createPiTask({ turn, workspace, network, onEvent = () => {}, modelName = 'Local model', preview, maxTokens = 2048, browser, confirmBrowserAction, browserSnapshotChars, linux = null, native = false, history = [] }) {
   // Call ids in Kimi's form (functions.name:index), which other templates ignore or only match.
   let callIndex=0;
-  let turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, pendingChangeError=false, previewPath=null;const failedCommands=new Set(), seen=new Set();let ghRepo=null;
+  let turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, pendingChangeError=false, previewPath=null;const failedCommands=new Map(), seen=new Set(), noted=new Set();let ghRepo=null, stuck=null;
   const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction}):null;
   const limits=linux?LINUX_LIMITS:browserTools?BROWSER_LIMITS:LIMITS;
   const declarations=(linux?[
@@ -252,12 +266,13 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       return {content:[{type:'text',text:browserTools.format(outcome,limits.result)}],details:{browser:true},isError:outcome.ok===false};
     }
     if(name==='bash'){
-      const [command,moved]=linux?await fromStart(String(args.command||''),workspace,linux.cwd):[args.command,null];
+      const [command,moved]=linux?await fromStart(String(args.command||''),workspace,linux.cwd,noted):[args.command,null];
       result=await workspace.request('exec',{command:ghRepo?`export GH_REPO=${ghRepo}; ${command}`:command,...(native?{asRoot:args.asRoot===true}:{}),network:network.options()},{signal});
-      if(linux&&result.code)result.notes=await shellNotes(String(args.command||''),result,workspace,failedCommands,signal);
+      if(linux&&result.code)try{result.notes=await shellNotes(String(args.command||''),result,workspace,failedCommands,signal)}catch(error){stuck=String(error.message||error);agent.abort();throw error}
       if(moved)result.notes=[moved,...(result.notes||[])];
     }
     else if(['read','write','edit'].includes(name)){
+      if(linux)args={...args,path:await pathFromStart(args.path,workspace,linux.cwd)};
       // An edit applies only where oldText matches exactly once (the workspace checks), so it
       // needs no earlier read of a long file. A miss shows the closest lines, so the next edit
       // can copy exact text from them.
@@ -349,5 +364,5 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
-  return {async run(prompt){const pre=linux?await preamble(prompt,workspace,linux.cwd):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
+  return {async run(prompt){const pre=linux?await preamble(prompt,workspace,linux.cwd):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
 }
