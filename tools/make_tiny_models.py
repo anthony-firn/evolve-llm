@@ -101,6 +101,39 @@ def build(name, tokenizer, out_dir):
     return logits
 
 
+def split_merged(src, dst):
+    """The same GGUF with Gated DeltaNet's merged projections split back (attn_qkv_gate into
+    attn_qkv and attn_gate, ssm_beta_alpha into ssm_beta and ssm_alpha), as older converters and
+    most published Qwen3.5 files (Holo3.1, Fara1.5) have them."""
+    import gguf
+    r = gguf.GGUFReader(str(src))
+    arch = r.fields["general.architecture"].contents()
+    w = gguf.GGUFWriter(str(dst), arch)
+    for name, f in r.fields.items():
+        if name.startswith("GGUF.") or name == "general.architecture":
+            continue
+        vtype = f.types[0]
+        sub = f.types[1] if vtype == gguf.GGUFValueType.ARRAY and len(f.types) > 1 else None
+        w.add_key_value(name, f.contents(), vtype, sub_type=sub)
+    ch = 2 * r.fields[f"{arch}.ssm.state_size"].contents() * r.fields[f"{arch}.ssm.group_count"].contents()
+    ch += r.fields[f"{arch}.ssm.inner_size"].contents()
+    heads = r.fields[f"{arch}.ssm.time_step_rank"].contents()
+    for t in r.tensors:
+        data = np.array(t.data)
+        if t.name.endswith("attn_qkv_gate.weight"):
+            parts = [(t.name.replace("attn_qkv_gate", "attn_qkv"), data[:ch]), (t.name.replace("attn_qkv_gate", "attn_gate"), data[ch:])]
+        elif t.name.endswith("ssm_beta_alpha.weight"):
+            parts = [(t.name.replace("ssm_beta_alpha", "ssm_beta"), data[:heads]), (t.name.replace("ssm_beta_alpha", "ssm_alpha"), data[heads:])]
+        else:
+            parts = [(t.name, data)]
+        for n, d in parts:
+            w.add_tensor(n, np.ascontiguousarray(d), raw_dtype=t.tensor_type)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
 def pack(v):
     return base64.b64encode(np.asarray(v, dtype=np.float32).tobytes()).decode()
 
@@ -124,6 +157,9 @@ def main():
                 subprocess.run([sys.executable, str(a.llama_cpp / "convert_hf_to_gguf.py"), str(tmp), "--outtype",
                                 kind, "--outfile", str(path), *CONVERT_ARGS.get(name, [])], check=True, env=env, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)
+        if name == "qwen35":
+            sys.path.insert(0, str(a.llama_cpp / "gguf-py"))
+            split_merged(out, a.models / f"tiny-{name}-split.gguf")
         fx = {"file": out.name, "tokens": TOKENS, "positions": [3, len(TOKENS) - 1],
               "logits": [pack(logits[3]), pack(logits[-1])],
               "range": float(logits.max() - logits.min())}

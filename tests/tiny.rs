@@ -125,6 +125,8 @@ fn mixtral_matches_transformers() {
 #[test]
 fn qwen35_matches_transformers() {
     check("qwen35");
+    // The same model with the projections unmerged, as most published Qwen3.5 files are.
+    run("qwen35", "-split", 5e-3);
 }
 
 #[test]
