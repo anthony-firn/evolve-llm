@@ -7,7 +7,7 @@
 
 use super::{read_back, wait_idle, Gpu};
 use crate::gguf::{parse, Gguf};
-use crate::vision::{Patches, VisionConfig};
+use crate::vision::{Patches, Projector, VisionConfig};
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
@@ -215,6 +215,9 @@ impl<'g> VisionGpu<'g> {
     pub fn load(gpu: &'g Gpu, bytes_all: &[u8]) -> Result<Self, String> {
         let g: Gguf = parse(bytes_all).map_err(|e| e.to_string())?;
         let cfg = VisionConfig::read(&g)?;
+        if cfg.kind != Projector::Qwen25Vl {
+            return Err("the GPU vision encoder runs Qwen2.5-VL so far; Qwen3-VL runs on the CPU".into());
+        }
         let dev = &gpu.device;
         let raw = |name: &str| -> Result<(&[u8], &crate::gguf::TensorInfo), String> {
             let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
@@ -412,7 +415,7 @@ mod tests {
         let rgb = crate::vision::tests_base64(fx["rgb"].as_str().unwrap());
         let cpu = crate::vision::Vision::load(&bytes).unwrap();
         let px = cpu.patches(&rgb, fx["width"].as_u64().unwrap() as usize, fx["height"].as_u64().unwrap() as usize).unwrap();
-        let want = cpu.encode(&px).unwrap();
+        let want = cpu.encode(&px).unwrap().embeddings;
         let v = super::VisionGpu::load(&gpu, &bytes).unwrap();
         let got = pollster::block_on(v.encode(&px)).unwrap();
         assert_eq!(got.len(), want.len());

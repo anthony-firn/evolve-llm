@@ -21,8 +21,19 @@ const MERGE: usize = 2;
 /// Frames per patch: a still image is two identical frames.
 const TEMPORAL: usize = 2;
 
+/// Which encoder an mmproj file holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Projector {
+    /// Qwen2.5-VL: 14-pixel patches, RMSNorm, SwiGLU, windowed attention.
+    Qwen25Vl,
+    /// Qwen3-VL and Qwen3.5: 16-pixel patches, a learned position table, LayerNorm, tanh-GELU,
+    /// whole-image attention, and (Qwen3-VL) deepstack features from some blocks.
+    Qwen3Vl,
+}
+
 #[derive(Clone, Debug)]
 pub struct VisionConfig {
+    pub kind: Projector,
     pub dim: usize,
     pub ff: usize,
     pub layers: usize,
@@ -34,6 +45,9 @@ pub struct VisionConfig {
     pub wa_pattern: usize,
     pub mean: [f32; 3],
     pub std: [f32; 3],
+    /// Blocks whose output also goes, through its own merger, to the language model's first
+    /// layers (Qwen3-VL deepstack), in order.
+    pub deepstack: Vec<usize>,
 }
 
 impl VisionConfig {
@@ -41,11 +55,12 @@ impl VisionConfig {
         if g.str("general.architecture") != Some("clip") {
             return Err("not a vision encoder file (general.architecture is not clip)".into());
         }
-        match g.str("clip.projector_type") {
-            Some("qwen2.5vl_merger") => {}
-            Some(other) => return Err(format!("the {other} vision encoder is not supported yet (supported: qwen2.5vl_merger)")),
+        let kind = match g.str("clip.projector_type") {
+            Some("qwen2.5vl_merger") => Projector::Qwen25Vl,
+            Some("qwen3vl_merger") => Projector::Qwen3Vl,
+            Some(other) => return Err(format!("the {other} vision encoder is not supported yet (supported: qwen2.5vl_merger, qwen3vl_merger)")),
             None => return Err("missing clip.projector_type".into()),
-        }
+        };
         let need = |k: &str| g.u64(k).map(|v| v as usize).ok_or_else(|| format!("missing {k}"));
         let three = |k: &str, d: [f32; 3]| -> [f32; 3] {
             g.get(k)
@@ -56,7 +71,14 @@ impl VisionConfig {
                 })
                 .unwrap_or(d)
         };
+        let deepstack = g
+            .get("clip.vision.is_deepstack_layers")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().enumerate().filter(|(_, v)| v.as_bool() == Some(true)).map(|(i, _)| i).collect())
+            .unwrap_or_default();
         Ok(Self {
+            kind,
+            deepstack,
             dim: need("clip.vision.embedding_length")?,
             ff: need("clip.vision.feed_forward_length")?,
             layers: need("clip.vision.block_count")?,
@@ -84,6 +106,13 @@ impl VisionConfig {
 pub struct Vision {
     pub cfg: VisionConfig,
     weights: HashMap<String, Vec<f32>>,
+}
+
+/// An image as the language model reads it: `tokens x out_dim` embeddings in raster order of the
+/// merge units, and (Qwen3-VL) one more set per deepstack block, for its first layers.
+pub struct Encoded {
+    pub embeddings: Vec<f32>,
+    pub deepstack: Vec<Vec<f32>>,
 }
 
 /// The patches of one image, in merge-unit order: each row is (channel, frame, y, x).
@@ -161,23 +190,25 @@ impl Vision {
         Ok(Patches { data, grid_h: gh, grid_w: gw })
     }
 
-    /// Image embeddings for the language model: `tokens() x out_dim`, in raster order of the
-    /// merge units.
-    pub fn encode(&self, px: &Patches) -> Result<Vec<f32>, String> {
+    /// The image's embeddings for the language model (see `Encoded`).
+    pub fn encode(&self, px: &Patches) -> Result<Encoded, String> {
         let c = &self.cfg;
+        let qwen3 = c.kind == Projector::Qwen3Vl;
         let (d, hd) = (c.dim, c.dim / c.heads);
         let n = px.grid_h * px.grid_w;
         let unit = MERGE * MERGE;
+        let opt = |name: &str| self.weights.get(name).map(|v| v.as_slice());
         // Patch embedding: a 3D convolution with a kernel as large as the patch is one linear map
         // per frame slice.
         let row = 3 * TEMPORAL * c.patch * c.patch;
         let pp = c.patch * c.patch;
         let (w0, w1) = (self.w("v.patch_embd.weight")?, self.w("v.patch_embd.weight.1")?);
+        let bias = opt("v.patch_embd.bias");
         let mut x = vec![0f32; n * d];
         for i in 0..n {
             let src = &px.data[i * row..(i + 1) * row];
             for o in 0..d {
-                let mut s = 0f32;
+                let mut s = bias.map_or(0.0, |b| b[o]);
                 for ch in 0..3 {
                     let k = &w0[(o * 3 + ch) * pp..(o * 3 + ch + 1) * pp];
                     let k1 = &w1[(o * 3 + ch) * pp..(o * 3 + ch + 1) * pp];
@@ -190,6 +221,9 @@ impl Vision {
                 x[i * d + o] = s;
             }
         }
+        if let Some(table) = opt("v.position_embd.weight") {
+            add(&mut x, &position_embeddings(table, d, px.grid_h, px.grid_w));
+        }
         let (order, windows, angles) = layout(c, px);
         let permute = |v: &[f32], width: usize| {
             let mut out = vec![0f32; v.len()];
@@ -199,39 +233,104 @@ impl Vision {
             out
         };
         x = permute(&x, d);
+        let norm = |x: &[f32], name: &str, width: usize| -> Result<Vec<f32>, String> {
+            let w = self.w(&format!("{name}.weight"))?;
+            Ok(match opt(&format!("{name}.bias")) {
+                Some(b) => layer_norm(x, w, b, width, c.eps),
+                None => rms_norm(x, w, width, c.eps),
+            })
+        };
+        // A merger: four patches side by side, normalized before (main) or after (deepstack),
+        // then linear, exact GELU, linear.
+        let merger = |x: &[f32], pre: Option<&str>, post: Option<&str>, fc1: &str, fc2: &str| -> Result<Vec<f32>, String> {
+            let wide = unit * d;
+            let h = match pre { Some(nm) => norm(x, nm, d)?, None => x.to_vec() };
+            let h = match post { Some(nm) => norm(&h, nm, wide)?, None => h };
+            let m = linear(&h, self.w(&format!("{fc1}.weight"))?, opt(&format!("{fc1}.bias")), wide, wide);
+            let m: Vec<f32> = m.iter().map(|&v| gelu(v)).collect();
+            Ok(linear(&m, self.w(&format!("{fc2}.weight"))?, opt(&format!("{fc2}.bias")), wide, c.out_dim))
+        };
         let whole = [(0usize, n)];
+        let mut deep = Vec::new();
         for l in 0..c.layers {
             let b = |s: &str| format!("v.blk.{l}.{s}");
             let spans: &[(usize, usize)] = if c.full_attention(l) { &whole } else { &windows };
-            let h = rms_norm(&x, self.w(&b("ln1.weight"))?, d, c.eps);
-            let mut q = linear(&h, self.w(&b("attn_q.weight"))?, self.weights.get(&b("attn_q.bias")).map(|v| v.as_slice()), d, d);
-            let mut k = linear(&h, self.w(&b("attn_k.weight"))?, self.weights.get(&b("attn_k.bias")).map(|v| v.as_slice()), d, d);
-            let v = linear(&h, self.w(&b("attn_v.weight"))?, self.weights.get(&b("attn_v.bias")).map(|v| v.as_slice()), d, d);
+            let h = norm(&x, &b("ln1"), d)?;
+            let (mut q, mut k, v) = match opt(&b("attn_qkv.weight")) {
+                Some(w) => {
+                    let qkv = linear(&h, w, opt(&b("attn_qkv.bias")), d, 3 * d);
+                    let (mut q, mut k, mut v) = (Vec::with_capacity(n * d), Vec::with_capacity(n * d), Vec::with_capacity(n * d));
+                    for r in qkv.chunks(3 * d) {
+                        q.extend_from_slice(&r[..d]);
+                        k.extend_from_slice(&r[d..2 * d]);
+                        v.extend_from_slice(&r[2 * d..]);
+                    }
+                    (q, k, v)
+                }
+                None => (
+                    linear(&h, self.w(&b("attn_q.weight"))?, opt(&b("attn_q.bias")), d, d),
+                    linear(&h, self.w(&b("attn_k.weight"))?, opt(&b("attn_k.bias")), d, d),
+                    linear(&h, self.w(&b("attn_v.weight"))?, opt(&b("attn_v.bias")), d, d),
+                ),
+            };
             rotate(&mut q, &angles, c.heads, hd);
             rotate(&mut k, &angles, c.heads, hd);
             let a = attention(&q, &k, &v, spans, c.heads, hd);
-            let o = linear(&a, self.w(&b("attn_out.weight"))?, self.weights.get(&b("attn_out.bias")).map(|v| v.as_slice()), d, d);
-            add(&mut x, &o);
-            let h = rms_norm(&x, self.w(&b("ln2.weight"))?, d, c.eps);
-            let gate = linear(&h, self.w(&b("ffn_gate.weight"))?, self.weights.get(&b("ffn_gate.bias")).map(|v| v.as_slice()), d, c.ff);
-            let up = linear(&h, self.w(&b("ffn_up.weight"))?, self.weights.get(&b("ffn_up.bias")).map(|v| v.as_slice()), d, c.ff);
-            let act: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
-            let down = linear(&act, self.w(&b("ffn_down.weight"))?, self.weights.get(&b("ffn_down.bias")).map(|v| v.as_slice()), c.ff, d);
-            add(&mut x, &down);
+            add(&mut x, &linear(&a, self.w(&b("attn_out.weight"))?, opt(&b("attn_out.bias")), d, d));
+            let h = norm(&x, &b("ln2"), d)?;
+            let act: Vec<f32> = if qwen3 {
+                linear(&h, self.w(&b("ffn_up.weight"))?, opt(&b("ffn_up.bias")), d, c.ff).into_iter().map(gelu_tanh).collect()
+            } else {
+                let gate = linear(&h, self.w(&b("ffn_gate.weight"))?, opt(&b("ffn_gate.bias")), d, c.ff);
+                let up = linear(&h, self.w(&b("ffn_up.weight"))?, opt(&b("ffn_up.bias")), d, c.ff);
+                gate.iter().zip(&up).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect()
+            };
+            add(&mut x, &linear(&act, self.w(&b("ffn_down.weight"))?, opt(&b("ffn_down.bias")), c.ff, d));
+            if c.deepstack.contains(&l) {
+                let p = format!("v.deepstack.{l}");
+                deep.push(merger(&x, None, Some(&format!("{p}.norm")), &format!("{p}.fc1"), &format!("{p}.fc2"))?);
+            }
         }
-        // Merger: each merge unit's four patches side by side, then a two-layer MLP.
-        let h = rms_norm(&x, self.w("v.post_ln.weight")?, d, c.eps);
-        let wide = unit * d;
-        let m = linear(&h, self.w("mm.0.weight")?, self.weights.get("mm.0.bias").map(|v| v.as_slice()), wide, wide);
-        let m: Vec<f32> = m.iter().map(|&v| gelu(v)).collect();
-        let merged = linear(&m, self.w("mm.2.weight")?, self.weights.get("mm.2.bias").map(|v| v.as_slice()), wide, c.out_dim);
+        let merged = merger(&x, Some("v.post_ln"), None, "mm.0", "mm.2")?;
         // Back to raster order.
-        let mut out = vec![0f32; merged.len()];
-        for (k, &u) in order.iter().enumerate() {
-            out[u * c.out_dim..(u + 1) * c.out_dim].copy_from_slice(&merged[k * c.out_dim..(k + 1) * c.out_dim]);
-        }
-        Ok(out)
+        let raster = |merged: &[f32]| {
+            let mut out = vec![0f32; merged.len()];
+            for (k, &u) in order.iter().enumerate() {
+                out[u * c.out_dim..(u + 1) * c.out_dim].copy_from_slice(&merged[k * c.out_dim..(k + 1) * c.out_dim]);
+            }
+            out
+        };
+        Ok(Encoded { embeddings: raster(&merged), deepstack: deep.iter().map(|m| raster(m)).collect() })
     }
+}
+
+/// The learned position table (a square grid of positions) resized to the image's patch grid by
+/// bilinear interpolation with aligned corners, in merge-unit order (Qwen3-VL).
+fn position_embeddings(table: &[f32], d: usize, gh: usize, gw: usize) -> Vec<f32> {
+    let side = ((table.len() / d) as f64).sqrt() as usize;
+    let span = |n: usize, i: usize| if n > 1 { i as f32 * (side - 1) as f32 / (n - 1) as f32 } else { 0.0 };
+    let mut out = vec![0f32; gh * gw * d];
+    let mut i = 0;
+    for bh in 0..gh / MERGE {
+        for bw in 0..gw / MERGE {
+            for mh in 0..MERGE {
+                for mw in 0..MERGE {
+                    let (y, x) = (span(gh, bh * MERGE + mh), span(gw, bw * MERGE + mw));
+                    let (y0, x0) = (y as usize, x as usize);
+                    let (y1, x1) = ((y0 + 1).min(side - 1), (x0 + 1).min(side - 1));
+                    let (dy, dx) = (y - y0 as f32, x - x0 as f32);
+                    let o = &mut out[i * d..(i + 1) * d];
+                    for (idx, wgt) in [(y0 * side + x0, (1.0 - dy) * (1.0 - dx)), (y0 * side + x1, (1.0 - dy) * dx), (y1 * side + x0, dy * (1.0 - dx)), (y1 * side + x1, dy * dx)] {
+                        for (a, b) in o.iter_mut().zip(&table[idx * d..(idx + 1) * d]) {
+                            *a += wgt * b;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The order the encoder works in, for an image's patches: the merge units grouped into
@@ -261,9 +360,10 @@ pub fn layout(c: &VisionConfig, px: &Patches) -> (Vec<usize>, Vec<(usize, usize)
             }
         }
     }
-    // Window order: merge units grouped into windows of `ws x ws` units, row by row.
+    // Window order: merge units grouped into windows of `ws x ws` units, row by row (Qwen2.5-VL;
+    // Qwen3-VL attends over the whole image, so one window holds everything).
     let (lh, lw) = (gh / MERGE, gw / MERGE);
-    let ws = WINDOW / MERGE / c.patch;
+    let ws = if c.kind == Projector::Qwen3Vl { lh.max(lw) } else { WINDOW / MERGE / c.patch };
     let (nh, nw) = (lh.div_ceil(ws), lw.div_ceil(ws));
     let mut order = Vec::with_capacity(lh * lw);
     let mut windows = Vec::new(); // (start, len) in patches
@@ -304,6 +404,24 @@ fn linear(x: &[f32], w: &[f32], b: Option<&[f32]>, k: usize, m: usize) -> Vec<f3
         }
     }
     y
+}
+
+fn layer_norm(x: &[f32], w: &[f32], b: &[f32], d: usize, eps: f32) -> Vec<f32> {
+    let mut y = vec![0f32; x.len()];
+    for (xr, yr) in x.chunks(d).zip(y.chunks_mut(d)) {
+        let mean = xr.iter().sum::<f32>() / d as f32;
+        let var = xr.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
+        let s = 1.0 / (var + eps).sqrt();
+        for j in 0..d {
+            yr[j] = (xr[j] - mean) * s * w[j] + b[j];
+        }
+    }
+    y
+}
+
+/// GELU with the tanh approximation (PyTorch's gelu_pytorch_tanh).
+fn gelu_tanh(x: f32) -> f32 {
+    0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh())
 }
 
 fn rms_norm(x: &[f32], w: &[f32], d: usize, eps: f32) -> Vec<f32> {
@@ -436,12 +554,48 @@ mod tests {
         let rgb = base64(want["rgb"].as_str().unwrap());
         let px = v.patches(&rgb, want["width"].as_u64().unwrap() as usize, want["height"].as_u64().unwrap() as usize).unwrap();
         assert_eq!(px.tokens(), want["tokens"].as_u64().unwrap() as usize);
-        let got = v.encode(&px).unwrap();
+        let got = v.encode(&px).unwrap().embeddings;
         let exp: Vec<f32> = want["embeddings"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
         assert_eq!(got.len(), exp.len());
         let scale = exp.iter().fold(0f32, |m, x| m.max(x.abs()));
         let worst = got.iter().zip(&exp).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         // About 6e-7 when right; a wrong window size gives 1.6e-3.
         assert!(worst <= 1e-5 * scale.max(1.0), "largest difference {worst} (values up to {scale})");
+    }
+}
+
+#[cfg(test)]
+mod qwen3vl_tests {
+    use super::*;
+
+    fn floats(v: &serde_json::Value) -> Vec<f32> {
+        v.as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+    }
+
+    fn worst(got: &[f32], want: &[f32]) -> f32 {
+        assert_eq!(got.len(), want.len());
+        got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+    }
+
+    #[test]
+    fn tiny_qwen3vl_encoder_and_deepstack_match_transformers() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let fx: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("tiny-qwen3vl-vision.json")).unwrap()).unwrap();
+        let v = Vision::load(&tests_base64(fx["gguf"].as_str().unwrap())).unwrap();
+        assert_eq!(v.cfg.kind, Projector::Qwen3Vl);
+        assert_eq!(v.cfg.deepstack, vec![1, 2]);
+        let px = v.patches(&tests_base64(fx["rgb"].as_str().unwrap()), fx["width"].as_u64().unwrap() as usize, fx["height"].as_u64().unwrap() as usize).unwrap();
+        assert_eq!(px.tokens(), fx["tokens"].as_u64().unwrap() as usize);
+        let got = v.encode(&px).unwrap();
+        let want = floats(&fx["embeddings"]);
+        let scale = want.iter().fold(0f32, |m, x| m.max(x.abs())).max(1.0);
+        let main = worst(&got.embeddings, &want);
+        // About 1e-6 when right; exact GELU in place of tanh-GELU is off by several times 2e-5.
+        assert!(main <= 2e-5 * scale, "embeddings differ by {main} (scale {scale})");
+        assert_eq!(got.deepstack.len(), 2);
+        for (g, w) in got.deepstack.iter().zip(fx["deepstack"].as_array().unwrap()) {
+            let e = worst(g, &floats(w));
+            assert!(e <= 2e-5 * scale, "deepstack differs by {e}");
+        }
     }
 }
