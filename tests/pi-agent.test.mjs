@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiTask, askedSteps, namedRepos } from '../web/pi-agent.mjs';
+import { createPiTask, askedSteps, namedRepos, wantsSources } from '../web/pi-agent.mjs';
 
 test('real Pi agent loop invokes sandbox tools and feeds their results back to the local transport',async()=>{
  const files=new Map(),events=[];let round=0;
@@ -395,4 +395,18 @@ test('a request about the repository the paired computer builds says to build an
  assert.match(seen[0],/Your computer is paired for building demo\/app: in its clone, cargo, npm, npx and node run on the computer/);
  building=null;await task.run('Fix the tests of the GitHub repository demo/app.');
  assert.doesNotMatch(seen.at(-1),/paired for building/);
+});
+
+test('a request for sources answered from memory is asked to search first, once, only with web access',async()=>{
+ assert.ok(wantsSources('Cite the code section and link to it.'));assert.ok(wantsSources('Look up when it was first lit'));assert.ok(!wantsSources('Fix calc.py'));
+ for(const enabled of [true,false]){
+  const seen=[];let n=0;
+  const task=createPiTask({workspace:{request:async()=>({})},network:{options:()=>({enabled}),run:async()=>({text:'[1] Sunvale City Code 12-4',sources:[{url:'https://x'}]})},turn:async messages=>{
+   n++;seen.push(messages.at(-1).content);
+   return{text:n===2&&enabled?'<tool_call>'+JSON.stringify({name:'web_search',arguments:{query:'Sunvale deposit'}})+'</tool_call>':'Landlords have 30 days.',reason:'end'};
+  }});
+  await task.run('How many days does a Sunvale landlord have to return a deposit? Cite the section.');
+  if(enabled){assert.match(seen[1],/Not finished yet: This question asks for sources, and you have not searched yet\. Make that tool call now: web_search/);assert.equal(n,3);}
+  else assert.equal(n,1);
+ }
 });

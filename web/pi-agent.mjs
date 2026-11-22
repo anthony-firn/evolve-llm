@@ -69,6 +69,11 @@ const shellText = r => [`exit code ${r.code}${r.timedOut?' (timed out)':''}, in 
 /** What a request in the Linux workspace starts with: the working directory and, for a GitHub
  *  repository the request names, where it is cloned or the exact command to clone it. Small
  *  models otherwise skip the clone or copy a placeholder like OWNER/REPO. */
+/** Whether a request asks for sources: cite, link, according to, look up. */
+export function wantsSources(prompt) {
+  return /\b(cite|citation|sources?|links?|according to|look (?:it |this |that )?up|search the web|find out)\b/i.test(String(prompt));
+}
+
 /** The git steps a request asks for: a pull request needs a push, and a push needs a commit.
  *  "Do not push" and the like turn a step (and the ones after it) off. */
 export function askedSteps(prompt) {
@@ -282,14 +287,18 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
   // A final reply while a step the request asked for has not happened (small models stop with
   // "Next steps: commit, push…" or say it is done): git status and gh pr view name the next one.
   const unfinished=async signal=>{
-    if(!linux||!asked?.commit||declined||nudges>=2)return null;
+    if(declined||nudges>=2)return null;
+    // A question that asks for sources, answered from memory: search first (once).
+    if(network.options().enabled&&webCalls===0&&nudges===0&&wantsSources(currentPrompt))
+      return {why:'This question asks for sources, and you have not searched yet.',cmd:'web_search with a short query, then open_url on the best result, and cite its link'};
+    if(!linux||!asked?.commit)return null;
     const st=await workspace.request('exec',{command:'git status'},{signal}).catch(()=>null);
     if(!st||st.code)return null;
     if(/Changes not committed/.test(st.stdout||''))return {why:'Your changes are not committed yet.',cmd:'git commit -m "What changed"'};
     if(asked.push&&/is ahead of/.test(st.stdout||''))return {why:'Your commits are not pushed yet.',cmd:'git push'};
     if(asked.pr&&pushed){const v=await workspace.request('exec',{command:'gh pr view'},{signal}).catch(()=>null);if(v&&v.code)return {why:'The pull request is not open yet.',cmd:'gh pr create --title "Title" --body "What and why"'};}
     return null;
-  };let ghRepo=null, stuck=null, asked=null, declined=false, nudges=0, pushed=false;
+  };let ghRepo=null, stuck=null, asked=null, declined=false, nudges=0, pushed=false, webCalls=0, currentPrompt='';
   const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction}):null;
   const limits=linux?LINUX_LIMITS:browserTools?BROWSER_LIMITS:LIMITS;
   const declarations=(linux?[
@@ -356,7 +365,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       if(['write','edit'].includes(name)){changes++;if(/\.html?$/i.test(args.path))previewPath=args.path;}
     }
     else if(['preview','browser_test'].includes(name)){if(!preview)throw new Error('Preview is unavailable.');if(name==='preview'&&pendingChangeError)throw new Error('A file change failed. Read the file and correct the failed write or edit before final preview.');result=await preview(args.path,{signal,smoke:name==='browser_test'});if(name==='preview'&&result.ok===true)completedPreview=true;}
-    else result=await network.run(name,args,signal);
+    else{result=await network.run(name,args,signal);webCalls++;}
     const full=name==='read'?`File: ${args.path}\n${result.text}`:name==='bash'&&linux?shellText(result):JSON.stringify(result);
     const body=full.length<=limits.result?full:full.slice(0,limits.result)+(name==='read'?`\n… (${full.length-limits.result} more characters not shown. To find a line, run: grep -n "SOME WORDS" ${args.path}; edit needs only the exact text to replace.)`:'\n… (output cut)');
     return {content:[{type:'text',text:body}],details:{sandbox:true},isError:result.ok===false||Boolean(result.code)||(['web_search','open_url'].includes(name)&&!result.sources?.length)};
@@ -439,5 +448,5 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
-  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;pushed=false;const pre=linux?await preamble(prompt,workspace,linux.cwd,linux.building?.()||null):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
+  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;pushed=false;webCalls=0;currentPrompt=String(prompt);const pre=linux?await preamble(prompt,workspace,linux.cwd,linux.building?.()||null):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
 }

@@ -132,6 +132,9 @@ pub struct Config {
     pub rope_dim: usize,
     /// NeoX-style rotation pairs (i, i + d/2) instead of adjacent pairs.
     pub rope_neox: bool,
+    /// Multimodal rotary positions (qwen2vl): rotary pairs per section (time, height, width),
+    /// each section rotated by its own position. None for text-only models.
+    pub rope_sections: Option<[usize; 3]>,
     /// Linear position scaling factor (1 = none).
     pub rope_linear_scale: f32,
     pub has_rope_freqs: bool,
@@ -207,7 +210,9 @@ pub fn arch_of(g: &Gguf) -> Result<Arch, String> {
         .ok_or("missing general.architecture")?;
     Ok(match arch {
         "llama" | "mistral" => Arch::Llama,
-        "qwen2" => Arch::Qwen2,
+        // Qwen2-VL and Qwen2.5-VL (and their fine-tunes such as UI-TARS and Holo): Qwen2 with
+        // multimodal rotary positions, which equal plain ones for text.
+        "qwen2" | "qwen2vl" => Arch::Qwen2,
         "qwen3" => Arch::Qwen3,
         "qwen3moe" => Arch::Qwen3Moe,
         "deepseek2" => Arch::Deepseek2,
@@ -220,6 +225,13 @@ pub fn arch_of(g: &Gguf) -> Result<Arch, String> {
             ))
         }
     })
+}
+
+/// Rotary pairs per multimodal section (time, height, width), from `ARCH.rope.dimension_sections`.
+pub fn rope_sections(g: &Gguf, prefix: &str) -> Option<[usize; 3]> {
+    let a = g.get(&format!("{prefix}.rope.dimension_sections"))?.as_array()?;
+    let n: Vec<usize> = a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect();
+    (n.len() >= 3 && n[..3].iter().any(|&x| x > 0)).then(|| [n[0], n[1], n[2]])
 }
 
 pub fn config(g: &Gguf) -> Result<Config, String> {
@@ -408,6 +420,7 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
             .map(|v| v as usize)
             .unwrap_or(head_dim),
         rope_neox: !matches!(arch, Arch::Llama | Arch::Deepseek2),
+        rope_sections: rope_sections(g, &prefix),
         rope_linear_scale,
         has_rope_freqs: g.tensor("rope_freqs.weight").is_some(),
         tied_embeddings: g.tensor("output.weight").is_none(),
@@ -663,4 +676,67 @@ pub fn rope_inv_freq(c: &Config, i: usize, factors: Option<&[f32]>) -> f32 {
         return (base / y.factor * (1.0 - mix) + base * mix) / f;
     }
     base / f / c.rope_linear_scale
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A GGUF header with string, u32 and u32-array keys and F32 tensor infos (no data needed).
+    fn header(keys: &[(&str, &dyn Fn(&mut Vec<u8>))], tensors: &[(&str, &[u64])]) -> Vec<u8> {
+        let s = |b: &mut Vec<u8>, t: &str| {
+            b.extend((t.len() as u64).to_le_bytes());
+            b.extend(t.as_bytes());
+        };
+        let mut b = Vec::new();
+        b.extend(b"GGUF");
+        b.extend(3u32.to_le_bytes());
+        b.extend((tensors.len() as u64).to_le_bytes());
+        b.extend((keys.len() as u64).to_le_bytes());
+        for (k, v) in keys {
+            s(&mut b, k);
+            v(&mut b);
+        }
+        for (name, dims) in tensors {
+            s(&mut b, name);
+            b.extend((dims.len() as u32).to_le_bytes());
+            for d in *dims {
+                b.extend(d.to_le_bytes());
+            }
+            b.extend(0u32.to_le_bytes());
+            b.extend(0u64.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn qwen2vl_loads_as_qwen2_with_rotary_sections() {
+        let text = |v: &'static str| move |b: &mut Vec<u8>| {
+            b.extend(8u32.to_le_bytes());
+            b.extend((v.len() as u64).to_le_bytes());
+            b.extend(v.as_bytes());
+        };
+        let int = |v: u32| move |b: &mut Vec<u8>| {
+            b.extend(4u32.to_le_bytes());
+            b.extend(v.to_le_bytes());
+        };
+        let sections = |b: &mut Vec<u8>| {
+            b.extend(9u32.to_le_bytes());
+            b.extend(5u32.to_le_bytes());
+            b.extend(4u64.to_le_bytes());
+            for x in [16i32, 24, 24, 0] {
+                b.extend(x.to_le_bytes());
+            }
+        };
+        let (arch, n_embd, blocks, heads, kv, ff) = (text("qwen2vl"), int(256), int(2), int(4), int(2), int(512));
+        let bytes = header(
+            &[("general.architecture", &arch), ("qwen2vl.embedding_length", &n_embd), ("qwen2vl.block_count", &blocks), ("qwen2vl.attention.head_count", &heads),
+              ("qwen2vl.attention.head_count_kv", &kv), ("qwen2vl.feed_forward_length", &ff), ("qwen2vl.rope.dimension_sections", &sections)],
+            &[("token_embd.weight", &[256, 1000]), ("blk.0.attn_q.weight", &[256, 256]), ("blk.0.attn_k.weight", &[256, 128]), ("blk.0.attn_q.bias", &[256])],
+        );
+        let g = crate::gguf::parse(&bytes).unwrap();
+        assert_eq!(arch_of(&g).unwrap(), Arch::Qwen2);
+        assert_eq!(rope_sections(&g, "qwen2vl"), Some([16, 24, 24]));
+        assert_eq!(rope_sections(&g, "qwen2"), None);
+    }
 }
