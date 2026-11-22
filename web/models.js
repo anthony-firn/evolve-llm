@@ -44,6 +44,12 @@ export const MODELS = [
     file: 'Qwen3-4B-Q4_K_M.gguf', bytes: 2497280256, quant: 'Q4_K_M', note: 'Largest here. Needs about 3.5 GB of GPU memory.', thinking: true, ...APACHE },
   { id: 'qwen3-4b-2507', name: 'Qwen3 4B Instruct 2507', maker: 'Qwen', repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF',
     file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf', bytes: 2497281120, quant: 'Q4_K_M', note: 'The July 2025 update of Qwen3 4B: better at using tools. A good coding assistant for most computers.', ...APACHE },
+  { id: 'qwen3-4b-thinking-2507', name: 'Qwen3 4B Thinking 2507', maker: 'Qwen', repo: 'unsloth/Qwen3-4B-Thinking-2507-GGUF',
+    file: 'Qwen3-4B-Thinking-2507-Q4_K_M.gguf', bytes: 2497281152, quant: 'Q4_K_M', note: 'Thinks before it answers: stronger with tools, slower to reply.', thinking: true, ...APACHE },
+  { id: 'qwen3.5-4b', name: 'Qwen3.5 4B', maker: 'Qwen', repo: 'unsloth/Qwen3.5-4B-GGUF',
+    file: 'Qwen3.5-4B-Q4_K_M.gguf', bytes: 2740937888, quant: 'Q4_K_M', note: 'The February 2026 generation: a linear-attention hybrid, much stronger than Qwen3 4B, with a far smaller cache for long chats.', thinking: true, ...APACHE },
+  { id: 'nanbeige4.1-3b', name: 'Nanbeige4.1 3B', maker: 'Nanbeige', repo: 'mradermacher/Nanbeige4.1-3B-GGUF',
+    file: 'Nanbeige4.1-3B.Q4_K_M.gguf', bytes: 2443113024, quant: 'Q4_K_M', note: 'A 3B model that leads small models at calling tools. Thinks before it answers.', thinking: true, ...APACHE },
 ];
 
 // Mixture-of-experts models. The ones larger than GPU memory keep their attention weights on the
