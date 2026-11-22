@@ -42,18 +42,44 @@ export function mountLocalComputer({ready, turn, lease, modelName, onConnectionC
     agent?.abort(); controller?.abort();
     try { await request('cancel', {}, {signal: AbortSignal.timeout(5000)}); } catch {}
   }
+  // Paired for building one repository: the chat keeps working in the browser's Linux VM, and
+  // there cargo, npm, npx, node and native run on this computer, in its copy of the repository.
+  async function runProject(req, write, signal) {
+    const {id} = await request('project-run', req, {signal: AbortSignal.timeout(300000)});
+    let offset = 0;
+    const cancel = () => { request('cancel', {}, {signal: AbortSignal.timeout(5000)}).catch(() => {}); };
+    signal?.addEventListener('abort', cancel, {once: true});
+    try {
+      for (;;) {
+        const r = await request('project-poll', {id, offset}, {signal: AbortSignal.timeout(30000)});
+        if (r.output) write(r.output);
+        offset = r.offset;
+        if (r.done) return r.code ?? 1;
+        if (!r.output) await new Promise(resolve => setTimeout(resolve, 400));
+      }
+    } finally { signal?.removeEventListener('abort', cancel); }
+  }
+  function showMode() {
+    const project = info?.project || null;
+    for (const e of [label, input, rootLabel, run, command]) e.hidden = Boolean(project);
+    // Loaded on demand: builds without the Linux VM (the SDK package) have no vm/ folder.
+    import('./vm/client.mjs').then(({provideComputer}) => provideComputer(project ? {project, call: req => request(req.type, req.data, {signal: AbortSignal.timeout(900000)}), run: runProject} : null), () => {});
+  }
   async function connectNow() {
     try {
       info = await request('status', {}, {signal: AbortSignal.timeout(10000)});
-      status.textContent = 'Connected · ' + info.root + ' · ' + info.sandbox;
+      status.textContent = info.project
+        ? `Connected for building ${info.project} · ${info.sandbox}. In a clone of it in the chat or the Linux terminal, cargo, npm, npx and node run on this computer.`
+        : 'Connected · ' + info.root + ' · ' + info.sandbox;
       root.disabled = !info.fullMachine;
-      button.setAttribute('aria-pressed', 'true'); button.title = 'Your computer is connected'; onConnectionChange(true);
-    } catch (error) { info = null; button.removeAttribute('aria-pressed'); button.title = ''; onConnectionChange(false); status.textContent = error.message + ' If prompted, allow this site to connect to apps on this device.'; }
+      button.setAttribute('aria-pressed', 'true'); button.title = info.project ? `Your computer builds ${info.project}` : 'Your computer is connected';
+      showMode(); onConnectionChange(!info.project, info.project || null);
+    } catch (error) { info = null; showMode(); button.removeAttribute('aria-pressed'); button.title = ''; onConnectionChange(false); status.textContent = error.message + ' If prompted, allow this site to connect to apps on this device.'; }
   }
   button.onclick = () => { panel.hidden = false; if (token && !info) connectNow(); input.focus(); };
   connect.onclick = connectNow;
   stop.onclick = cancel;
-  disconnect.onclick = async () => { await cancel(); token = ''; info = null; button.removeAttribute('aria-pressed'); button.title = ''; onConnectionChange(false); status.textContent = 'Disconnected. Reopen the connector’s pairing link to reconnect.'; };
+  disconnect.onclick = async () => { await cancel(); token = ''; info = null; showMode(); button.removeAttribute('aria-pressed'); button.title = ''; onConnectionChange(false); status.textContent = 'Disconnected. Reopen the connector’s pairing link to reconnect.'; };
   async function execute(useModel, questionOverride, options = {}) {
     if (controller) { if (options.external) throw new Error('The local computer is busy.'); return; }
     if (!info) { if (options.external) throw new Error('Connect this computer first.'); status.textContent = 'Connect this computer first.'; return; }
@@ -85,5 +111,6 @@ export function mountLocalComputer({ready, turn, lease, modelName, onConnectionC
   run.onclick = () => execute(true); command.onclick = () => execute(false);
   window.addEventListener('pagehide', () => { if (controller) cancel(); token = ''; });
   if (token) { panel.hidden = false; connectNow(); }
-  return {cancel, get connected() { return Boolean(token && info); }, runTask: (question, options = {}) => execute(true, question, {...options, external: true})};
+  // connected: the chat works on this computer. building: the repository it builds, if paired for that.
+  return {cancel, get connected() { return Boolean(token && info && !info.project); }, get building() { return (token && info?.project) || null; }, runTask: (question, options = {}) => execute(true, question, {...options, external: true})};
 }

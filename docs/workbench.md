@@ -123,13 +123,31 @@ git status; git diff; git commit -m "Fix a typo"   # every change is included; n
 git push                                    # creates the branch on GitHub
 gh pr create --title "Fix a typo" --body "…"
 gh run list --branch fix-typo; gh run view RUN_ID  # CI results: failed steps and annotations
+gh run watch                                # waits for this branch's CI run, then shows the result
 ```
+
+Outside a clone, `gh pr` and `gh run` take `-R OWNER/REPO` or the `GH_REPO` variable, as GitHub's
+`gh` does. `gh run watch` waits up to 8 minutes at a time (a VM command stops after 10) and then
+says how to keep waiting.
+
+`python3` runs Python there: RustPython 0.6.0 (a Python 3 interpreter written in Rust, with its
+standard library inside), built from its crates.io release by `tools/build_vm.py` and loaded the
+first time it runs (33 MB). Scripts, the standard library and `unittest` work; there is no pip,
+and C extensions such as numpy are not available. Bytecode caches are not written, so `git`
+does not pick up `__pycache__`.
 
 `pi TASK` in the Linux terminal gives the task to Pi with the loaded model. Pi works in the
 current directory with the VM's shell, files, `git` and `gh`, writes its progress to the
 terminal, and stops on Ctrl+C. A task allows 40 model turns and 80 tool calls. The VM has no
-compiler, Node or Python yet, so builds and tests run in the repository's GitHub Actions: Pi pushes
-a branch and reads its CI run.
+compiler or Node, so other builds and tests run in the repository's GitHub Actions: Pi pushes a
+branch and `gh run watch` shows what failed. That is also how Pi works on Evolve LLM itself, whose
+CI builds the engine and the app and runs the Rust, Node and browser tests (8 to 12 minutes).
+
+On Linux, a computer paired for building one repository (`python3 companion/local.py --project
+OWNER/NAME`, see `companion/README.md`) runs `cargo`, `npm`, `npx`, `node` and `native COMMAND`
+from a clone of that repository in the VM: the clone's files go to the computer's own copy, the
+command runs there in a sandbox without network, and its output streams back. Pi is told when
+the repository it works on is built that way.
 
 Merging works on GitHub, and always asks the person first, whatever the autonomy setting:
 

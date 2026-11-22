@@ -1150,7 +1150,8 @@ $('new-chat').addEventListener('click', () => {
   if (state.phase !== 'ready') return;
   for(const m of state.messages)m.workView?.dispose();
   state.messages = [];state.chatId=newChatId();assistant?.reset();
-  worker.postMessage({ type: 'reset' });
+  // The engine keeps what it computed: a new conversation starts with the same system prompt and
+  // tools, which it then reuses (it compares tokens, so a different start is simply recomputed).
   renderMessages();
   setPhase('ready');
   $('status-line').textContent = 'Started a new conversation.';
@@ -1362,7 +1363,7 @@ configureVm();
 import { mountLocalComputer } from './local-computer.mjs';
 const localComputer = mountLocalComputer({
   ready:()=>['ready','preparing'].includes(state.phase)&&Boolean(state.loaded), turn:agentTurn,
-  onConnectionChange:connected=>{$('status-line').textContent=connected?'Computer connected · the chat works on this computer.':'Local computer disconnected.';},
+  onConnectionChange:(connected,building)=>{$('status-line').textContent=building?`Computer paired for building ${building}: cargo, npm and node run there.`:connected?'Computer connected · the chat works on this computer.':'Local computer disconnected.';},
   modelName:()=>state.loaded?.label||'Local model',
   lease:()=>{if(!['ready','preparing'].includes(state.phase)||!state.loaded)throw new Error('The model is not ready.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?(state.live?.assistant?'preparing':'ready'):'idle');}};}
 });

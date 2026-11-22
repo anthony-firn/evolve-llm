@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 """Build the Evolve VM into web/vm/: the kernel (Rust, wasm-bindgen) in kernel/, and the WASI
-programs (shell, core utilities) in bin/, with programs.json listing what /bin holds.
+programs (shell, core utilities, git/gh, pi, python3) in bin/, with programs.json listing what
+/bin holds.
 
 Needs Rust with the wasm32-unknown-unknown and wasm32-wasip1 targets, and wasm-bindgen-cli.
+python3 is RustPython, a Python 3 interpreter in Rust, built from its crates.io release with that
+release's own Cargo.lock (--locked) and the Rust it needs (rustup installs it for this step only);
+--no-python skips it.
 """
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "web" / "vm"
+# RustPython: the release, the Rust it builds with, and the features for WASI (its standard
+# library frozen in; no threads, sockets or native allocator).
+PYTHON = ("rustpython", "0.6.0", "1.97.0", "freeze-stdlib,stdlib,stdio,importlib,host_env")
 
 
-def run(*args, cwd=ROOT):
-    subprocess.run(args, cwd=cwd, check=True)
+def run(*args, cwd=ROOT, env=None):
+    subprocess.run(args, cwd=cwd, check=True, env=env)
 
 
 def main():
@@ -27,6 +36,14 @@ def main():
     (OUT / "bin").mkdir(parents=True, exist_ok=True)
     for name in ("sh", "utils", "gh", "pi"):
         shutil.copy(progs / f"target/wasm32-wasip1/release/{name}.wasm", OUT / "bin" / f"{name}.wasm")
+    if "--no-python" not in sys.argv:
+        crate, version, rust, features = PYTHON
+        run("rustup", "toolchain", "install", rust, "--profile", "minimal", "--target", "wasm32-wasip1")
+        root = vm / "target" / "python"
+        env = {**os.environ, "RUSTUP_TOOLCHAIN": rust}
+        run("cargo", "install", f"{crate}@{version}", "--locked", "--root", str(root), "--target", "wasm32-wasip1",
+            "--no-default-features", "--features", features, env=env)
+        shutil.copy(root / "bin" / "rustpython.wasm", OUT / "bin" / "python.wasm")
     # The utility names, read from the source so the list cannot drift.
     src = (progs / "src/bin/utils.rs").read_text()
     names = re.findall(r'"([^"]+)"', src.split("pub const NAMES")[1].split("];")[0])

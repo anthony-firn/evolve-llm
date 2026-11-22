@@ -10,12 +10,12 @@
 
 import init, { Vm } from './kernel/evolve_vm.js';
 globalThis.VM_TRACE = new URL(location.href).searchParams.has('trace');
-import { Host } from './host.mjs';
+import { Host, LAZY } from './host.mjs';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const SNAPSHOT = 'evolve-vm-home.snap';
-const ENV = ['HOME=/home/user', 'USER=user', 'PATH=/bin:/usr/bin', 'TERM=xterm-256color', 'LANG=C.UTF-8', 'SHELL=/bin/sh'];
+const ENV = ['HOME=/home/user', 'USER=user', 'PATH=/bin:/usr/bin', 'TERM=xterm-256color', 'LANG=C.UTF-8', 'SHELL=/bin/sh', 'PYTHONDONTWRITEBYTECODE=1'];
 
 let vm;
 let host;
@@ -43,15 +43,22 @@ async function boot() {
     },
     onChange: () => { dirty = true; },
   });
-  // `pi` tasks run on the page (where the model is); its progress comes back as output.
-  host.agent = (task, cwd, write, pid) => new Promise((resolve) => {
+  // `pi` tasks and builds on the paired computer run from the page; their output comes back as
+  // output, and Ctrl+C on the program stops them.
+  const pageTask = (message, write, pid) => new Promise((resolve) => {
     const id = ++askSeq;
-    // Ctrl+C on `pi` stops Pi itself.
     const watch = setInterval(() => {
       if (vm.killed(pid) >= 0 || !vm.running(pid)) postMessage({ type: 'agent-cancel', id });
     }, 250);
     agents.set(id, { resolve: (code) => { clearInterval(watch); resolve(code); }, write, pid });
-    postMessage({ type: 'agent', id, task, cwd });
+    postMessage({ ...message, id });
+  });
+  host.agent = (task, cwd, write, pid) => pageTask({ type: 'agent', task, cwd }, write, pid);
+  host.computerRun = (req, write, pid) => pageTask({ type: 'computer-run', req }, write, pid);
+  host.computer = (req) => new Promise((resolve) => {
+    const id = ++askSeq;
+    asks.set(id, resolve);
+    postMessage({ type: 'computer', id, req });
   });
   // Questions from programs (push, pull requests) go to the page and wait for the answer.
   host.ask = (question) => new Promise((resolve) => {
@@ -72,8 +79,11 @@ async function boot() {
   vm.write_file('/usr/lib/evolve/utils', new Uint8Array(utils));
   vm.write_file('/usr/lib/evolve/gh', new Uint8Array(gh));
   for (const name of list.utils) vm.symlink('/usr/lib/evolve/utils', `/bin/${name}`);
-  for (const name of ['gh', 'git']) vm.symlink('/usr/lib/evolve/gh', `/bin/${name}`);
+  for (const name of ['gh', 'git', 'native', 'cargo', 'npm', 'npx', 'node']) vm.symlink('/usr/lib/evolve/gh', `/bin/${name}`);
   vm.write_file('/bin/pi', new Uint8Array(pi));
+  // python3 is 33 MB: /bin/python3 names it, and the host loads it the first time it runs.
+  vm.write_file('/usr/lib/evolve/python3', enc.encode(`${LAZY}python.wasm`));
+  for (const name of ['python3', 'python']) vm.symlink('/usr/lib/evolve/python3', `/bin/${name}`);
   await restore();
   // A process that owns the pipes of commands run for the page.
   const t = vm.create_tty();
@@ -188,6 +198,10 @@ const handlers = {
   },
   answer: ({ id, yes }) => {
     asks.get(id)?.(Boolean(yes));
+    asks.delete(id);
+  },
+  'computer-answer': ({ id, answer }) => {
+    asks.get(id)?.(answer);
     asks.delete(id);
   },
   session: ({ id }) => postMessage({ type: 'session', id, tty: newSession() }),

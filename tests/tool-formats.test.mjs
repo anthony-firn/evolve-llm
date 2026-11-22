@@ -64,3 +64,19 @@ test('structured history reaches native templates, and text reaches the rest', (
   assert.equal(text[3].role, 'user');
   assert.match(text[3].content, /<tool_response>\nR\n<\/tool_response>/);
 });
+
+test('a call whose reply ends after the JSON, without </tool_call>, still counts; a cut-off one does not', () => {
+  const call = '<tool_call>\n{"name": "bash", "arguments": {"command": "cd app && grep -n \\"x\\" README.md"}}';
+  const bash = new Set(['bash']);
+  assert.deepEqual(parseToolCalls(call, bash).map((c) => [c.name, c.args.command]), [['bash', 'cd app && grep -n "x" README.md']]);
+  assert.equal(parseToolCalls('<tool_call>\n{"name": "bash", "arguments": {"command": "ls', bash).length, 0);
+});
+
+test('a command called as if it were a tool runs as that command line with bash', () => {
+  const names = new Set(['bash', 'read']);
+  assert.deepEqual(parseToolCalls('<tool_call>\n{"name": "git", "arguments": {"command": "commit -m \\"Fix add\\""}}\n</tool_call>', names), [{ name: 'bash', args: { command: 'git commit -m "Fix add"' } }]);
+  assert.deepEqual(parseToolCalls('<tool_call>{"name": "gh", "arguments": {"command": "gh pr create --title x"}}</tool_call>', names), [{ name: 'bash', args: { command: 'gh pr create --title x' } }]);
+  assert.deepEqual(parseToolCalls('<tool_call>{"name": "python3", "arguments": {"args": ["test_calc.py"]}}</tool_call>', names), [{ name: 'bash', args: { command: 'python3 test_calc.py' } }]);
+  assert.deepEqual(parseToolCalls('<tool_call>{"name": "git", "arguments": {"command": "status"}}</tool_call>', new Set(['read'])), []);
+  assert.deepEqual(parseToolCalls('<tool_call>{"name": "git", "arguments": {"command": "status", "cwd": "x"}}</tool_call>', names), []);
+});

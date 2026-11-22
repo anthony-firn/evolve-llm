@@ -12,9 +12,13 @@ use wgpu::util::DeviceExt;
 
 /// Tokens processed per submission while reading a prompt.
 pub const MAX_BATCH: usize = 128;
-/// The smallest prompt chunk, and the time past which the next chunk is halved.
+/// The smallest prompt chunk, the first chunk of a pass (it grows while chunks finish fast), and
+/// the time past which the next chunk is halved. Starting small matters: on a slow GPU a first
+/// full chunk can already outlast the driver's limit, and cancelled work leaves wrong numbers,
+/// not an error.
 const MIN_BATCH: usize = 16;
-const SLOW_CHUNK_MS: f64 = 2000.0;
+const FIRST_BATCH: usize = 32;
+const SLOW_CHUNK_MS: f64 = 3000.0;
 
 /// Marks an expert that is not resident in the expert-to-slot map.
 pub const ABSENT: u32 = u32::MAX;
@@ -908,7 +912,7 @@ impl Engine {
             recurrent_pos: Cell::new(0),
             snapshot_pos: Cell::new(None),
             all_logits: Cell::new(false),
-            batch: Cell::new(MAX_BATCH),
+            batch: Cell::new(FIRST_BATCH),
             spec_state: RefCell::new(Vec::new()),
             spec_pos: Cell::new(0),
             stage,
@@ -2444,6 +2448,9 @@ impl Engine {
         // as soon as this GPU has it, so both work at once: this GPU reads chunk i+1 while the
         // other runs chunk i. The other device takes chunks in the order sent.
         let mut sent: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>, String>> + '_>>> = Vec::new();
+        // Each pass starts small (a smaller size a slow device found is kept), as it may begin far
+        // deeper into the context than the last pass ended.
+        self.batch.set(self.batch.get().min(FIRST_BATCH));
         let mut s = 0;
         while s < total {
             let n = self.batch.get().clamp(MIN_BATCH, MAX_BATCH).min(total - s);
@@ -2478,7 +2485,7 @@ impl Engine {
                 let ms = super::now_ms() - started;
                 if ms > SLOW_CHUNK_MS && n > MIN_BATCH {
                     self.batch.set((n / 2).max(MIN_BATCH));
-                } else if ms < SLOW_CHUNK_MS / 4.0 && n < MAX_BATCH {
+                } else if ms < SLOW_CHUNK_MS / 3.0 && n < MAX_BATCH {
                     self.batch.set((n * 2).min(MAX_BATCH));
                 }
             }

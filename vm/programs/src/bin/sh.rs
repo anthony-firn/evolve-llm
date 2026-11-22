@@ -682,12 +682,19 @@ impl Shell {
                 let _ = writeln!(out, "{}", cwd());
                 0
             }
+            // Backslash escapes are read, as by dash (sh on Debian and Ubuntu), which is what
+            // `echo "a\nb"` is written for; -E reads them as plain text.
             "echo" => {
-                let (newline, words) = match args.first().map(|s| s.as_str()) {
-                    Some("-n") => (false, &args[1..]),
-                    _ => (true, args),
-                };
-                let _ = write!(out, "{}{}", words.join(" "), if newline { "\n" } else { "" });
+                let mut words = args;
+                let (mut newline, mut escapes) = (true, true);
+                while let Some(f) = words.first().filter(|f| f.len() > 1 && f.starts_with('-') && f[1..].chars().all(|c| "neE".contains(c))) {
+                    newline &= !f.contains('n');
+                    escapes = !f.contains('E');
+                    words = &words[1..];
+                }
+                let text = words.join(" ");
+                let (text, stop) = if escapes { echo_escapes(&text) } else { (text, false) };
+                let _ = write!(out, "{text}{}", if newline && !stop { "\n" } else { "" });
                 0
             }
             "export" => {
@@ -803,6 +810,49 @@ impl Write for FdOut {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// echo's backslash escapes: \n \t \\ \a \b \f \r \v, \0NNN (octal), and \c, which ends the
+/// output there without a newline (the bool).
+fn echo_escapes(s: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('a') => out.push('\u{7}'),
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('v') => out.push('\u{b}'),
+            Some('\\') => out.push('\\'),
+            Some('c') => return (out, true),
+            Some('0') => {
+                let mut v = 0u32;
+                for _ in 0..3 {
+                    match it.peek().and_then(|d| d.to_digit(8)) {
+                        Some(d) => {
+                            v = v * 8 + d;
+                            it.next();
+                        }
+                        None => break,
+                    }
+                }
+                out.push(char::from_u32(v).unwrap_or('?'));
+            }
+            Some(o) => {
+                out.push('\\');
+                out.push(o);
+            }
+            None => out.push('\\'),
+        }
+    }
+    (out, false)
 }
 
 fn is_builtin(name: &str) -> bool {
@@ -939,6 +989,8 @@ mod tests {
         assert_eq!(first.args.len(), 4);
         assert_eq!(l[0].0[1].redirs.len(), 2);
         assert!(lex("echo 'open").is_err());
+        assert_eq!(echo_escapes("a\\nb\\tc\\\\d"), ("a\nb\tc\\d".to_string(), false));
+        assert_eq!(echo_escapes("one\\ctwo"), ("one".to_string(), true));
         // Lines are commands; a newline after && continues; comments end at the line's end.
         let l = parse(lex("cd app # go in\ngit status &&\n  git diff\necho 'a\nb'").unwrap()).unwrap();
         assert_eq!(l.iter().map(|(p, op)| (p[0].args.len(), *op)).collect::<Vec<_>>(), vec![(2, ";"), (2, "&&"), (2, ";"), (2, ";")]);

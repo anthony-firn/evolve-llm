@@ -39,15 +39,18 @@ C0 = "0f3c1a7e9b2d4c6e8a0b1c2d3e4f5a6b7c8d9e0f"  # the original commit
 class Fake:
     """One repository, demo/app, with branches, trees (path -> blob sha) and blobs."""
 
-    def __init__(self):
+    def __init__(self, files=None):
         self.blobs = {}
         self.trees = {}
         self.commits = {}
-        files = {"README.md": b"# Demo\n", "src/main.rs": b"fn main() {}\n", "docs/notes.txt": b"a\nb\n"}
+        files = files or {"README.md": b"# Demo\n", "src/main.rs": b"fn main() {}\n", "docs/notes.txt": b"a\nb\n"}
         tree = {p: self.put(d) for p, d in files.items()}
         self.commits[C0] = {"tree": self.tree_id(tree), "parents": [], "message": "Initial commit"}
         self.refs = {"main": C0}
         self.pulls = []
+        # Actions runs: each {id, status, conclusion, name, head_branch, jobs: [{id, name, conclusion,
+        # steps: [{name, conclusion}], annotations: [{path, start_line, message}]}]}.
+        self.runs = [{"id": 7, "status": "completed", "conclusion": "failure", "name": "CI", "head_branch": "feature", "jobs": []}]
         self.corrupt = None
         self.auth = []
 
@@ -136,6 +139,9 @@ class Fake:
         if rest == "/merges" and method == "POST":
             status, sha = self.merge(body["base"], body["head"], body.get("commit_message", "Merge"))
             return status, ({"sha": sha} if sha else {"message": "Merge conflict"} if status == 409 else b"")
+        if rest.startswith("/check-runs/") and rest.endswith("/annotations"):
+            job = int(rest.split("/")[2])
+            return 200, next((j.get("annotations", []) for r in self.runs for j in r["jobs"] if j["id"] == job), [])
         if "/check-runs" in rest:
             return 200, {"check_runs": [{"name": "CI", "status": "completed", "conclusion": "success"}]}
         if rest.startswith("/pulls/") and rest.endswith("/merge") and method == "PUT":
@@ -188,8 +194,16 @@ class Fake:
         if rest == "/pulls":
             head = query.get("head", "").partition(":")[2]
             return 200, [self.pull_json(p) for p in self.pulls if not p.get("merged") and head in ("", p["head"])]
+        if rest.startswith("/actions/runs/") and rest.endswith("/jobs"):
+            run = next((r for r in self.runs if str(r["id"]) == rest.split("/")[3]), None)
+            return (200, {"jobs": run["jobs"]}) if run else (404, {"message": "Not Found"})
+        if rest.startswith("/actions/runs/"):
+            run = next((r for r in self.runs if str(r["id"]) == rest.split("/")[3]), None)
+            return (200, {k: v for k, v in run.items() if k != "jobs"}) if run else (404, {"message": "Not Found"})
+        if rest == "/actions/runs" and query.get("branch"):
+            return 200, {"workflow_runs": [{k: v for k, v in r.items() if k != "jobs"} for r in self.runs if r["head_branch"] == query["branch"]]}
         if rest == "/actions/runs":
-            return 200, {"workflow_runs": [{"id": 7, "status": "completed", "conclusion": "failure", "name": "CI", "head_branch": "feature"}]}
+            return 200, {"workflow_runs": [{k: v for k, v in r.items() if k != "jobs"} for r in self.runs]}
         if rest.startswith("/commits"):
             out, c = [], query.get("sha", C0)
             while c and len(out) < 10:
@@ -286,6 +300,9 @@ def main():
         check(head and FAKE.commits[head]["parents"] == [C0] and FAKE.refs["main"] == C0, "parented on the original commit; main untouched")
         code, out, _ = sh("cd app && gh pr create --title 'Change things' --body 'Done' && gh pr list && gh run list")
         check(code == 0 and "pull/1" in out and "#1\tChange things\tfeature -> main" in out and "failure\tCI\tfeature" in out, f"pull request and CI runs ({out!r})")
+        FAKE.runs[0]["jobs"] = [{"id": 70, "name": "test", "conclusion": "failure", "steps": [{"name": "Run tests", "conclusion": "failure"}], "annotations": [{"path": "src/main.rs", "start_line": 1, "message": "expected 2, got 3"}]}]
+        code, out, err = sh("cd app && gh run watch")
+        check(code == 0 and "CI (feature): completed failure" in out and "step Run tests: failure" in out and "src/main.rs:1: expected 2, got 3" in out, f"gh run watch shows the finished run with its annotations ({out!r} {err!r})")
         config(0)
         code, out, err = sh("cd app && echo again >> README.md && git commit -m 'Again' && git push")
         check(code != 0 and "not allowed (autonomy: local commits only" in err, f"local-only refuses to push ({err!r})")
@@ -335,6 +352,13 @@ def main():
         check("fix.txt" in fixed and FAKE.pulls[1].get("merged"), "main on GitHub holds the fix")
         code, out, _ = sh("cd app && gh pr merge 2")
         check(code == 0 and "already merged" in out, "merging a merged pull request says so")
+        code, out, err = sh("cd / && GH_REPO=demo/app gh pr view 2 | head -1")
+        check(code == 0 and out.startswith("#2 Fix it"), f"gh pr works outside a clone with GH_REPO ({out!r} {err!r})")
+        code, out, err = sh("cd / && gh pr view 2 -R demo/app && gh pr merge 2 --repo demo/app")
+        check(code == 0 and "#2 Fix it" in out and "already merged" in out, f"gh pr works outside a clone with -R ({out!r} {err!r})")
+        # Without a number: -b's value is not taken for the pull request, and the error lists the open ones.
+        code, out, err = sh("cd / && GH_REPO=demo/app gh pr merge -b 'Merge pull request #1'")
+        check(code == 1 and err.startswith("gh: which pull request? Give its number: gh pr merge 1 (open pull requests on demo/app: ") and '#1 "Change things" (feature into main)' in err, f"gh pr merge without a number lists the open pull requests ({err!r})")
 
         # A conflict: nothing changes, and the message says what to do.
         c = FAKE.refs["main"]
@@ -361,6 +385,11 @@ def main():
         check(code != 0 and "Long" in out and "long.txt would go from 40 lines to 1, so nothing was committed" in err and "git restore long.txt" in err, f"an overwritten file is not committed ({out!r} {err!r})")
         code, out, err = sh("cd guard && git commit -m Oops --allow-shrink && git log --oneline -n 1")
         check(code == 0 and "long.txt +1 -40" in out, f"unless asked, and the commit says what changed ({out!r} {err!r})")
+        # A shorter file that lost a function it had looks rewritten from memory: no commit.
+        code, out, err = sh("cd guard && printf 'def add(a, b):\\n    return a - b\\n\\n\\ndef sub(a, b):\\n    return a - b\\n' > calc.py && git commit -m Calc && printf 'def add(a, b):\\n    return a + b\\n' > calc.py && git commit -m Fix")
+        check(code != 0 and "calc.py would lose def sub (6 lines to 2), so nothing was committed" in err and "edit calc.py 'old text' 'new text'" in err, f"a file that lost a function is not committed ({err!r})")
+        code, out, err = sh("cd guard && git restore calc.py && sed -i '2s/a - b/a + b/' calc.py && git commit -m Fix")
+        check(code == 0 and "calc.py +1 -1" in out, f"a one-line change with sed is committed ({out!r} {err!r})")
         code, out, _ = sh("git help && gh help")
         check("git merge BRANCH" in out and "gh pr merge" in out and "always asks the person" in out, "help lists merging")
 

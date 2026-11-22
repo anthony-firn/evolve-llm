@@ -30,6 +30,8 @@ extern "C" {
     fn http_read(buf: *mut u8, len: usize) -> u32;
     fn ask_user(q: *const u8, q_len: usize, answer: *mut u32) -> u32;
     fn policy(level: *mut u32) -> u32;
+    fn computer_call(req: *const u8, req_len: usize, resp_len: *mut u32) -> u32;
+    fn computer_run(req: *const u8, req_len: usize, status: *mut i32) -> u32;
 }
 
 const API: &str = "https://api.github.com";
@@ -113,7 +115,7 @@ fn allowed(action: &str, always_ask: bool) -> R<()> {
             if ask(&format!("{action}?")) {
                 Ok(())
             } else {
-                Err(format!("{action}: declined by the person, so nothing changed on GitHub"))
+                Err(format!("{action}: declined by the person, so nothing changed on GitHub. Do not try again; tell the person what you did"))
             }
         }
     }
@@ -420,6 +422,94 @@ fn tree_of(owner: &str, repo: &str, commit: &str) -> R<(Vec<(String, String, Str
     Ok((files, tree, skipped))
 }
 
+// ---- builds on the paired computer ----
+
+/// Commands that run on the person's computer when it is paired for building this repository.
+const NATIVE: &[&str] = &["native", "cargo", "npm", "npx", "node"];
+
+/// A request to the paired computer ({type, data}); its answer comes back like an HTTP response.
+fn computer(req: &Value) -> R<Value> {
+    let body = serde_json::to_vec(req).unwrap();
+    let mut len = 0u32;
+    if unsafe { computer_call(body.as_ptr(), body.len(), &mut len) } != 0 {
+        return Err("the paired computer did not answer".into());
+    }
+    let mut buf = vec![0u8; len as usize];
+    unsafe { http_read(buf.as_mut_ptr(), buf.len()) };
+    let v: Value = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
+    match v["error"].as_str() {
+        Some(e) => Err(e.to_string()),
+        None => Ok(v),
+    }
+}
+
+fn shell_quote(a: &str) -> String {
+    if !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || "_./:=,+-@%".contains(c)) {
+        a.to_string()
+    } else {
+        format!("'{}'", a.replace('\'', "'\\''"))
+    }
+}
+
+/// `native COMMAND`, and cargo, npm, npx and node: run on the paired computer, in its own copy of
+/// this repository holding this clone's files (sandboxed there). Output streams here; the exit
+/// status is the command's.
+fn native(name: &str, args: &[String]) -> R<i32> {
+    let command = match (name, args) {
+        // One argument is a command line, so `native "cargo test 2>&1 | tail -20"` works.
+        ("native", [one]) => one.clone(),
+        ("native", rest) => rest.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "),
+        (n, rest) => std::iter::once(n.to_string()).chain(rest.iter().map(|a| shell_quote(a))).collect::<Vec<_>>().join(" "),
+    };
+    if command.trim().is_empty() || command == "--help" {
+        println!("usage: native COMMAND   (cargo, npm, npx and node also run there)\nRuns COMMAND on your computer when it is paired for building this repository, in its own\ncopy with this clone's files: no network there, and only that copy changes.");
+        return Ok(if command.trim().is_empty() { 2 } else { 0 });
+    }
+    let unpaired = "not available in the browser. To build and test, push a branch, then gh run watch shows its CI".to_string();
+    let project = match computer(&json!({ "type": "status" })) {
+        Ok(s) => s["project"].as_str().map(String::from).ok_or(unpaired.clone())?,
+        Err(_) => return Err(unpaired),
+    };
+    let r = Repo::find().map_err(|_| format!("this runs on your paired computer from a clone of {project}: gh repo clone {project}, then cd into it"))?;
+    if r.owner_repo() != project {
+        return Err(format!("your computer is paired for building {project}, and this is {}. To build this one, push a branch, then gh run watch shows its CI", r.owner_repo()));
+    }
+    let commit = r.config["upstream"]["commit"].as_str().ok_or("this clone has no commit")?.to_string();
+    let mut req = json!({ "type": "project-sync", "data": { "repo": project, "commit": commit, "files": r.work()? } });
+    let mut answer = computer(&req)?;
+    for _ in 0..100 {
+        let Some(need) = answer["need"].as_array().cloned() else { break };
+        // At most about 4 MB of files per request.
+        let mut contents = Map::new();
+        let mut size = 0;
+        for p in need.iter().filter_map(|p| p.as_str()) {
+            let full = r.root.join(p);
+            let data = match fs::read_link(&full) {
+                Ok(t) => t.to_string_lossy().into_owned().into_bytes(),
+                Err(_) => fs::read(&full).map_err(|e| format!("{p}: {e}"))?,
+            };
+            size += data.len();
+            contents.insert(p.to_string(), Value::String(B64.encode(&data)));
+            if size > 4 << 20 {
+                break;
+            }
+        }
+        req["data"]["contents"] = Value::Object(contents);
+        answer = computer(&req)?;
+    }
+    if answer["ok"].as_bool() != Some(true) {
+        return Err("the paired computer could not take this clone's files".into());
+    }
+    let here = env::current_dir().map_err(|e| e.to_string())?;
+    let cwd = here.strip_prefix(&r.root).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let body = serde_json::to_vec(&json!({ "cwd": cwd, "command": command })).unwrap();
+    let mut status = 1i32;
+    if unsafe { computer_run(body.as_ptr(), body.len(), &mut status) } != 0 {
+        return Err("the paired computer did not answer".into());
+    }
+    Ok(status)
+}
+
 // ---- commands ----
 
 fn clone(args: &[String]) -> R<()> {
@@ -583,6 +673,15 @@ fn commit(r: &Repo, args: &[String]) -> R<()> {
             if before >= 20 && after * 2 < before && removed * 5 >= before * 4 {
                 return Err(format!("{p} would go from {before} lines to {after}, so nothing was committed. It looks overwritten (for example with > instead of >>). Undo it with: git restore {p}   (if you meant it: git commit -m \"MESSAGE\" --allow-shrink)"));
             }
+            // A shorter file that lost a function or class it had: most likely rewritten from
+            // memory (echo '...' > calc.py) rather than changed.
+            let defs = |t: &[u8]| String::from_utf8_lossy(t).lines().filter_map(definition).collect::<Vec<_>>();
+            let (had, has) = (defs(&old), defs(&new));
+            let lost: Vec<&String> = had.iter().filter(|d| !has.contains(d)).collect();
+            if after < before && !lost.is_empty() {
+                let names = lost.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ");
+                return Err(format!("{p} would lose {names} ({before} lines to {after}), so nothing was committed. It looks rewritten instead of changed. Undo it with: git restore {p}, then change only the lines that need it: edit {p} 'old text' 'new text'   (if you meant to remove it: git commit -m \"MESSAGE\" --allow-shrink)"));
+            }
         }
     }
     let summary = change_summary(r, &head, &work);
@@ -658,8 +757,23 @@ fn push(r: &mut Repo) -> R<()> {
 
 /// A pull request's number from `12`, `#12`, its URL or a branch name; with none, the open pull
 /// request of the current branch.
-fn pr_number(r: &Repo, args: &[String]) -> R<String> {
-    let given = args.iter().find(|a| !a.starts_with('-'));
+/// Flags of gh pr merge and gh pr view that take a value, so the value is not taken for the
+/// pull request (`gh pr merge -b "Merge #1"`).
+const PR_VALUE_FLAGS: &[&str] = &["-b", "--body", "-t", "--subject", "--title", "-F", "--body-file", "--match-head-commit", "-A", "--author-email", "--json", "-q", "--jq", "--template"];
+
+fn pr_number(r: &Repo, args: &[String], verb: &str) -> R<String> {
+    let mut given = None;
+    let mut i = 0;
+    while i < args.len() {
+        if PR_VALUE_FLAGS.contains(&args[i].as_str()) {
+            i += 2;
+        } else if args[i].starts_with('-') {
+            i += 1;
+        } else {
+            given = Some(&args[i]);
+            break;
+        }
+    }
     if let Some(n) = given.map(|a| a.trim_start_matches('#').rsplit('/').next().unwrap_or("").to_string()).filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
         return Ok(n);
     }
@@ -667,8 +781,34 @@ fn pr_number(r: &Repo, args: &[String]) -> R<String> {
     let open = api("GET", &format!("/repos/{}/pulls?state=open&head={}:{}", r.owner_repo(), r.config["owner"].as_str().unwrap_or(""), url_path(&branch)), None)?;
     match open.as_array().and_then(|a| a.first()).and_then(|p| p["number"].as_u64()) {
         Some(n) => Ok(n.to_string()),
-        None => Err(format!("no open pull request for branch {branch}. Open one with: gh pr create --title \"TITLE\" (or run gh pr list to see the numbers)")),
+        // The open pull requests and their numbers are in the error, so the next command can be right.
+        None => {
+            // Lead with what to run: "no open pull request for branch main" reads as "nothing to
+            // merge" to a small model that was asked to merge #1.
+            let open = api("GET", &format!("/repos/{}/pulls?state=open&per_page=10", r.owner_repo()), None)?.as_array().cloned().unwrap_or_default();
+            let list: Vec<String> = open.iter().map(|p| format!("#{} \"{}\" ({} into {})", p["number"], p["title"].as_str().unwrap_or(""), p["head"]["ref"].as_str().unwrap_or(""), p["base"]["ref"].as_str().unwrap_or(""))).collect();
+            let which = match given {
+                Some(g) => format!("{g} is not a pull request number. Which pull request?"),
+                None => "which pull request?".to_string(),
+            };
+            match open.first() {
+                Some(p) => Err(format!("{which} Give its number: gh pr {verb} {} (open pull requests on {}: {})", p["number"], r.owner_repo(), list.join("; "))),
+                None => Err(format!("{} has no open pull requests (branch {branch} has none either). Open one with: gh pr create --title \"TITLE\"", r.owner_repo())),
+            }
+        }
     }
+}
+
+/// "def sub", "class App", "fn main", "function draw": a line that defines something by name.
+fn definition(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    for k in ["async def ", "def ", "class ", "pub fn ", "pub(crate) fn ", "fn ", "export default function ", "export async function ", "export function ", "async function ", "function ", "pub struct ", "struct ", "pub enum ", "enum "] {
+        if let Some(rest) = t.strip_prefix(k) {
+            let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            return (!name.is_empty()).then(|| format!("{k}{name}"));
+        }
+    }
+    None
 }
 
 /// "2 passed, 1 failed" for the checks on a commit.
@@ -685,7 +825,7 @@ fn checks_summary(or: &str, sha: &str) -> R<String> {
 /// gh pr merge: merge a pull request on GitHub. Always asks the person first.
 fn pr_merge(r: &Repo, args: &[String]) -> R<()> {
     let or = r.owner_repo();
-    let n = pr_number(r, args)?;
+    let n = pr_number(r, args, "merge")?;
     let p = api("GET", &format!("/repos/{or}/pulls/{n}"), None)?;
     if p["merged"].as_bool() == Some(true) {
         println!("Pull request #{n} is already merged.");
@@ -748,8 +888,8 @@ fn pr(r: &Repo, args: &[String]) -> R<()> {
                 println!("#{}\t{}\t{} -> {}", p["number"], p["title"].as_str().unwrap_or(""), p["head"]["ref"].as_str().unwrap_or(""), p["base"]["ref"].as_str().unwrap_or(""));
             }
         }
-        Some("view") | Some("checks") => {
-            let n = pr_number(r, &args[1..])?;
+        Some(verb @ ("view" | "checks")) => {
+            let n = pr_number(r, &args[1..], verb)?;
             let p = api("GET", &format!("/repos/{or}/pulls/{n}"), None)?;
             let conflicts = if p["mergeable"].as_bool() == Some(false) { " (has merge conflicts)" } else { "" };
             println!("#{n} {}\nstate: {}{}{conflicts}\n{} -> {}\n{}\n\n{}", p["title"].as_str().unwrap_or(""), p["state"].as_str().unwrap_or(""), if p["merged"].as_bool() == Some(true) { " (merged)" } else { "" }, p["head"]["ref"].as_str().unwrap_or(""), p["base"]["ref"].as_str().unwrap_or(""), p["html_url"].as_str().unwrap_or(""), p["body"].as_str().unwrap_or(""));
@@ -776,23 +916,66 @@ fn run_cmd(r: &Repo, args: &[String]) -> R<()> {
         }
         Some("view") => {
             let id = args.get(1).ok_or("usage: gh run view RUN_ID")?;
-            let w = api("GET", &format!("/repos/{or}/actions/runs/{id}"), None)?;
-            println!("{} ({}): {} {}", w["name"].as_str().unwrap_or(""), w["head_branch"].as_str().unwrap_or(""), w["status"].as_str().unwrap_or(""), w["conclusion"].as_str().unwrap_or(""));
-            for j in api("GET", &format!("/repos/{or}/actions/runs/{id}/jobs"), None)?["jobs"].as_array().cloned().unwrap_or_default() {
-                println!("job {}: {}", j["name"].as_str().unwrap_or(""), j["conclusion"].as_str().or(j["status"].as_str()).unwrap_or(""));
-                for s in j["steps"].as_array().cloned().unwrap_or_default() {
-                    if s["conclusion"].as_str() != Some("success") && s["conclusion"].as_str() != Some("skipped") {
-                        println!("  step {}: {}", s["name"].as_str().unwrap_or(""), s["conclusion"].as_str().or(s["status"].as_str()).unwrap_or(""));
+            run_summary(&or, id)?;
+        }
+        // Wait for a run to finish (the newest on a branch, by default this one), then show it:
+        // one command instead of many model turns spent checking.
+        Some("watch") => {
+            let id = match args.iter().skip(1).find(|a| !a.starts_with('-')) {
+                Some(id) => id.clone(),
+                None => {
+                    let branch = args.iter().position(|a| a == "--branch" || a == "-b").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| r.branch());
+                    let mut found = None;
+                    // A pushed branch's run can take a little while to appear.
+                    for _ in 0..12 {
+                        found = api("GET", &format!("/repos/{or}/actions/runs?per_page=1&branch={}", url_path(&branch)), None)?["workflow_runs"].get(0).map(|w| w["id"].to_string());
+                        if found.is_some() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(5));
                     }
+                    found.ok_or(format!("no CI run for branch {branch} after a minute (gh run list shows the runs)"))?
                 }
-                if j["conclusion"].as_str() == Some("failure") {
-                    for a in api("GET", &format!("/repos/{or}/check-runs/{}/annotations", j["id"]), None)?.as_array().cloned().unwrap_or_default() {
-                        println!("  {}:{}: {}", a["path"].as_str().unwrap_or(""), a["start_line"], a["message"].as_str().unwrap_or(""));
-                    }
+            };
+            // At most 8 minutes here: a command in the VM is stopped after 10, and CI can take longer.
+            eprint!("Waiting for run {id}");
+            let mut done = false;
+            for _ in 0..48 {
+                if api("GET", &format!("/repos/{or}/actions/runs/{id}"), None)?["status"].as_str() == Some("completed") {
+                    done = true;
+                    break;
                 }
+                eprint!(".");
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+            eprintln!();
+            run_summary(&or, &id)?;
+            if !done {
+                println!("Run {id} is still running after 8 minutes. To keep waiting, run: gh run watch {id}");
             }
         }
-        Some(other) => return Err(format!("gh run {other}: not supported (list, view)")),
+        Some(other) => return Err(format!("gh run {other}: not available here (list, view, watch)")),
+    }
+    Ok(())
+}
+
+/// A run's result: its status, each job, the steps that did not pass and the annotations
+/// (file:line: message) of failed jobs.
+fn run_summary(or: &str, id: &str) -> R<()> {
+    let w = api("GET", &format!("/repos/{or}/actions/runs/{id}"), None)?;
+    println!("{} ({}): {} {}", w["name"].as_str().unwrap_or(""), w["head_branch"].as_str().unwrap_or(""), w["status"].as_str().unwrap_or(""), w["conclusion"].as_str().unwrap_or(""));
+    for j in api("GET", &format!("/repos/{or}/actions/runs/{id}/jobs"), None)?["jobs"].as_array().cloned().unwrap_or_default() {
+        println!("job {}: {}", j["name"].as_str().unwrap_or(""), j["conclusion"].as_str().or(j["status"].as_str()).unwrap_or(""));
+        for s in j["steps"].as_array().cloned().unwrap_or_default() {
+            if s["conclusion"].as_str() != Some("success") && s["conclusion"].as_str() != Some("skipped") {
+                println!("  step {}: {}", s["name"].as_str().unwrap_or(""), s["conclusion"].as_str().or(s["status"].as_str()).unwrap_or(""));
+            }
+        }
+        if j["conclusion"].as_str() == Some("failure") {
+            for a in api("GET", &format!("/repos/{or}/check-runs/{}/annotations", j["id"]), None)?.as_array().cloned().unwrap_or_default() {
+                println!("  {}:{}: {}", a["path"].as_str().unwrap_or(""), a["start_line"], a["message"].as_str().unwrap_or(""));
+            }
+        }
     }
     Ok(())
 }
@@ -1029,12 +1212,35 @@ const GH_HELP: &str = "gh here works on GitHub through its API.
 
   gh repo clone OWNER/REPO [DIR] [--branch B]    gh repo list [OWNER]    gh auth status
   gh pr create --title \"TITLE\" --body \"TEXT\" [--base BRANCH]   (push first; may ask the person)
-  gh pr list            gh pr view [NUMBER]       gh pr checks [NUMBER]
+  gh pr list            gh pr view [NUMBER]       gh pr checks [NUMBER]   (add -R OWNER/REPO outside a clone)
   gh pr merge [NUMBER] [--squash|--rebase]        (always asks the person; no NUMBER = this branch's pull request)
-  gh run list [--branch B]    gh run view RUN_ID  (CI results: failed steps and errors)
+  gh run list [--branch B]    gh run view RUN_ID  gh run watch [RUN_ID]  (CI results: failed steps and errors; watch waits for the run)
   gh api PATH
 
 Local work (git status, diff, commit, push, pull, checkout, merge): git help";
+
+/// The repository for gh pr and gh run: `-R OWNER/REPO` (or `--repo`), as in GitHub's gh, works
+/// anywhere; otherwise the clone around the working directory. Returns it and the other args.
+fn repo_or_flag(args: &[String]) -> R<(Repo, Vec<String>)> {
+    let (spec, rest): (String, Vec<String>) = match args.iter().position(|a| a == "-R" || a == "--repo") {
+        Some(i) => (
+            args.get(i + 1).ok_or("usage: -R OWNER/REPO")?.clone(),
+            args.iter().enumerate().filter(|(j, _)| *j != i && *j != i + 1).map(|(_, a)| a.clone()).collect(),
+        ),
+        // Outside a clone, GH_REPO names the repository, as in GitHub's gh.
+        None => match Repo::find() {
+            Ok(r) => return Ok((r, args.to_vec())),
+            Err(e) => (env::var("GH_REPO").map_err(|_| e)?, args.to_vec()),
+        },
+    };
+    let spec = spec.trim_start_matches("https://github.com/").trim_end_matches(".git");
+    let (owner, repo) = spec.split_once('/').ok_or("expected OWNER/REPO")?;
+    let info = api("GET", &format!("/repos/{owner}/{repo}"), None)?;
+    let default = info["default_branch"].as_str().unwrap_or("main").to_string();
+    // Not a clone: no local commits, and the branch is the default one unless --head says.
+    let r = Repo { root: PathBuf::from("/nonexistent-clone"), config: json!({ "owner": owner, "repo": repo, "default_branch": default, "branch": default }) };
+    Ok((r, rest))
+}
 
 fn gh(args: &[String]) -> R<()> {
     match (args.first().map(|s| s.as_str()), args.get(1).map(|s| s.as_str())) {
@@ -1058,8 +1264,14 @@ fn gh(args: &[String]) -> R<()> {
             println!("Autonomy: {}", names[level().min(2) as usize]);
             Ok(())
         }
-        (Some("pr"), _) => pr(&Repo::find()?, &args[1..]),
-        (Some("run"), _) => run_cmd(&Repo::find()?, &args[1..]),
+        (Some("pr"), _) => {
+            let (r, rest) = repo_or_flag(&args[1..])?;
+            pr(&r, &rest)
+        }
+        (Some("run"), _) => {
+            let (r, rest) = repo_or_flag(&args[1..])?;
+            run_cmd(&r, &rest)
+        }
         (Some("api"), Some(path)) => {
             let method = args.iter().position(|a| a == "-X").and_then(|i| args.get(i + 1)).map(|s| s.as_str()).unwrap_or("GET");
             if method != "GET" {
@@ -1068,19 +1280,39 @@ fn gh(args: &[String]) -> R<()> {
             println!("{}", serde_json::to_string_pretty(&api(method, &format!("/{}", path.trim_start_matches('/')), None)?).unwrap());
             Ok(())
         }
-        _ => {
+        (None, _) | (Some("help" | "--help" | "-h"), _) => {
             println!("{GH_HELP}");
             Ok(())
         }
+        // A command that is not here fails, so a chain stops and the model sees it.
+        (Some(a), b) => Err(format!("gh {a}{}: not available here. gh help lists what works", b.map(|b| format!(" {b}")).unwrap_or_default())),
     }
 }
 
 fn main() {
+    // A reader that stopped early (`gh pr list | head -1`) ends the program quietly, as it would
+    // a native one, instead of a panic about a broken pipe.
+    std::panic::set_hook(Box::new(|info| {
+        let msg = info.to_string();
+        if msg.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        eprintln!("{msg}");
+    }));
     if let Ok(p) = env::var("PWD") {
         let _ = env::set_current_dir(p);
     }
     let argv: Vec<String> = env::args().collect();
     let name = argv.first().map(|a| Path::new(a).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default();
+    if NATIVE.contains(&name.as_str()) {
+        match native(&name, &argv[1..]) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("{name}: {e}");
+                std::process::exit(127);
+            }
+        }
+    }
     let r = if name == "git" { git(&argv[1..]) } else { gh(&argv[1..]) };
     if let Err(e) = r {
         eprintln!("{name}: {e}");

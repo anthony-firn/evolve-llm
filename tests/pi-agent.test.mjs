@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiTask } from '../web/pi-agent.mjs';
+import { createPiTask, askedSteps, namedRepos } from '../web/pi-agent.mjs';
 
 test('real Pi agent loop invokes sandbox tools and feeds their results back to the local transport',async()=>{
  const files=new Map(),events=[];let round=0;
@@ -290,4 +290,109 @@ test('an empty reply after tool results is asked to continue, and a long read sa
  assert.match(seen[1].content,/more characters not shown\. To find a line, run: grep -n/);
  assert.match(seen[2].content,/Your reply was empty\. Continue the task/);
  assert.equal(result.repairs,1);assert.equal(n,3);
+});
+
+test('write does not replace an existing file the task has not read; it may after a read',async()=>{
+ const files=new Map([['/workspace/calc.py','def add(a, b):\n    return a - b\n\n\ndef sub(a, b):\n    return a - b\n']]);let n=0;const results=[];
+ const task=createPiTask({workspace:{request:async(name,args)=>{if(name==='read'){if(!files.has(args.path))throw Error('no such file');return{text:files.get(args.path)}}if(name==='write'){files.set(args.path,args.text);return{ok:true}}return{}}},network:{options:()=>({enabled:false})},
+  onEvent:e=>{if(e.type==='tool-result')results.push([e.isError,e.result.content[0].text])},turn:async()=>{
+  n++;const call=n===1?{name:'write',arguments:{path:'/workspace/calc.py',text:'def add(a, b):\n    return a + b\n'}}:n===2?{name:'write',arguments:{path:'/workspace/new.txt',text:'fresh'}}:n===3?{name:'read',arguments:{path:'/workspace/calc.py'}}:n===4?{name:'write',arguments:{path:'/workspace/calc.py',text:'whole new file'}}:null;
+  return{text:call?'<tool_call>'+JSON.stringify(call)+'</tool_call>':'Done.',reason:'end'};
+ }});
+ await task.run('Fix calc.py');
+ assert.equal(results[0][0],true);assert.match(results[0][1],/calc\.py already exists, so nothing was written\. To change part of it, use edit/);
+ assert.equal(results[1][0],false);assert.equal(files.get('/workspace/new.txt'),'fresh');
+ assert.equal(results[3][0],false);assert.equal(files.get('/workspace/calc.py'),'whole new file');
+});
+
+test('the same failing command a third time stops the task with the reason',async()=>{
+ let n=0;
+ const task=createPiTask({linux:{cwd:'/home/user'},workspace:{cwd:'/home/user',request:async(name)=>name==='exec'?{code:1,stdout:'',stderr:'boom',cwd:'/home/user'}:{}},network:{options:()=>({enabled:false})},turn:async()=>{
+  n++;return{text:'<tool_call>'+JSON.stringify({name:'bash',arguments:{command:'make it work'}})+'</tool_call>',reason:'end'};
+ }});
+ await assert.rejects(task.run('Do it'),/The same command failed 3 times, so the task stopped: make it work/);
+ assert.equal(n,3);
+});
+
+test('a request about failing CI says where the reason is',async()=>{
+ const seen=[];const vm={read:async()=>({ok:false}),exec:async()=>({code:0,stdout:'',stderr:''})};
+ const task=createPiTask({linux:{cwd:'/home/user'},workspace:{cwd:'/home/user',vm,path:p=>p,request:async()=>({})},network:{options:()=>({enabled:false})},turn:async messages=>{seen.push(messages.at(-1).content);return{text:'Done.',reason:'end'}}});
+ await task.run('CI is failing for the GitHub repository demo/app. Fix it.');
+ assert.match(seen[0],/To find out why CI fails, run gh run list, then gh run view ID/);
+ await task.run('Add a line to README.md in demo/app.');
+ assert.doesNotMatch(seen.at(-1),/find out why CI fails/);
+ assert.doesNotMatch(seen.at(-1),/To put a line after another line/);
+ await task.run('In README.md of demo/app, right after the line "npm test", add the line "npm run lint".');
+ assert.match(seen.at(-1),/To put a line after another line, use edit with oldText "that line" and newText "that line\\nnew line"/);
+});
+
+test('askedSteps reads commit, push and pull request from a request, and "do not"',()=>{
+ assert.deepEqual(askedSteps('Fix it, commit it on a new branch, push it and open a pull request.'),{commit:true,push:true,pr:true});
+ assert.deepEqual(askedSteps('Fix it on a new branch named fix-ci, test the fix, push it and open a pull request.'),{commit:true,push:true,pr:true});
+ assert.deepEqual(askedSteps('Commit it on a new branch named docs. Do not push it.'),{commit:true,push:false,pr:false});
+ assert.deepEqual(askedSteps('Merge pull request #1 in demo/app.'),{commit:false,push:false,pr:false});
+ assert.deepEqual(askedSteps('Find the commit that broke the build.'),{commit:false,push:false,pr:false});
+ assert.deepEqual(askedSteps('Fix it on a branch named fix-add and send me a pull request.'),{commit:true,push:true,pr:true});
+ assert.deepEqual(askedSteps('Use a branch called docs-serve and open a PR for it.'),{commit:true,push:true,pr:true});
+});
+
+test('a final reply before the asked commit, push and pull request gets at most two nudges naming the next command',async()=>{
+ const seen=[];let status='On branch fix\nChanges not committed (git commit -m "MESSAGE" saves them all):\n\tmodified:   calc.py\n';
+ const workspace={cwd:'/home/user/app',vm:{read:async()=>({ok:false})},path:p=>p,request:async(name,args)=>{
+  if(name!=='exec')return{};
+  if(args.command==='git status')return{code:0,stdout:status,stderr:''};
+  if(args.command==='gh pr view')return{code:1,stdout:'',stderr:'gh: no open pull request'};
+  return{code:0,stdout:'',stderr:''};
+ }};
+ const task=createPiTask({linux:{cwd:'/home/user/app'},workspace,network:{options:()=>({enabled:false})},turn:async messages=>{
+  seen.push(messages.at(-1).content);
+  return{text:'I fixed it and committed it. Next steps: push and open a pull request.',reason:'end'};
+ }});
+ const r=await task.run('Fix calc.py, commit it, push it and open a pull request.');
+ assert.equal(seen.length,3);
+ assert.match(seen[1],/^Not finished yet: Your changes are not committed yet\. Make that tool call now: git commit -m "What changed"\./);
+ status='On branch fix\nYour branch is ahead of \'origin/main\' by 1 commit (not pushed; git push uploads them).\nnothing to commit, working tree clean\n';
+ seen.length=0;await task.run('Now push it and open a pull request.');
+ assert.match(seen[1],/Your commits are not pushed yet\. Make that tool call now: git push\./);
+ status='On branch fix\nnothing to commit, working tree clean\n';
+ seen.length=0;await task.run('Open a pull request for it.');
+ assert.equal(seen.length,1,'no pull request nudge before anything was pushed');
+ seen.length=0;await task.run('What does calc.py do?');
+ assert.equal(seen.length,1);
+});
+
+test('an edit aimed at the wrong file is told where the text is, and the same failing edit a third time stops',async()=>{
+ const files=new Map([['/home/user/app/calc.py','def add(a, b):\n    return a - b\n'],['/home/user/app/test_calc.py','from calc import add\n']]);const results=[];
+ const workspace={cwd:'/home/user/app',vm:{read:async p=>({ok:files.has(p)})},path:p=>p.startsWith('/')?p:`/home/user/app/${p.replace(/^\.\//,'')}`,request:async(name,args)=>{
+  if(name==='read'){const t=files.get(workspace.path(args.path));if(t==null)throw Error('no such file');return{text:t}}
+  if(name==='edit'){const t=files.get(workspace.path(args.path));if(!t.includes(args.oldText))throw Error(`oldText is not in ${args.path}; read the file again`);return{}}
+  if(name==='exec'&&args.command.startsWith('grep -rlF'))return{code:0,stdout:'calc.py\n',stderr:''};
+  return{code:0,stdout:'',stderr:''};
+ }};
+ const call={name:'edit',arguments:{path:'test_calc.py',oldText:'def add(a, b):\n    return a - b',newText:'def add(a, b):\n    return a + b'}};
+ const task=createPiTask({linux:{cwd:'/home/user/app'},workspace,network:{options:()=>({enabled:false})},onEvent:e=>{if(e.type==='tool-result')results.push(e.result.content[0].text)},turn:async()=>({text:'<tool_call>'+JSON.stringify(call)+'</tool_call>',reason:'end'})});
+ await assert.rejects(task.run('Fix add in calc.py'),/The same edit call failed 3 times, so the task stopped/);
+ assert.match(results[0],/oldText is not in test_calc\.py, so nothing was changed\. That text is in calc\.py: call edit with that path\./);
+});
+
+test('namedRepos finds OWNER/NAME however a request names the repository, and not file paths',()=>{
+ const names=p=>namedRepos(p).map(([o,n])=>`${o}/${n}`);
+ assert.deepEqual(names('Clone the GitHub repository demo/app. In tools/serve_local.py add x.'),['demo/app']);
+ assert.deepEqual(names('In demo/app on GitHub, README.md has the line'),['demo/app']);
+ assert.deepEqual(names('calc.py in demo/app (GitHub) is broken'),['demo/app']);
+ assert.deepEqual(names('Please merge PR #1 on demo/app (it is on GitHub).'),['demo/app']);
+ assert.deepEqual(names("The checks on demo/app's main branch are red."),['demo/app']);
+ assert.deepEqual(names('See https://github.com/anthony-firn/evolve-llm/pull/4'),['anthony-firn/evolve-llm']);
+ assert.deepEqual(names('Run python3 tests/vm_browser_test.py and fix web/app.js'),[]);
+});
+
+test('a request about the repository the paired computer builds says to build and test there',async()=>{
+ const seen=[];
+ const workspace={cwd:'/home/user',vm:{read:async()=>({ok:false})},path:p=>p,request:async()=>({code:0,stdout:'',stderr:''})};
+ let building='demo/app';
+ const task=createPiTask({linux:{cwd:'/home/user',building:()=>building},workspace,network:{options:()=>({enabled:false})},turn:async m=>{seen.push(m.at(-1).content);return{text:'Done.',reason:'end'}}});
+ await task.run('Fix the tests of the GitHub repository demo/app.');
+ assert.match(seen[0],/Your computer is paired for building demo\/app: in its clone, cargo, npm, npx and node run on the computer/);
+ building=null;await task.run('Fix the tests of the GitHub repository demo/app.');
+ assert.doesNotMatch(seen.at(-1),/paired for building/);
 });

@@ -30,6 +30,8 @@ export const MODELS = [
     file: 'Llama-3.2-3B-Instruct-Q4_K_M.gguf', bytes: 2019377696, quant: 'Q4_K_M', note: 'Needs about 3 GB of GPU memory.', ...LLAMA },
   { id: 'qwen3-4b', name: 'Qwen3 4B', maker: 'Qwen', repo: 'Qwen/Qwen3-4B-GGUF',
     file: 'Qwen3-4B-Q4_K_M.gguf', bytes: 2497280256, quant: 'Q4_K_M', note: 'Largest here. Needs about 3.5 GB of GPU memory.', thinking: true, ...APACHE },
+  { id: 'qwen3-4b-2507', name: 'Qwen3 4B Instruct 2507', maker: 'Qwen', repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF',
+    file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf', bytes: 2497281120, quant: 'Q4_K_M', note: 'The July 2025 update of Qwen3 4B: better at using tools. A good coding assistant for most computers.', ...APACHE },
 ];
 
 // Mixture-of-experts models. The ones larger than GPU memory keep their attention weights on the
@@ -41,6 +43,9 @@ export const LARGE = [
   { id: 'olmoe-1b-7b', name: 'OLMoE 1B-7B', maker: 'Ai2', repo: 'allenai/OLMoE-1B-7B-0125-Instruct-GGUF',
     file: 'OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf', bytes: 4210000000, quant: 'Q4_K_M', params: '7B, 1.3B active',
     note: '64 experts, 8 per token. Fits on GPUs with about 5 GB.', ...APACHE },
+  { id: 'qwen3-coder-30b-a3b', name: 'Qwen3 Coder 30B-A3B', maker: 'Qwen', repo: 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF',
+    file: 'Qwen3-Coder-30B-A3B-Instruct-UD-IQ3_XXS.gguf', bytes: 12848766112, quant: 'UD-IQ3_XXS', params: '30B, 3.3B active',
+    note: 'Trained for coding agents. Runs on the GPU with 14 GB free; streams experts from storage with less.', ...APACHE },
   { id: 'qwen3-30b-a3b', name: 'Qwen3 30B-A3B', maker: 'Qwen', repo: 'unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF',
     file: 'Qwen3-30B-A3B-Instruct-2507-UD-Q2_K_XL.gguf', bytes: 11790000000, quant: 'UD-Q2_K_XL', params: '30B, 3.3B active',
     note: 'Strong general model. Streams experts from storage when GPU memory is short.', ...APACHE },

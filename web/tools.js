@@ -20,7 +20,14 @@ function call(obj, allowed = NAMES) {
   if (typeof args === 'string') {
     try { args = JSON.parse(args); } catch { args = {}; }
   }
-  return allowed.has(name) && args && typeof args === 'object' ? { name, args } : null;
+  if (!args || typeof args !== 'object') return null;
+  if (allowed.has(name)) return { name, args };
+  // A small model may call a command as if it were a tool: {"name": "git", "arguments":
+  // {"command": "commit -m 'x'"}}. With a bash tool, that is the command line "git commit -m 'x'".
+  const rest = typeof args.command === 'string' ? args.command : typeof args.args === 'string' ? args.args : Array.isArray(args.args) ? args.args.join(' ') : null;
+  if (allowed.has('bash') && typeof name === 'string' && /^[a-z][\w.+-]*$/.test(name) && rest !== null && Object.keys(args).length === 1)
+    return { name: 'bash', args: { command: rest.trim().startsWith(name + ' ') || rest.trim() === name ? rest.trim() : `${name} ${rest}`.trim() } };
+  return null;
 }
 
 function parseJson(text) {
@@ -126,6 +133,13 @@ export function parseToolCalls(text, allowed = NAMES, types = null) {
   const calls = [];
   for (const m of text.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g)) {
     const c = call(parseJson(m[1]), allowed);
+    if (c) calls.push(c);
+  }
+  // Small models often end the reply right after the JSON, without </tool_call>. What follows
+  // the last opening tag still counts when it is complete JSON (a cut-off call does not parse).
+  const open = text.lastIndexOf('<tool_call>');
+  if (open >= 0 && !text.slice(open).includes('</tool_call>')) {
+    const c = call(parseJson(text.slice(open + '<tool_call>'.length).trim()), allowed);
     if (c) calls.push(c);
   }
   if (calls.length) return calls;

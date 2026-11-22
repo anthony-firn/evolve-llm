@@ -28,7 +28,7 @@ SCRIPT = [
     {"name": "bash", "arguments": {"command": "cd app"}},  # carries over to the next calls
     {"name": "read", "arguments": {"path": "README.md"}},
     {"name": "edit", "arguments": {"path": "README.md", "oldText": "# Demo", "newText": "# Demo\n\nBuilt by Pi."}},
-    {"name": "bash", "arguments": {"command": "git checkout -b pi-readme\ngit commit -m 'Describe the project'\ngit push"}},  # one command per line
+    {"name": "bash", "arguments": {"command": "cd app && git checkout -b pi-readme\ngit commit -m 'Describe the project'\ngit push"}},  # cd app again, from inside app; one command per line
     {"name": "bash", "arguments": {"command": "gh pr create --title 'Describe the project' --body 'From Pi' && gh pr merge"}},
 ]
 
@@ -89,20 +89,21 @@ def main():
           vmClient.configure({ github: { token: 't', autonomy: 2, api: origin + '/mockgh/api', raw: origin + '/mockgh/raw' } });
           const asked = [];
           vmClient.onAsk = (q) => { asked.push(q); return true; };
-          let turn = 0;
+          let turn = 0, firstRequest = null;
           const events = [];
           const task = createPiTask({
             workspace: new VmWorkspace(vmClient, { cwd: '/home/user' }),
             network: { options: () => ({ enabled: false }) },
             linux: { cwd: '/home/user' },
             onEvent: (e) => { if (e.type === 'tool-result') events.push([e.isError, JSON.stringify(e.result).slice(0, 2000)]); },
-            turn: async () => {
+            turn: async (messages) => {
+              firstRequest ??= messages.find((m) => m.role === 'user')?.content;
               const call = script[turn++];
               return call ? { text: `<tool_call>${JSON.stringify(call)}</tool_call>`, reason: 'end' } : { text: 'Opened a pull request.', reason: 'end' };
             },
           });
-          const r = await task.run('Describe the project in its README and open a pull request.');
-          return { calls: r.calls, events, asked };
+          const r = await task.run('In the GitHub repository demo/app, describe the project in its README and open a pull request.');
+          return { calls: r.calls, events, asked, firstRequest };
         }""", {"origin": origin, "script": SCRIPT})
         failed = [e for e in result["events"] if e[0]]
         check(result["calls"] == len(SCRIPT) and len(failed) == 1, f"every tool call ran, one failing on purpose ({result['calls']} calls; failures {failed})")
@@ -115,6 +116,8 @@ def main():
         main = gh.FAKE.trees[gh.FAKE.commits[gh.FAKE.refs["main"]]["tree"]]
         check(gh.FAKE.pulls and gh.FAKE.pulls[-1].get("merged") and gh.FAKE.blobs[main["README.md"]] == b"# Demo\n\nBuilt by Pi.\n", "Pi merged it once approved")
         check(len(result["asked"]) == 1 and result["asked"][0].startswith("Merge pull request #1"), f"only the merge asked the person ({result['asked']})")
+        check(any("so this ran cd /home/user/app (where the task began)" in e[1] for e in result["events"]), "a repeated cd app runs from where the task began")
+        check("To work on demo/app, first run: gh repo clone demo/app, then cd app" in (result["firstRequest"] or ""), f"the request names the clone command ({result['firstRequest']!r:.200})")
         shell = [e[1] for e in result["events"] if "exit code" in e[1]]
         check(shell and all("in /home/user" in t for t in shell) and any("in /home/user/app" in t for t in shell), "shell results read as text with the directory")
         browser.close()

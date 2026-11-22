@@ -6,6 +6,9 @@
 // WebAssembly.promising) while the others keep running. The `evolve` imports give the shell
 // what WASI lacks: starting programs, waiting for them, pipes and the terminal's foreground.
 
+/** The start of a program file that is fetched the first time it runs (see module()). */
+export const LAZY = '#!evolve-lazy '; // `#!` so the kernel counts it as a program
+
 const E = { SUCCESS: 0, AGAIN: 6, BADF: 8, CHILD: 12, INVAL: 28, NOENT: 44, NOSYS: 52, NOTSUP: 58, FAULT: 21 };
 const ALL_RIGHTS = 0x1fffffffn;
 const enc = new TextEncoder();
@@ -38,6 +41,9 @@ export class Host {
       write('pi: the agent is not available here\n');
       return 1;
     };
+    // The paired computer (builds and tests): ({type, data}) -> answer, and runs that stream.
+    this.computer = async () => ({ error: 'no computer is paired for building' });
+    this.computerRun = async () => 127;
   }
 
   /** One request from a program: only GitHub's API and raw files, with the token for the API. */
@@ -88,8 +94,17 @@ export class Host {
   }
 
   async module(path) {
-    const bytes = this.vm.read_file(path);
+    let bytes = this.vm.read_file(path);
     if (!bytes) throw new Error(`${path}: not found`);
+    // A program loaded on first use (python3): the file names it in bin/ next to this script.
+    const lazy = dec.decode(bytes.subarray(0, 64));
+    if (lazy.startsWith(LAZY)) {
+      const name = lazy.slice(LAZY.length).trim();
+      const r = await fetch(new URL(`./bin/${name}`, import.meta.url));
+      if (!r.ok) throw new Error(`${name} is not part of this build (HTTP ${r.status})`);
+      bytes = new Uint8Array(await r.arrayBuffer());
+      this.vm.write_file(path, bytes);
+    }
     const key = `${path}:${bytes.length}:${bytes[bytes.length - 1]}`;
     let m = this.modules.get(key);
     if (!m) {
@@ -108,6 +123,7 @@ export class Host {
     const path = this.vm.which(pid, argv[0], pathVar);
     if (!path) return null;
     const head = this.vm.read_file(path).subarray(0, 256);
+    if (dec.decode(head).startsWith(LAZY)) return [path, argv]; // fetched when it runs (module())
     if (head[0] === 0x23 && head[1] === 0x21) {
       const line = dec.decode(head).split('\n')[0].slice(2).trim().split(/\s+/);
       let interp = line[0];
@@ -514,6 +530,32 @@ export class Host {
           host.changed();
         };
         const code = await host.agent(str(taskPtr, taskLen), str(cwdPtr, cwdLen), write, pid);
+        view().setInt32(statusPtr, code, true);
+        return 0;
+      }),
+      computer_call: new WebAssembly.Suspending(async (reqPtr, reqLen, outLenPtr) => {
+        check();
+        let answer;
+        try {
+          answer = await host.computer(JSON.parse(str(reqPtr, reqLen)), pid);
+        } catch (e) {
+          answer = { error: e?.message || String(e) };
+        }
+        check();
+        const out = enc.encode(JSON.stringify(answer ?? {}));
+        host.http.set(pid, out);
+        view().setUint32(outLenPtr, out.length, true);
+        return 0;
+      }),
+      computer_run: new WebAssembly.Suspending(async (reqPtr, reqLen, statusPtr) => {
+        check();
+        // The command's output goes to this program's standard output as it arrives.
+        const write = (text) => {
+          if (!vm.running(pid)) return;
+          vm.fd_write(pid, 1, enc.encode(text));
+          host.changed();
+        };
+        const code = await host.computerRun(JSON.parse(str(reqPtr, reqLen)), write, pid);
         view().setInt32(statusPtr, code, true);
         return 0;
       }),
