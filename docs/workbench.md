@@ -146,6 +146,13 @@ files not committed yet. First run: git commit -m "MESSAGE"”), so a small mode
 help` and `gh help` print a short recipe. Switching, pulling and merging need everything committed
 and pushed first.
 
+Small models make the same slips; the tools catch them. `git commit` refuses when a file of 20 or
+more lines loses most of them (it looks overwritten, for example with `>` instead of `>>`) and
+says how to undo it; `--allow-shrink` commits it anyway. Every commit prints each file's added and
+removed lines, and the question before a push says the same ("README.md +1 -0"). `edit FILE OLD
+NEW` is a command in the VM: OLD becomes NEW where it occurs exactly once (`\n` is a new line).
+A failed shell command comes back with notes on what to run instead.
+
 Settings → **GitHub** sets what the assistant (in the chat or `pi`) may do:
 
 - **Commit locally only**: `git push`, `gh pr create`, merging and write calls through `gh api`

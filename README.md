@@ -48,6 +48,12 @@ announced on Nostr. See [docs/browser.md](docs/browser.md).
   stays on the GPU; the rest is read from storage while the model runs. Mixture-of-experts
   models keep their attention weights on the GPU and read only the experts each token chooses,
   through an expert cache. The operating system's file cache keeps recently read weights in RAM.
+- **Uses both GPUs.** On a computer with two (an integrated and a discrete GPU, with Highest
+  performance chosen), a model that does not fit in the faster GPU's free memory runs as many
+  layers there as fit and the rest on the other GPU, from a second worker in the same page, and
+  each prompt passes through both at once. Free memory is measured when the model loads. With
+  1.75 GB free on an RTX 3050 laptop GPU beside its Intel iGPU, Qwen3 4B read a 3,941-token
+  prompt 1.8x as fast and wrote 1.35x as fast as on the iGPU alone.
 - **Runs models larger than your device.** The largest open models (Kimi K3.1 Pro is 593 GB at
   its smallest) do not fit on most laptops' disks. These run straight from Hugging Face: each
   forward pass fetches the byte ranges it needs, many requests at once, and a capped cache in
