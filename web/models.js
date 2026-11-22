@@ -7,6 +7,18 @@ const MIT = { license: 'MIT', licenseUrl: 'https://opensource.org/license/mit' }
 const KIMI = { license: 'Modified MIT', licenseUrl: 'https://huggingface.co/moonshotai/Kimi-K2-Instruct-0905/blob/main/LICENSE' };
 const KIMI_K31 = { license: 'Kimi K3.1 Pro License', licenseUrl: 'https://huggingface.co/moonshotai/Kimi-K3.1-Pro/blob/main/LICENSE' };
 
+/** For each kind of request (web/chat-development.mjs kindOf), the catalog models that did that
+ *  work best in tests/agent_bench.py, best first. With "Switch models by kind of request" on, the
+ *  chat loads the first one saved on this device before answering. Measured on a laptop with an
+ *  RTX 3050 and an Intel GPU (2026-11-22); update from new benchmark runs. */
+export const BEST_FOR = {
+  coding: ['qwen3-4b', 'qwen3-4b-2507'],
+  research: ['qwen3-4b-2507', 'qwen3-4b'],
+  law: ['qwen3-4b-2507', 'qwen3-4b'],
+  browser: ['qwen3-4b-2507', 'qwen3-4b'],
+  chat: ['qwen3-4b-2507', 'qwen3-4b'],
+};
+
 export const MODELS = [
   { id: 'smollm2-135m', name: 'SmolLM2 135M', maker: 'Hugging Face', repo: 'bartowski/SmolLM2-135M-Instruct-GGUF',
     file: 'SmolLM2-135M-Instruct-Q8_0.gguf', bytes: 144811360, quant: 'Q8_0', note: 'Tiny. A quick first test.', ...APACHE },

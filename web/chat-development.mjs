@@ -14,6 +14,21 @@ export function wantsBrowser(text) {
   return BROWSER_ACTION.test(t) && BROWSER_PLACE.test(t) && !/\b[\w-]+\.(?:html?|css|[cm]?js|json|txt|md|csv)\b|\/workspace\//i.test(t);
 }
 
+const LAW = /§|\b(?:laws?|legal(?:ly)?|statutes?|ordinances?|regulations?|(?:city|civil|penal|tax|municipal) code|court|lawsuit|sue|liab(?:le|ility)|contract|lease|landlord|tenants?|eviction|attorney|lawyer|copyright|trademark|patent|GDPR|CCPA|compliance)\b/i;
+const CODING = /\b(?:code|coding|function|bug|fix|tests?|compile|build|refactor|repo(?:sitory)?|clone|commit|branch|pull request|PR|merge|git|gh|CI|npm|cargo|python3?|javascript|typescript|rust|html|css|script|app|game|api|sql)\b|\.(?:py|[cm]?js|ts|rs|html?|css|json|md|toml|ya?ml)\b/i;
+const RESEARCH = /\b(?:look (?:up|into)|research|search (?:for|the web)|find out|sources?|cite|citation|according to|latest|news|who (?:is|was|were|designed|invented|founded|wrote)|when (?:was|did|is|were)|what year|how many)\b/i;
+
+/** What kind of work a request is: browser (a live web page), law, coding, research or chat.
+ *  Used to pick the model that does that kind of work best on this device. */
+export function kindOf(text) {
+  const t = String(text);
+  if (wantsBrowser(t)) return 'browser';
+  if (LAW.test(t)) return 'law';
+  if (CODING.test(t)) return 'coding';
+  if (RESEARCH.test(t)) return 'research';
+  return 'chat';
+}
+
 export function wantsSnakeStarter(text) {
   const creation=/\b(make|build|create|develop|implement|code)\b/i.test(text);
   const newGame=/\b(?:a|an|new|another)\s+(?:[\w-]+\s+){0,2}snake\s+(?:game|clone)\b/i.test(text);

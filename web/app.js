@@ -1,7 +1,7 @@
-import { LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from './models.js';
+import { BEST_FOR, LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from './models.js';
 import { renderMarkdown, splitThinking } from './markdown.js';
 import { stripToolCalls } from './tools.js';
-import { wantsSnakeStarter, wantsBrowser, createWorkView } from './chat-development.mjs';
+import { wantsSnakeStarter, wantsBrowser, createWorkView, kindOf } from './chat-development.mjs';
 import { trace } from './trace.mjs';
 import { newChatId, saveChat, getChat, listChats, deleteChat } from './chats.mjs';
 
@@ -242,7 +242,7 @@ function renderStorage() {
 
 let loadStarted = 0;
 
-async function startLoad(source) {
+async function startLoad(source, { keepChat = false } = {}) {
   if (['agent','preparing'].includes(state.phase)) { $('status-line').textContent = 'Stop the current reply before loading another model.'; return; }
   if (!state.adapter?.ok) return;
   closeDrawer();
@@ -253,8 +253,11 @@ async function startLoad(source) {
   const label = known ? known.name : source.kind === 'file' ? first.replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '') : source.name;
   state.loading = { label, key: known ? cacheKey(known.repo, known.file) : source.key, id: known ? known.id : source.id, kind: source.kind, stream: Boolean(source.stream) };
   state.loaded = null;
-  for(const m of state.messages)m.workView?.dispose();
-  state.messages = [];state.chatId=newChatId();assistant?.reset();
+  // Switching models for a kind of request keeps the conversation; choosing one starts afresh.
+  if (!keepChat) {
+    for(const m of state.messages)m.workView?.dispose();
+    state.messages = [];state.chatId=newChatId();assistant?.reset();
+  }
   renderMessages();
   $('loading-title').textContent = label;
   for (const li of $('loading-steps').children) li.dataset.state = '';
@@ -697,6 +700,10 @@ function onLoaded(msg) {
   $('status-line').textContent = 'Replies are generated on this device. Responses can be wrong; check anything important.';
   setPhase('ready');
   $('prompt').focus();
+  // A switch for a kind of request: answer the request that asked for it.
+  const after = state.afterLoad;
+  state.afterLoad = null;
+  if (after) { $('status-line').textContent = after.note; after.run(); }
 }
 
 function formatParams(n) {
@@ -830,7 +837,29 @@ function send(text) {
   text = text.trim();
   if (!text || state.phase !== 'ready') return;
   state.messages.push({ role: 'user', content: text });
+  const better = betterModelFor(text);
+  if (better) {
+    trace({ type: 'switch', chat: state.chatId, kind: better.kind, from: state.loaded.label, to: better.name });
+    state.afterLoad = { run: runResponse, note: `Switched to ${better.name}, which does ${better.kind} best on this device.` };
+    startLoad(better.entry, { keepChat: true });
+    return;
+  }
   runResponse();
+}
+
+/** The saved model that does this kind of request best (BEST_FOR in models.js), when it is not the
+ *  one loaded and switching is on. Only models already saved on this device: no downloads. */
+function betterModelFor(question) {
+  if (state.settings.autoSwitch === false || !state.loaded?.tools || localComputer.connected) return null;
+  const kind = kindOf(question);
+  for (const id of BEST_FOR[kind] || []) {
+    const m = ALL.find((x) => x.id === id);
+    if (!m) continue;
+    const key = cacheKey(m.repo, m.file);
+    if (state.loaded.key === key) return null;
+    if (cachedEntry(key)?.complete) return { kind, name: m.name, entry: catalogEntry(m) };
+  }
+  return null;
 }
 
 function regenerate() {
@@ -1030,6 +1059,8 @@ function onDone(d) {
 
 function onError({ during, message }) {
   if (during === 'load') {
+    if (state.afterLoad) message = `Switching models for this request did not work: ${message}`;
+    state.afterLoad = null;
     state.loading = null;
     state.loaded = null;
     $('loading-bar').classList.remove('indeterminate');
@@ -1230,6 +1261,7 @@ function fillSettings() {
   form.elements.shareUpload.value = String(s.shareUpload ?? 2);
   form.elements.thinking.checked = Boolean(s.thinking);
   form.elements.poolGpus.checked = s.poolGpus !== false;
+  form.elements.autoSwitch.checked = s.autoSwitch !== false;
   form.elements.internet.checked = Boolean(s.internet);
   form.elements.jinaKey.value = s.jinaKey || '';
   form.elements.githubToken.value = s.githubToken || '';
