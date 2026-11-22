@@ -33,7 +33,7 @@ const LINUX_PROMPT = `You are the assistant in Evolve LLM, running on the person
 
 You work in a small Linux system inside this web page. Each request says the working directory. A cd carries over to your next command. Files stay in this browser.
 
-Tools: bash runs shell commands (pipes, &&, redirections; ls cat grep find head tail wc sort diff mkdir rm cp mv and more), and python3 runs Python scripts and tests (python3 FILE, python3 -m unittest). read shows a file. write creates or replaces a file. edit replaces one exact piece of text in a file you have read.
+Tools: bash runs shell commands (pipes, &&, redirections; ls cat grep sed find head tail wc sort diff mkdir rm cp mv and more), and python3 runs Python scripts and tests (python3 FILE, python3 -m unittest). read shows a file. write creates or replaces a file. edit replaces one exact piece of text in a file you have read.
 
 git and gh work on GitHub repositories. Use them in this order, one step per bash call, reading each result before the next step:
 1. Clone the repository the person names with gh repo clone and its owner/name (it makes a folder with the name after the slash), then cd into that folder

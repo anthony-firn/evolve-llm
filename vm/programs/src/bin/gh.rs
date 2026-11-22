@@ -583,6 +583,15 @@ fn commit(r: &Repo, args: &[String]) -> R<()> {
             if before >= 20 && after * 2 < before && removed * 5 >= before * 4 {
                 return Err(format!("{p} would go from {before} lines to {after}, so nothing was committed. It looks overwritten (for example with > instead of >>). Undo it with: git restore {p}   (if you meant it: git commit -m \"MESSAGE\" --allow-shrink)"));
             }
+            // A shorter file that lost a function or class it had: most likely rewritten from
+            // memory (echo '...' > calc.py) rather than changed.
+            let defs = |t: &[u8]| String::from_utf8_lossy(t).lines().filter_map(definition).collect::<Vec<_>>();
+            let (had, has) = (defs(&old), defs(&new));
+            let lost: Vec<&String> = had.iter().filter(|d| !has.contains(d)).collect();
+            if after < before && !lost.is_empty() {
+                let names = lost.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ");
+                return Err(format!("{p} would lose {names} ({before} lines to {after}), so nothing was committed. It looks rewritten instead of changed. Undo it with: git restore {p}, then change only the lines that need it: edit {p} 'old text' 'new text'   (if you meant to remove it: git commit -m \"MESSAGE\" --allow-shrink)"));
+            }
         }
     }
     let summary = change_summary(r, &head, &work);
@@ -696,6 +705,18 @@ fn pr_number(r: &Repo, args: &[String], verb: &str) -> R<String> {
             }
         }
     }
+}
+
+/// "def sub", "class App", "fn main", "function draw": a line that defines something by name.
+fn definition(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    for k in ["async def ", "def ", "class ", "pub fn ", "pub(crate) fn ", "fn ", "export default function ", "export async function ", "export function ", "async function ", "function ", "pub struct ", "struct ", "pub enum ", "enum "] {
+        if let Some(rest) = t.strip_prefix(k) {
+            let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            return (!name.is_empty()).then(|| format!("{k}{name}"));
+        }
+    }
+    None
 }
 
 /// "2 passed, 1 failed" for the checks on a commit.

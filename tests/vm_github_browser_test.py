@@ -385,6 +385,11 @@ def main():
         check(code != 0 and "Long" in out and "long.txt would go from 40 lines to 1, so nothing was committed" in err and "git restore long.txt" in err, f"an overwritten file is not committed ({out!r} {err!r})")
         code, out, err = sh("cd guard && git commit -m Oops --allow-shrink && git log --oneline -n 1")
         check(code == 0 and "long.txt +1 -40" in out, f"unless asked, and the commit says what changed ({out!r} {err!r})")
+        # A shorter file that lost a function it had looks rewritten from memory: no commit.
+        code, out, err = sh("cd guard && printf 'def add(a, b):\\n    return a - b\\n\\n\\ndef sub(a, b):\\n    return a - b\\n' > calc.py && git commit -m Calc && printf 'def add(a, b):\\n    return a + b\\n' > calc.py && git commit -m Fix")
+        check(code != 0 and "calc.py would lose def sub (6 lines to 2), so nothing was committed" in err and "edit calc.py 'old text' 'new text'" in err, f"a file that lost a function is not committed ({err!r})")
+        code, out, err = sh("cd guard && git restore calc.py && sed -i '2s/a - b/a + b/' calc.py && git commit -m Fix")
+        check(code == 0 and "calc.py +1 -1" in out, f"a one-line change with sed is committed ({out!r} {err!r})")
         code, out, _ = sh("git help && gh help")
         check("git merge BRANCH" in out and "gh pr merge" in out and "always asks the person" in out, "help lists merging")
 

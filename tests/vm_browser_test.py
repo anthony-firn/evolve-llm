@@ -40,6 +40,9 @@ CASES = [
     ("echo 'a\\nb' && echo -E 'c\\nd' && echo -n x && echo 'y\\cz'", 0, "a\nb\nc\\nd\nxy"),
     ("printf 'one\\ntwo\\n' > l.txt && edit l.txt 2 two 2 && cat l.txt && rm l.txt", 0, "edited l.txt\none\n2\n"),
     ("printf 'one\\n' > s.txt; edit s.txt one one 2>&1; echo status=$?; rm s.txt", 0, "edit: OLD and NEW are the same, so nothing would change. Show the lines with grep -n \"WORDS\" -A3 s.txt, then edit s.txt 'exact old text' 'corrected text'\nstatus=1\n"),
+    # sed: s with g, \( \) groups and & (+ and ( ) are plain in basic regexes), addresses, ranges, d, a, -n, -i.
+    ("printf 'a+b x\naaa\none\ntwo\nlast\n' > s.txt && sed -i 's/a+b/(&)/' s.txt && sed -n '1p;2s/a/b/gp;3s/\\(o\\)n/[\\1]/p' s.txt", 0, "(a+b) x\nbbb\n[o]e\n"),
+    ("sed -e '1,2d' -e '/one/a inserted\\n2' -e '$s/last/END/' s.txt && sed -n '$=' s.txt 2>&1; sed 's//x/' s.txt 2>&1; rm s.txt", 0, "one\ninserted\n2\ntwo\nEND\nsed: unknown command = (s, d, p, q, a, i, c are available)\nsed: empty regular expression: write the text to find, as in s/old/new/\n"),
     ("read notes.txt 2>&1; echo status=$?", 0, "read: notes.txt is not a variable name (read takes a line of input; to show a file, use: cat notes.txt)\nstatus=2\n"),
     # python3: RustPython, loaded on first use; scripts, the standard library and unittest.
     ("python3 -c 'import json; print(json.dumps({\"sum\": 2 + 3}))'", 0, '{"sum": 5}\n'),

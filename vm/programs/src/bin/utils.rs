@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const NAMES: &[&str] = &[
     "ls", "cat", "cp", "mv", "rm", "mkdir", "rmdir", "touch", "head", "tail", "wc", "sort", "uniq", "tee", "grep", "find", "env", "sleep",
     "basename", "dirname", "seq", "tr", "cut", "date", "yes", "stat", "ln", "readlink", "realpath", "clear", "uname", "whoami", "du", "diff",
-    "test", "[", "printf", "nl", "rev", "xxd", "hostname", "id", "nproc", "df", "file", "edit",
+    "test", "[", "printf", "nl", "rev", "xxd", "hostname", "id", "nproc", "df", "file", "edit", "sed",
 ];
 
 type R = Result<i32, String>;
@@ -266,6 +266,350 @@ fn glob_match(pat: &[char], name: &[char]) -> bool {
         Some('?') => !name.is_empty() && glob_match(&pat[1..], &name[1..]),
         Some(&c) => name.first() == Some(&c) && glob_match(&pat[1..], &name[1..]),
     }
+}
+
+// ---- sed: the forms models and people use most ----
+
+enum SedAddr {
+    Line(usize),
+    Last,
+    Re(regex::Regex),
+}
+
+enum SedOp {
+    Sub(regex::Regex, String, bool, bool, usize),
+    Del,
+    Print,
+    Quit,
+    Append(String),
+    Insert(String),
+    Change(String),
+}
+
+struct SedCmd {
+    a1: Option<SedAddr>,
+    a2: Option<SedAddr>,
+    neg: bool,
+    op: SedOp,
+    active: bool,
+}
+
+/// A basic regular expression (sed's default) as a Rust regex: \( \) \| \+ \? \{ \} are the
+/// operators there, and ( ) | + ? { } are plain characters.
+fn sed_regex(pat: &str, extended: bool, icase: bool) -> Result<regex::Regex, String> {
+    if pat.is_empty() {
+        return Err("sed: empty regular expression: write the text to find, as in s/old/new/".into());
+    }
+    let pat = if extended {
+        pat.to_string()
+    } else {
+        let mut o = String::new();
+        let mut it = pat.chars();
+        while let Some(c) = it.next() {
+            match c {
+                '\\' => match it.next() {
+                    Some(d) if "(){}|+?".contains(d) => o.push(d),
+                    Some(d) => {
+                        o.push('\\');
+                        o.push(d);
+                    }
+                    None => o.push_str("\\\\"),
+                },
+                c if "(){}|+?".contains(c) => {
+                    o.push('\\');
+                    o.push(c);
+                }
+                c => o.push(c),
+            }
+        }
+        o
+    };
+    regex::RegexBuilder::new(&pat).case_insensitive(icase).build().map_err(|e| format!("sed: {e}"))
+}
+
+fn sed_parse(script: &str, extended: bool) -> Result<Vec<SedCmd>, String> {
+    let c: Vec<char> = script.chars().collect();
+    let mut i = 0;
+    let mut cmds = Vec::new();
+    // Text up to an unescaped delimiter; \DELIM is the delimiter itself.
+    let delimited = |i: &mut usize, d: char| -> Result<String, String> {
+        let mut t = String::new();
+        while *i < c.len() && c[*i] != d {
+            if c[*i] == '\\' && *i + 1 < c.len() {
+                if c[*i + 1] != d {
+                    t.push('\\');
+                }
+                t.push(c[*i + 1]);
+                *i += 2;
+            } else {
+                t.push(c[*i]);
+                *i += 1;
+            }
+        }
+        if *i >= c.len() {
+            return Err(format!("sed: unterminated expression (missing {d}): write it as s/old/new/"));
+        }
+        *i += 1;
+        Ok(t)
+    };
+    let address = |i: &mut usize| -> Result<Option<SedAddr>, String> {
+        if *i < c.len() && c[*i].is_ascii_digit() {
+            let mut n = 0usize;
+            while *i < c.len() && c[*i].is_ascii_digit() {
+                n = n * 10 + c[*i].to_digit(10).unwrap() as usize;
+                *i += 1;
+            }
+            return Ok(Some(SedAddr::Line(n)));
+        }
+        if *i < c.len() && c[*i] == '$' {
+            *i += 1;
+            return Ok(Some(SedAddr::Last));
+        }
+        if *i < c.len() && c[*i] == '/' {
+            *i += 1;
+            return Ok(Some(SedAddr::Re(sed_regex(&delimited(i, '/')?, extended, false)?)));
+        }
+        Ok(None)
+    };
+    loop {
+        while i < c.len() && (c[i].is_whitespace() || c[i] == ';') {
+            i += 1;
+        }
+        if i >= c.len() {
+            break;
+        }
+        let a1 = address(&mut i)?;
+        let mut a2 = None;
+        if a1.is_some() && i < c.len() && c[i] == ',' {
+            i += 1;
+            a2 = address(&mut i)?;
+            if a2.is_none() {
+                return Err("sed: a range needs an end, as in 2,5p".into());
+            }
+        }
+        while i < c.len() && c[i] == ' ' {
+            i += 1;
+        }
+        let neg = i < c.len() && c[i] == '!';
+        if neg {
+            i += 1;
+        }
+        let Some(&cmd) = c.get(i) else { return Err("sed: missing command after the address".into()) };
+        i += 1;
+        let op = match cmd {
+            's' => {
+                let d = *c.get(i).ok_or("sed: s needs /old/new/")?;
+                i += 1;
+                let pat = delimited(&mut i, d)?;
+                let rep = delimited(&mut i, d)?;
+                let (mut g, mut p, mut icase, mut nth) = (false, false, false, 0usize);
+                while i < c.len() && !c[i].is_whitespace() && c[i] != ';' && c[i] != '}' {
+                    match c[i] {
+                        'g' => g = true,
+                        'p' => p = true,
+                        'i' | 'I' => icase = true,
+                        d if d.is_ascii_digit() => nth = nth * 10 + d.to_digit(10).unwrap() as usize,
+                        o => return Err(format!("sed: unknown s flag {o} (g, p, i or a number)")),
+                    }
+                    i += 1;
+                }
+                SedOp::Sub(sed_regex(&pat, extended, icase)?, rep, g, p, nth.max(1))
+            }
+            'd' => SedOp::Del,
+            'p' => SedOp::Print,
+            'q' => SedOp::Quit,
+            'a' | 'i' | 'c' => {
+                while i < c.len() && c[i] == ' ' {
+                    i += 1;
+                }
+                if i < c.len() && c[i] == '\\' {
+                    i += 1;
+                    if i < c.len() && c[i] == '\n' {
+                        i += 1;
+                    }
+                }
+                let mut t = String::new();
+                while i < c.len() && c[i] != '\n' {
+                    t.push(c[i]);
+                    i += 1;
+                }
+                let t = t.replace("\\n", "\n").replace("\\t", "\t");
+                match cmd {
+                    'a' => SedOp::Append(t),
+                    'i' => SedOp::Insert(t),
+                    _ => SedOp::Change(t),
+                }
+            }
+            '{' | '}' => return Err("sed: { } groups are not available here; use several -e expressions".into()),
+            o => return Err(format!("sed: unknown command {o} (s, d, p, q, a, i, c are available)")),
+        };
+        cmds.push(SedCmd { a1, a2, neg, op, active: false });
+    }
+    Ok(cmds)
+}
+
+fn sed_expand(rep: &str, caps: &regex::Captures) -> String {
+    let mut s = String::new();
+    let mut it = rep.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '&' => s.push_str(caps.get(0).map_or("", |m| m.as_str())),
+            '\\' => match it.next() {
+                Some(d @ '0'..='9') => s.push_str(caps.get(d as usize - '0' as usize).map_or("", |m| m.as_str())),
+                Some('n') => s.push('\n'),
+                Some('t') => s.push('\t'),
+                Some(o) => s.push(o),
+                None => s.push('\\'),
+            },
+            _ => s.push(c),
+        }
+    }
+    s
+}
+
+fn sed_run(cmds: &mut [SedCmd], text: &str, quiet: bool) -> String {
+    let had_nl = text.ends_with('\n');
+    let lines: Vec<&str> = if text.is_empty() { vec![] } else { text.strip_suffix('\n').unwrap_or(text).split('\n').collect() };
+    let mut out: Vec<String> = Vec::new();
+    let matches = |a: &SedAddr, n: usize, ps: &str, last: bool| match a {
+        SedAddr::Line(k) => n == *k,
+        SedAddr::Last => last,
+        SedAddr::Re(re) => re.is_match(ps),
+    };
+    'lines: for (idx, line) in lines.iter().enumerate() {
+        let (n, last) = (idx + 1, idx + 1 == lines.len());
+        let mut ps = line.to_string();
+        let mut after = Vec::new();
+        for cmd in cmds.iter_mut() {
+            let mut sel = match (&cmd.a1, &cmd.a2) {
+                (None, _) => true,
+                (Some(a1), None) => matches(a1, n, &ps, last),
+                (Some(a1), Some(a2)) => {
+                    if cmd.active {
+                        if match a2 { SedAddr::Line(k) => n >= *k, _ => matches(a2, n, &ps, last) } {
+                            cmd.active = false;
+                        }
+                        true
+                    } else if matches(a1, n, &ps, last) {
+                        cmd.active = !matches!(a2, SedAddr::Line(k) if *k <= n);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if cmd.neg {
+                sel = !sel;
+            }
+            if !sel {
+                continue;
+            }
+            match &cmd.op {
+                SedOp::Sub(re, rep, g, p, nth) => {
+                    let (mut res, mut lastpos, mut count, mut did) = (String::new(), 0, 0, false);
+                    for caps in re.captures_iter(&ps) {
+                        let m = caps.get(0).unwrap();
+                        count += 1;
+                        if count == *nth || (*g && count > *nth) {
+                            res.push_str(&ps[lastpos..m.start()]);
+                            res.push_str(&sed_expand(rep, &caps));
+                            lastpos = m.end();
+                            did = true;
+                            if !*g {
+                                break;
+                            }
+                        }
+                    }
+                    if did {
+                        res.push_str(&ps[lastpos..]);
+                        ps = res;
+                        if *p {
+                            out.push(ps.clone());
+                        }
+                    }
+                }
+                SedOp::Del => continue 'lines,
+                SedOp::Print => out.push(ps.clone()),
+                SedOp::Quit => {
+                    if !quiet {
+                        out.push(ps.clone());
+                    }
+                    out.extend(after);
+                    break 'lines;
+                }
+                SedOp::Append(t) => after.push(t.clone()),
+                SedOp::Insert(t) => out.push(t.clone()),
+                SedOp::Change(t) => {
+                    if !cmd.active {
+                        out.push(t.clone());
+                    }
+                    continue 'lines;
+                }
+            }
+        }
+        if !quiet {
+            out.push(ps);
+        }
+        out.extend(after);
+    }
+    let mut s = out.join("\n");
+    if !out.is_empty() && (had_nl || lines.is_empty()) {
+        s.push('\n');
+    }
+    s
+}
+
+/// sed [-n] [-i] [-E] [-e SCRIPT]... [SCRIPT] [FILE...]: s/RE/NEW/[g p i N], d, p, q, a/i/c TEXT,
+/// with LINE, $ and /RE/ addresses, ranges and !. -i changes the files in place.
+fn sed(args: &[String], out: &mut dyn Write) -> R {
+    let (mut quiet, mut in_place, mut extended) = (false, false, false);
+    let (mut scripts, mut files) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "-n" | "--quiet" | "--silent" => quiet = true,
+            "-E" | "-r" | "--regexp-extended" => extended = true,
+            "-e" | "--expression" => {
+                i += 1;
+                scripts.push(args.get(i).ok_or("sed: -e needs a script")?.clone());
+            }
+            _ if a.starts_with("--in-place") || (a.starts_with("-i") && !a[2..].chars().all(|c| "nEr".contains(c))) => in_place = true,
+            _ if a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "niEr".contains(c)) => {
+                quiet |= a.contains('n');
+                in_place |= a.contains('i');
+                extended |= a.contains('E') || a.contains('r');
+            }
+            _ => files.push(a.to_string()),
+        }
+        i += 1;
+    }
+    if scripts.is_empty() {
+        if files.is_empty() {
+            return Err("usage: sed [-n] [-i] [-E] 's/old/new/' FILE   (also: '3d', '2,5p', '/text/a new line')".into());
+        }
+        scripts.push(files.remove(0));
+    }
+    let mut cmds = sed_parse(&scripts.join("\n"), extended)?;
+    if in_place {
+        if files.is_empty() {
+            return Err("sed: -i needs a file to change".into());
+        }
+        for f in &files {
+            let text = String::from_utf8_lossy(&read_input(f)?).into_owned();
+            for c in cmds.iter_mut() {
+                c.active = false;
+            }
+            fs::write(f, sed_run(&mut cmds, &text, quiet)).map_err(|e| err(e, f))?;
+        }
+        return Ok(0);
+    }
+    let mut text = String::new();
+    for f in if files.is_empty() { vec!["-".to_string()] } else { files } {
+        text.push_str(&String::from_utf8_lossy(&read_input(&f)?));
+    }
+    out.write_all(sed_run(&mut cmds, &text, quiet).as_bytes()).map_err(|e| err(e, "stdout"))?;
+    Ok(0)
 }
 
 fn grep(args: &[String], out: &mut dyn Write) -> R {
@@ -730,6 +1074,7 @@ fn run(name: &str, args: &[String]) -> R {
             Ok(0)
         }
         "grep" => grep(args, out),
+        "sed" => sed(args, out),
         "find" => {
             let mut roots = Vec::new();
             let mut i = 0;
