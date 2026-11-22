@@ -890,7 +890,8 @@ async function runAssistant(question){
         else if(e.type==='retry')trace({type:'retry',chat:state.chatId,message:e.message,output:e.output});
       }});
     calls=result.calls;error=result.error;
-    m.content=result.answer||m.content||(result.calls?'Done.':'');
+    // Never claim success the model did not state: the steps show what actually ran.
+    m.content=result.answer||m.content||(result.calls?'I stopped without saying what I did. The steps above show what actually ran.':'');
     if(result.error)m.content=(m.content?m.content+'\n\n':'')+(m.cancelRequested?'Stopped.':`I stopped before finishing: ${result.error}`);
     if(!m.content.trim())m.content='(no reply)';
     m.stats=result.calls?`${result.calls} step${result.calls===1?'':'s'}`:'';
