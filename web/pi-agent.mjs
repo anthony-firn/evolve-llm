@@ -69,6 +69,21 @@ const shellText = r => [`exit code ${r.code}${r.timedOut?' (timed out)':''}, in 
 /** What a request in the Linux workspace starts with: the working directory and, for a GitHub
  *  repository the request names, where it is cloned or the exact command to clone it. Small
  *  models otherwise skip the clone or copy a placeholder like OWNER/REPO. */
+/** The git steps a request asks for: a pull request needs a push, and a push needs a commit.
+ *  "Do not push" and the like turn a step (and the ones after it) off. */
+export function askedSteps(prompt) {
+  const p = String(prompt);
+  const not = w => new RegExp(`\\b(do not|don't|never|without|no need to)\\s+(\\w+\\s+)?${w}`, 'i').test(p);
+  let pr = /\b(open|create|make|send|submit|raise)\s+(a |an |the )?(new )?(pull request|PR)\b/i.test(p);
+  let push = pr || /\bpush\s+(it|them|this|that|these|those|the|your|my|all|changes?|to|a|branch)\b|\bpush\b\s*([,.;]|$)/im.test(p);
+  // "the commit that…" is a noun, not a request.
+  let commit = push || /(?<!\b(the|a|which|last|first|each|every|that|this)\s)\bcommit\s+(it|them|this|that|these|those|the|your|my|all|changes?|on|to|with)\b/i.test(p);
+  if (not('(open|create|make)')) pr = false;
+  if (not('push')) push = pr = false;
+  if (not('commit')) commit = push = pr = false;
+  return { commit, push, pr };
+}
+
 async function preamble(prompt, workspace, cwd) {
   const lines = [`Working directory: ${cwd}.`];
   const repos = [];
@@ -240,7 +255,18 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
 export function createPiTask({ turn, workspace, network, onEvent = () => {}, modelName = 'Local model', preview, maxTokens = 2048, browser, confirmBrowserAction, browserSnapshotChars, linux = null, native = false, history = [] }) {
   // Call ids in Kimi's form (functions.name:index), which other templates ignore or only match.
   let callIndex=0;
-  let turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, pendingChangeError=false, previewPath=null;const failedCommands=new Map(), seen=new Set(), noted=new Set();let ghRepo=null, stuck=null;
+  let turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, pendingChangeError=false, previewPath=null;const failedCommands=new Map(), seen=new Set(), noted=new Set();
+  // A final reply while a step the request asked for has not happened (small models stop with
+  // "Next steps: commit, push…" or say it is done): git status and gh pr view name the next one.
+  const unfinished=async signal=>{
+    if(!linux||!asked?.commit||declined||nudges>=2)return null;
+    const st=await workspace.request('exec',{command:'git status'},{signal}).catch(()=>null);
+    if(!st||st.code)return null;
+    if(/Changes not committed/.test(st.stdout||''))return {why:'Your changes are not committed yet.',cmd:'git commit -m "What changed"'};
+    if(asked.push&&/is ahead of/.test(st.stdout||''))return {why:'Your commits are not pushed yet.',cmd:'git push'};
+    if(asked.pr){const v=await workspace.request('exec',{command:'gh pr view'},{signal}).catch(()=>null);if(v&&v.code)return {why:'The pull request is not open yet.',cmd:'gh pr create --title "Title" --body "What and why"'};}
+    return null;
+  };let ghRepo=null, stuck=null, asked=null, declined=false, nudges=0;
   const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction}):null;
   const limits=linux?LINUX_LIMITS:browserTools?BROWSER_LIMITS:LIMITS;
   const declarations=(linux?[
@@ -276,6 +302,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       result=await workspace.request('exec',{command:ghRepo?`export GH_REPO=${ghRepo}; ${command}`:command,...(native?{asRoot:args.asRoot===true}:{}),network:network.options()},{signal});
       if(linux&&result.code)try{result.notes=await shellNotes(String(args.command||''),result,workspace,failedCommands,signal)}catch(error){stuck=String(error.message||error);agent.abort();throw error}
       if(moved)result.notes=[moved,...(result.notes||[])];
+      if(/declined by the person/.test(`${result.stdout||''}${result.stderr||''}`))declined=true;
     }
     else if(['read','write','edit'].includes(name)){
       if(linux)args={...args,path:await pathFromStart(args.path,workspace,linux.cwd)};
@@ -346,7 +373,14 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
             const attempted=attemptedToolCall(result.text);
             const empty=!parsed.length&&!stripToolCalls(result.text).replace(/<think>[\s\S]*?(<\/think>|$)/g,'').trim()&&context.messages.at(-1)?.role==='toolResult';
             const failure=attempted&&!parsed.length?'invalid or incomplete tool call':empty?'empty reply':null;
-            if(!failure)break;
+            if(!failure){
+              const next=!parsed.length&&!attempted?await unfinished(options?.signal):null;
+              if(!next)break;
+              nudges++;
+              onEvent({type:'retry',attempt:nudges,message:`Not finished; asking the model to continue (${next.cmd.split(' -')[0]}).`,output:''});
+              messages=[...original,{role:'user',content:`Not finished yet: ${next.why} Make that tool call now: ${next.cmd}. Say a step is done only after its command succeeded.`}];
+              continue;
+            }
             if(repairs>=limits.repairs)throw new Error(failure==='empty reply'?'The model kept replying with nothing after its tool results.':'The model kept returning invalid or incomplete tool calls. No tools from the invalid replies were executed.');
             repairs++;
             if(empty){
@@ -370,5 +404,5 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
-  return {async run(prompt){const pre=linux?await preamble(prompt,workspace,linux.cwd):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
+  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;const pre=linux?await preamble(prompt,workspace,linux.cwd):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
 }

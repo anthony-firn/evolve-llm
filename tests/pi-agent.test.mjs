@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiTask } from '../web/pi-agent.mjs';
+import { createPiTask, askedSteps } from '../web/pi-agent.mjs';
 
 test('real Pi agent loop invokes sandbox tools and feeds their results back to the local transport',async()=>{
  const files=new Map(),events=[];let round=0;
@@ -324,4 +324,37 @@ test('a request about failing CI says where the reason is',async()=>{
  assert.doesNotMatch(seen.at(-1),/To put a line after another line/);
  await task.run('In README.md of demo/app, right after the line "npm test", add the line "npm run lint".');
  assert.match(seen.at(-1),/To put a line after another line, use edit with oldText "that line" and newText "that line\\nnew line"/);
+});
+
+test('askedSteps reads commit, push and pull request from a request, and "do not"',()=>{
+ assert.deepEqual(askedSteps('Fix it, commit it on a new branch, push it and open a pull request.'),{commit:true,push:true,pr:true});
+ assert.deepEqual(askedSteps('Fix it on a new branch named fix-ci, test the fix, push it and open a pull request.'),{commit:true,push:true,pr:true});
+ assert.deepEqual(askedSteps('Commit it on a new branch named docs. Do not push it.'),{commit:true,push:false,pr:false});
+ assert.deepEqual(askedSteps('Merge pull request #1 in demo/app.'),{commit:false,push:false,pr:false});
+ assert.deepEqual(askedSteps('Find the commit that broke the build.'),{commit:false,push:false,pr:false});
+});
+
+test('a final reply before the asked commit, push and pull request gets at most two nudges naming the next command',async()=>{
+ const seen=[];let status='On branch fix\nChanges not committed (git commit -m "MESSAGE" saves them all):\n\tmodified:   calc.py\n';
+ const workspace={cwd:'/home/user/app',vm:{read:async()=>({ok:false})},path:p=>p,request:async(name,args)=>{
+  if(name!=='exec')return{};
+  if(args.command==='git status')return{code:0,stdout:status,stderr:''};
+  if(args.command==='gh pr view')return{code:1,stdout:'',stderr:'gh: no open pull request'};
+  return{code:0,stdout:'',stderr:''};
+ }};
+ const task=createPiTask({linux:{cwd:'/home/user/app'},workspace,network:{options:()=>({enabled:false})},turn:async messages=>{
+  seen.push(messages.at(-1).content);
+  return{text:'I fixed it and committed it. Next steps: push and open a pull request.',reason:'end'};
+ }});
+ const r=await task.run('Fix calc.py, commit it, push it and open a pull request.');
+ assert.equal(seen.length,3);
+ assert.match(seen[1],/^Not finished yet: Your changes are not committed yet\. Make that tool call now: git commit -m "What changed"\./);
+ status='On branch fix\nYour branch is ahead of \'origin/main\' by 1 commit (not pushed; git push uploads them).\nnothing to commit, working tree clean\n';
+ seen.length=0;await task.run('Now push it and open a pull request.');
+ assert.match(seen[1],/Your commits are not pushed yet\. Make that tool call now: git push\./);
+ status='On branch fix\nnothing to commit, working tree clean\n';
+ seen.length=0;await task.run('Open a pull request for it.');
+ assert.match(seen[1],/The pull request is not open yet\. Make that tool call now: gh pr create/);
+ seen.length=0;await task.run('What does calc.py do?');
+ assert.equal(seen.length,1);
 });
