@@ -202,6 +202,14 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn('cargo ', out)
 
+    def test_cargo_git_dependencies_are_mounted_read_only(self):
+        tools = {'binds': [], 'path': [], 'cargo_bin': '/c/bin', 'registry': '/c/registry', 'cargo_git': '/c/git'}
+        argv = local.project_sandbox('/copy', tools, '', 'true')
+        for src, dst in (('/c/bin', '/home/agent/cargo/bin'), ('/c/registry', '/home/agent/cargo/registry'), ('/c/git', '/home/agent/cargo/git'), ('/copy/.git', '/workspace/.git')):
+            i = argv.index(src)
+            self.assertEqual((argv[i - 1], argv[i + 1]), ('--ro-bind', dst))
+        self.assertIn('CARGO_NET_OFFLINE', argv)
+
     def test_extra_origin_for_local_builds(self):
         c = local.Connector(self.p.copy, approve=lambda _: True)
         c.project = self.p

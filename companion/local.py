@@ -81,6 +81,8 @@ def find_tools(home=None):
         tools['cargo_bin'] = str(cargo / 'bin')
     if (cargo / 'registry').is_dir():
         tools['registry'] = str(cargo / 'registry')
+    if (cargo / 'git').is_dir():
+        tools['cargo_git'] = str(cargo / 'git')  # dependencies taken from git repositories
     node = shutil.which('node')
     nodes = sorted((home / '.nvm' / 'versions' / 'node').glob('v*/bin/node')) if not node else []
     node = Path(node).resolve() if node else (nodes[-1] if nodes else None)
@@ -115,6 +117,8 @@ def project_sandbox(copy, tools, cwd, command, network=False):
         a += ['--dir', '/home/agent/cargo', '--ro-bind', tools['cargo_bin'], '/home/agent/cargo/bin']
         if 'registry' in tools:
             a += ['--ro-bind', tools['registry'], '/home/agent/cargo/registry']
+        if 'cargo_git' in tools:
+            a += ['--ro-bind', tools['cargo_git'], '/home/agent/cargo/git']
         path.insert(0, '/home/agent/cargo/bin')
         env.update(CARGO_HOME='/home/agent/cargo', CARGO_NET_OFFLINE='true')
     if 'rustup' in tools:
@@ -170,9 +174,12 @@ class Project:
             setup = True
         if setup and (self.copy / 'package-lock.json').exists():
             subprocess.run(project_sandbox(self.copy, self.tools, '', 'npm ci --ignore-scripts --no-audit --no-fund', network=True), check=True, timeout=1800)
-        if setup and (self.copy / 'Cargo.lock').exists() and 'cargo_bin' in self.tools:
-            # Downloads crates into the person's own registry, as their own cargo build would.
-            subprocess.run([str(Path(self.tools['cargo_bin']) / 'cargo'), 'fetch', '--locked', '--manifest-path', str(self.copy / 'Cargo.toml')], check=True, timeout=1800)
+        if setup and 'cargo_bin' in self.tools:
+            # Every Rust project in the repository (a Cargo.lock beside its Cargo.toml): crates and
+            # git dependencies go into the person's own cargo home, as their own build would.
+            for lock in self.git('ls-files', '-z', '--', 'Cargo.lock', '*/Cargo.lock').split('\0'):
+                if lock and (self.copy / lock).with_name('Cargo.toml').exists():
+                    subprocess.run([str(Path(self.tools['cargo_bin']) / 'cargo'), 'fetch', '--locked', '--manifest-path', str((self.copy / lock).with_name('Cargo.toml'))], check=True, timeout=1800)
 
     def opendir(self, parts, create=False):
         """A directory of the copy, opened without following any symlink."""
