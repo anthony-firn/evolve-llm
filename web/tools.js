@@ -20,7 +20,14 @@ function call(obj, allowed = NAMES) {
   if (typeof args === 'string') {
     try { args = JSON.parse(args); } catch { args = {}; }
   }
-  return allowed.has(name) && args && typeof args === 'object' ? { name, args } : null;
+  if (!args || typeof args !== 'object') return null;
+  if (allowed.has(name)) return { name, args };
+  // A small model may call a command as if it were a tool: {"name": "git", "arguments":
+  // {"command": "commit -m 'x'"}}. With a bash tool, that is the command line "git commit -m 'x'".
+  const rest = typeof args.command === 'string' ? args.command : typeof args.args === 'string' ? args.args : Array.isArray(args.args) ? args.args.join(' ') : null;
+  if (allowed.has('bash') && typeof name === 'string' && /^[a-z][\w.+-]*$/.test(name) && rest !== null && Object.keys(args).length === 1)
+    return { name: 'bash', args: { command: rest.trim().startsWith(name + ' ') || rest.trim() === name ? rest.trim() : `${name} ${rest}`.trim() } };
+  return null;
 }
 
 function parseJson(text) {

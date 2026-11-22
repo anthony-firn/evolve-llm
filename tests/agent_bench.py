@@ -103,7 +103,7 @@ def check_merge(fake, page, run):
     return (tree(fake, "main")["README.md"] == b"# Demo\n\nA small calculator.\n"), "merged; main has the change"
 
 
-TEST_CALC = "import unittest\nfrom calc import add, sub\n\n\nclass T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_sub(self):\n        self.assertEqual(sub(5, 3), 2)\n\n\nunittest.main()\n"
+TEST_CALC = "import unittest\nfrom calc import add, sub\n\n\nclass T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_sub(self):\n        self.assertEqual(sub(5, 3), 2)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
 
 
 def setup_ci():
