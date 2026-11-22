@@ -1381,6 +1381,27 @@ pub fn res_mix() -> String {
     format!("{COMMON}{RES_MIX}")
 }
 
+/// Deepstack: after an early layer, add that layer's image features (zero for text tokens) to the
+/// hidden states, when the pass carries them (step.pad2).
+pub const DEEP_ADD: &str = r#"
+struct P { n_embd: u32, layer: u32, cap: u32, pad: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read_write> x: array<f32>;
+@group(0) @binding(3) var<storage, read> deep: array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    if (step.pad2 == 0u) { return; }
+    let t = wg.y;
+    let j = wg.x * 256u + li;
+    if (j >= p.n_embd) { return; }
+    x[t * p.n_embd + j] += deep[(p.layer * p.cap + t) * p.n_embd + j];
+}
+"#;
+
+pub fn deep_add() -> String {
+    format!("{COMMON}{DEEP_ADD}")
+}
+
 pub fn fill() -> String {
     format!("{COMMON}{FILL}")
 }

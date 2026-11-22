@@ -12,6 +12,8 @@ use wgpu::util::DeviceExt;
 
 /// Tokens processed per submission while reading a prompt.
 pub const MAX_BATCH: usize = 128;
+/// Tokens per chunk that the deepstack buffer holds.
+const DEEP_CAP: usize = SUPER_BATCH;
 /// The smallest prompt chunk, the first chunk of a pass (it grows while chunks finish fast), and
 /// the time past which the next chunk is halved. Starting small matters: on a slow GPU a first
 /// full chunk can already outlast the driver's limit, and cancelled work leaves wrong numbers,
@@ -293,6 +295,7 @@ enum Kernel {
     MoeSum,
     ResMix,
     Fill,
+    DeepAdd,
     KdaConv,
     L2Norm,
     Kda,
@@ -321,6 +324,7 @@ struct Layouts {
     mla: wgpu::BindGroupLayout,
     res_mix: wgpu::BindGroupLayout,
     fill: wgpu::BindGroupLayout,
+    deep_add: wgpu::BindGroupLayout,
     kda_conv: wgpu::BindGroupLayout,
     l2norm: wgpu::BindGroupLayout,
     kda: wgpu::BindGroupLayout,
@@ -342,6 +346,7 @@ struct State {
     ctx: usize,
     step: wgpu::Buffer,
     mpos: wgpu::Buffer,
+    deep: wgpu::Buffer,
     tokens: wgpu::Buffer,
     logits: wgpu::Buffer,
     staging: wgpu::Buffer,
@@ -410,6 +415,7 @@ pub struct Engine {
     batch: Cell<usize>,
     rope_delta: Cell<i32>,
     rope_positions: std::cell::RefCell<Option<(usize, Vec<u32>)>>,
+    deepstack: std::cell::RefCell<Option<(usize, Vec<Vec<f32>>)>>,
     /// A second copy of the recurrent state, taken before verifying a draft (made on first use).
     spec_state: RefCell<Vec<(wgpu::Buffer, wgpu::Buffer)>>,
     spec_pos: Cell<usize>,
@@ -868,6 +874,7 @@ impl Engine {
             mla: layout(device, "uurrrw"),
             res_mix: layout(device, "uurrww"),
             fill: layout(device, "uuw"),
+            deep_add: layout(device, "uuwr"),
             kda_conv: layout(device, "uurww"),
             l2norm: layout(device, "uuw"),
             kda: layout(device, "uurrrrrww"),
@@ -918,6 +925,7 @@ impl Engine {
             batch: Cell::new(FIRST_BATCH),
             rope_delta: Cell::new(0),
             rope_positions: std::cell::RefCell::new(None),
+            deepstack: std::cell::RefCell::new(None),
             spec_state: RefCell::new(Vec::new()),
             spec_pos: Cell::new(0),
             stage,
@@ -1034,6 +1042,10 @@ impl Engine {
         }
         if self.cfg.expert_latent > 0 {
             self.pipeline("fill".into(), shaders::fill(), &fl);
+        }
+        if self.cfg.deepstack > 0 {
+            let da = self.layouts.deep_add.clone();
+            self.pipeline("deep-add".into(), shaders::deep_add(), &da);
         }
         if self.cfg.kda.is_some() {
             self.pipeline("kda-conv".into(), shaders::kda_conv(), &kc);
@@ -1278,6 +1290,13 @@ impl Engine {
             label: Some("step"),
             size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Deepstack image features for a chunk's tokens, per early layer (Qwen3-VL).
+        let deep = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deepstack"),
+            size: (c.deepstack.max(1) * if c.deepstack > 0 { DEEP_CAP * c.n_embd } else { 1 } * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         // Per-token (time, height, width) rotary positions of a chunk, when given (images).
@@ -1886,6 +1905,14 @@ impl Engine {
                     matmul(&mut ops, &n("ffn_down.weight"), &gate, &x, 1, None, false, Input::rows(c.n_ff));
                 }
             }
+            if l < c.deepstack {
+                ops.push(Op {
+                    when: When::Always,
+                    kernel: Kernel::DeepAdd,
+                    grid: Grid::Width(c.n_embd as u32),
+                    bind: bind(&self.layouts.deep_add, "deep-add", &[&step, &params(&words(&[c.n_embd as u32, l as u32, DEEP_CAP as u32, 0])), &x, &deep]),
+                });
+            }
             let end = ops.len();
             if route_end == 0 {
                 route_end = end;
@@ -2000,6 +2027,7 @@ impl Engine {
             ck_tokens,
             hidden_staging,
             mpos,
+            deep,
         });
         match self.gpu.take_error() {
             Some(e) => Err(format!("could not prepare the model on the GPU: {e}")),
@@ -2069,6 +2097,7 @@ impl Engine {
             (Kernel::MoeSum, Grid::Width(w)) => ("moe-sum".into(), (w.div_ceil(256), t)),
             (Kernel::ResMix, Grid::Tokens) => ("res-mix".into(), (t, 1)),
             (Kernel::Fill, Grid::Width(w)) => ("fill".into(), (w.div_ceil(256), t)),
+            (Kernel::DeepAdd, Grid::Width(w)) => ("deep-add".into(), (w.div_ceil(256), t)),
             (Kernel::KdaConv, Grid::Groups(n)) => ("kda-conv".into(), (n, 1)),
             (Kernel::L2Norm, Grid::Heads(h)) => ("l2norm".into(), (h, t)),
             (Kernel::Kda, Grid::Groups(n)) => ("kda".into(), (n, 1)),
@@ -2174,9 +2203,20 @@ impl Engine {
                 mode = 1;
             }
         }
+        // Deepstack features for these tokens, when this pass was given them.
+        let mut deep = 0u32;
+        if let Some((p0, ref layers)) = *self.deepstack.borrow() {
+            let d = self.cfg.n_embd;
+            if pos >= p0 && n <= DEEP_CAP && layers.iter().all(|f| (pos - p0 + n) * d <= f.len()) {
+                for (i, f) in layers.iter().enumerate().take(self.cfg.deepstack) {
+                    self.gpu.queue.write_buffer(&st.deep, (i * DEEP_CAP * d * 4) as u64, &floats(&f[(pos - p0) * d..(pos - p0 + n) * d]));
+                }
+                deep = 1;
+            }
+        }
         let n = n as u32;
         let pos = pos as u32;
-        self.gpu.queue.write_buffer(&st.step, 0, &words(&[n, pos, pos + n, n - 1, chunk0 as u32, mode, self.rope_delta.get() as u32, 0]));
+        self.gpu.queue.write_buffer(&st.step, 0, &words(&[n, pos, pos + n, n - 1, chunk0 as u32, mode, self.rope_delta.get() as u32, deep]));
     }
 
     /// Rotary positions minus cache slots for the tokens that follow (Qwen2-VL: an image of n
@@ -2185,14 +2225,20 @@ impl Engine {
         self.rope_delta.set(delta);
     }
 
-    /// Like `forward_hidden`, with each token's (time, height, width) rotary positions.
-    pub async fn forward_hidden_positioned(&self, hidden: &[f32], n: usize, pos0: usize, positions: &[[u32; 3]]) -> Result<Vec<f32>, String> {
+    /// Like `forward_hidden`, with each token's (time, height, width) rotary positions and, for
+    /// models with deepstack, each early layer's image features (`n x n_embd`, zero for text).
+    pub async fn forward_hidden_positioned(&self, hidden: &[f32], n: usize, pos0: usize, positions: &[[u32; 3]], deepstack: &[Vec<f32>]) -> Result<Vec<f32>, String> {
         if positions.len() != n {
             return Err(format!("{} positions for {n} tokens", positions.len()));
         }
+        if deepstack.iter().any(|f| f.len() != n * self.cfg.n_embd) {
+            return Err("deepstack features must cover every token".into());
+        }
         *self.rope_positions.borrow_mut() = Some((pos0, positions.iter().flatten().copied().collect()));
+        *self.deepstack.borrow_mut() = (!deepstack.is_empty()).then(|| (pos0, deepstack.to_vec()));
         let out = self.forward_hidden(hidden, n, pos0).await;
         *self.rope_positions.borrow_mut() = None;
+        *self.deepstack.borrow_mut() = None;
         out
     }
 

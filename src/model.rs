@@ -137,6 +137,9 @@ pub struct Config {
     pub rope_sections: Option<[usize; 3]>,
     /// Sections interleaved pair by pair (Qwen3-VL) instead of contiguous (Qwen2-VL).
     pub rope_interleaved: bool,
+    /// Layers after which image features from the vision encoder's deepstack are added to the
+    /// image tokens (Qwen3-VL: the first 3).
+    pub deepstack: usize,
     /// Linear position scaling factor (1 = none).
     pub rope_linear_scale: f32,
     pub has_rope_freqs: bool,
@@ -428,6 +431,7 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
         rope_neox: !matches!(arch, Arch::Llama | Arch::Deepseek2),
         rope_sections: rope_sections(g, &prefix),
         rope_interleaved: prefix.starts_with("qwen3vl"),
+        deepstack: g.u64(&key("n_deepstack_layers")).unwrap_or(0) as usize,
         rope_linear_scale,
         has_rope_freqs: g.tensor("rope_freqs.weight").is_some(),
         tied_embeddings: g.tensor("output.weight").is_none(),
