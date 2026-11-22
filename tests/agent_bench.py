@@ -148,6 +148,18 @@ TASKS = {
     "html-app": (lambda: gh.Fake(), "Make a small web page counter.html with a button that counts how many times it is clicked. Test it and show it to me.", check_html),
 }
 
+# The same tasks said another way (--wording 2), so a harness change is judged on more than one
+# phrasing: same repository, branch names and checks.
+REWORDED = {
+    "docs-line": f'In demo/app on GitHub, README.md has the line "{TARGET}". Put "{NEW_LINE}" on the line below it. Use a branch called docs-serve and open a PR for it.',
+    "bugfix": "calc.py in demo/app (GitHub) is broken: add(2, 3) gives -1. Please fix it on a branch named fix-add and send me a pull request.",
+    "new-file": "demo/app on GitHub needs a CONTRIBUTING.md with a few lines on how to open a pull request. Add it on a branch called contributing and open a PR.",
+    "question": 'Explain in one sentence what "git checkout -b NAME" does.',
+    "merge": "Please merge PR #1 on demo/app (it is on GitHub).",
+    "ci-fix": "The checks on demo/app's main branch are red. Figure out what broke, fix it on a branch fix-ci, run the tests, then push and open a pull request.",
+    "html-app": "Build me counter.html: a page with a button and a number that goes up by one on each click. Check that it works and show it.",
+}
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -158,6 +170,7 @@ def main():
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--minutes", type=float, default=20, help="per task")
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--wording", type=int, choices=[1, 2], default=1, help="2: the tasks said another way")
     a = ap.parse_args()
     trace = Path(tempfile.mkstemp(suffix=".jsonl")[1])
     gh.Handler.trace_file = str(trace)
@@ -171,6 +184,7 @@ def main():
         browser = p.chromium.launch(executable_path="/usr/bin/google-chrome", args=FLAGS)
         for name in a.tasks.split(","):
             setup, prompt, check = TASKS[name]
+            prompt = REWORDED[name] if a.wording == 2 else prompt
             gh.FAKE = setup()
             ctx = browser.new_context(viewport={"width": 1280, "height": 900})
             ctx.add_init_script(f"if(window===window.top)localStorage.setItem('evolve-llm-settings',JSON.stringify({json.dumps(settings)}))")

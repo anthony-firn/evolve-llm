@@ -74,7 +74,7 @@ const shellText = r => [`exit code ${r.code}${r.timedOut?' (timed out)':''}, in 
 export function askedSteps(prompt) {
   const p = String(prompt);
   const not = w => new RegExp(`\\b(do not|don't|never|without|no need to)\\s+(\\w+\\s+)?${w}`, 'i').test(p);
-  let pr = /\b(open|create|make|send|submit|raise)\s+(a |an |the )?(new )?(pull request|PR)\b/i.test(p);
+  let pr = /\b(open|create|make|send|submit|raise)\s+(me |us )?(a |an |the )?(new )?(pull request|PR)\b/i.test(p);
   let push = pr || /\bpush\s+(it|them|this|that|these|those|the|your|my|all|changes?|to|a|branch)\b|\bpush\b\s*([,.;]|$)/im.test(p);
   // "the commit that…" is a noun, not a request.
   let commit = push || /(?<!\b(the|a|which|last|first|each|every|that|this)\s)\bcommit\s+(it|them|this|that|these|those|the|your|my|all|changes?|on|to|with)\b/i.test(p);

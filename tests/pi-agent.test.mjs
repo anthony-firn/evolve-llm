@@ -332,6 +332,8 @@ test('askedSteps reads commit, push and pull request from a request, and "do not
  assert.deepEqual(askedSteps('Commit it on a new branch named docs. Do not push it.'),{commit:true,push:false,pr:false});
  assert.deepEqual(askedSteps('Merge pull request #1 in demo/app.'),{commit:false,push:false,pr:false});
  assert.deepEqual(askedSteps('Find the commit that broke the build.'),{commit:false,push:false,pr:false});
+ assert.deepEqual(askedSteps('Fix it on a branch named fix-add and send me a pull request.'),{commit:true,push:true,pr:true});
+ assert.deepEqual(askedSteps('Use a branch called docs-serve and open a PR for it.'),{commit:true,push:true,pr:true});
 });
 
 test('a final reply before the asked commit, push and pull request gets at most two nudges naming the next command',async()=>{
