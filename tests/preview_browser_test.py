@@ -2,7 +2,7 @@
 import argparse
 from pathlib import Path
 from playwright.sync_api import sync_playwright
-from browser_test import serve
+from browser_test import open_sandbox, serve
 
 def check(runtime):
  server=serve(runtime)
@@ -12,8 +12,7 @@ def check(runtime):
     browser=kind.launch();page=browser.new_page();remote=[]
     page.on('request',lambda r:remote.append(r.url) if not r.url.startswith('http://127.0.0.1:') else None)
     page.goto(f'http://127.0.0.1:{server.server_address[1]}/play/evolve-llm/')
-    page.locator('#open-terminal').click();page.locator('#workbench').wait_for()
-    if page.locator('#linux-terminal-toggle').is_visible():page.locator('#linux-terminal-toggle').click()  # to the browser sandbox (the only terminal without JSPI)
+    open_sandbox(page)
     page.wait_for_function("() => document.querySelector('#terminal-status')?.textContent.startsWith('Ready')")
     page.locator('#terminal-input').fill('demo snake');page.locator('.terminal-form button[type=submit]').click()
     page.wait_for_function("() => !document.querySelector('.terminal-form button[type=submit]').disabled",timeout=20000)

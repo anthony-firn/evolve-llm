@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
-from browser_test import FLAGS, serve
+from browser_test import FLAGS, open_sandbox, serve
 
 
 def run(page, text, timeout):
@@ -41,8 +41,7 @@ def main():
             page.wait_for_selector('#gpu-chip[data-state=ok]', timeout=30000)
             page.set_input_files('#file-input', str(model))
             page.wait_for_selector('#ready:not([hidden])', timeout=300000)
-            page.locator('#open-terminal').click()
-            page.locator('#linux-terminal-toggle').click()  # the browser sandbox
+            open_sandbox(page)
             page.wait_for_function("() => document.querySelector('#terminal-status')?.textContent.startsWith('Ready')", timeout=60000)
             word, name = f'evolve{i}ok', f'note{i}.txt'
             log = run(page, f'pi Write the text "{word}" to a file named {name}', 600000)

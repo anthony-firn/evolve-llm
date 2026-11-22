@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from browser_test import FLAGS, ROOT, letters, serve  # noqa: E402
+from browser_test import FLAGS, ROOT, letters, open_sandbox, serve  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 
@@ -131,8 +131,7 @@ def main():
             if a.pi_hf:
                 a.hf = a.pi_hf
                 load(phone)
-                phone.locator("#open-terminal").click()
-                phone.locator("#linux-terminal-toggle").click()  # the browser sandbox
+                open_sandbox(phone)
                 phone.wait_for_function("() => document.querySelector('#terminal-status')?.textContent.startsWith('Ready')", timeout=60000)
                 phone.locator("#terminal-input").fill('pi Write the text "phoneok" to a file named phone.txt')
                 phone.locator(".terminal-form button[type=submit]").click()

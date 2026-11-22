@@ -53,6 +53,7 @@ export class VmClient {
         }
       };
     });
+    this.ready.catch(() => {}); // a build without the VM: callers that await it see the failure
   }
 
   /** `pi TASK` in a terminal: run Pi in `cwd`, writing progress with `write`; resolves the status. */

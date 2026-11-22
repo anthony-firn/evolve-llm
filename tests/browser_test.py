@@ -82,6 +82,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_error(405)
 
 
+def open_sandbox(page):
+    """Open Terminal and switch it to the browser sandbox: Terminal opens the Linux terminal where
+    the VM runs, and the sandbox by itself where it cannot (no JSPI, or a build without the VM)."""
+    page.locator("#open-terminal").click()
+    page.wait_for_function("() => { const t = document.querySelector('#linux-terminal-toggle'); return t && (t.hidden || document.querySelector('.vm-console .vt-term')); }", timeout=30000)
+    if page.locator("#linux-terminal-toggle").is_visible():
+        page.locator("#linux-terminal-toggle").click()
+
+
 def serve(directory):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Handler, directory=str(directory)))
     threading.Thread(target=server.serve_forever, daemon=True).start()

@@ -41,14 +41,17 @@ export async function mountWorkbench({ ready, turn, lease, getNetwork, setNetwor
   aside.append(node('h2','Workspace files'),actions,files);layout.append(aside,console,vmHost);root.append(head,notice,layout,filePicker,restorePicker);document.body.append(root);
   let vmWindow=null;
   // The Linux terminal needs WebAssembly JSPI (Chrome, Edge); elsewhere the sandbox is the terminal.
-  const linuxAvailable=typeof WebAssembly.Suspending==='function';linuxToggle.hidden=!linuxAvailable;
+  let linuxAvailable=typeof WebAssembly.Suspending==='function';linuxToggle.hidden=!linuxAvailable;
+  function showLinux(on){vmHost.hidden=!on;aside.hidden=on;console.hidden=on;notice.hidden=on;layout.classList.toggle('vm-mode',on);linuxToggle.textContent=on?'Browser sandbox':'Linux terminal';}
   async function toggleLinux(){
-    const on=vmHost.hidden;vmHost.hidden=!on;aside.hidden=on;console.hidden=on;notice.hidden=on;layout.classList.toggle('vm-mode',on);
-    linuxToggle.textContent=on?'Browser sandbox':'Linux terminal';
+    const on=vmHost.hidden;showLinux(on);
     if(on&&!vmWindow){
       if(!document.querySelector('link[href$="vm/terminal.css"]')){const l=document.createElement('link');l.rel='stylesheet';l.href=new URL('./vm/terminal.css',import.meta.url).href;document.head.append(l)}
       const [{sharedVm},{TerminalWindow}]=await Promise.all([import('./vm/client.mjs'),import('./vm/terminal.mjs')]);
-      const vm=sharedVm();vm.onAgent=runLinuxTask;
+      const vm=sharedVm();
+      // A build without the VM (or one that fails to start): the sandbox is the terminal.
+      try{await vm.ready}catch{linuxAvailable=false;linuxToggle.hidden=true;showLinux(false);await boot();input.focus();return}
+      vm.onAgent=runLinuxTask;
       vmWindow=new TerminalWindow({vm,container:vmHost});await vmWindow.open();
     }
     if(on)vmWindow?.active?.term.focus();
