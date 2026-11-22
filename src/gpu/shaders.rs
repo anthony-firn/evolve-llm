@@ -463,7 +463,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /// Rotary position embedding on queries (in place) and keys, then store keys
 /// and values in the f16 cache at their positions.
 pub const ROPE: &str = r#"
-struct P { n_head: u32, n_kv: u32, head_dim: u32, half_rot: u32, neox: u32, kv_dim: u32, q_dim: u32, rot_offset: u32 }
+// s0, s1, s2: rotary pairs in the time, height and width sections of multimodal positions.
+// Contiguous sections (Qwen2-VL), or interleaved (Qwen3-VL: pair i is height when i % 3 == 1 and
+// i < 3 * s1, width when i % 3 == 2 and i < 3 * s2, else time). Text-only models: all in s0.
+struct P { n_head: u32, n_kv: u32, head_dim: u32, half_rot: u32, neox: u32, kv_dim: u32, q_dim: u32, rot_offset: u32, s0: u32, s1: u32, s2: u32, interleaved: u32 }
 @group(0) @binding(1) var<uniform> p: P;
 @group(0) @binding(2) var<storage, read_write> q: array<f32>;
 @group(0) @binding(3) var<storage, read> k: array<f32>;
@@ -471,20 +474,34 @@ struct P { n_head: u32, n_kv: u32, head_dim: u32, half_rot: u32, neox: u32, kv_d
 @group(0) @binding(5) var<storage, read_write> kc: array<u32>;
 @group(0) @binding(6) var<storage, read_write> vc: array<u32>;
 @group(0) @binding(7) var<storage, read> table: array<vec2<f32>>;
+@group(0) @binding(8) var<storage, read> mpos: array<u32>;
 
-fn rot_k(base: u32, d: u32, cs_base: u32) -> f32 {
+// The rotary position of chunk token t for pair i: its cache slot plus an offset (step.pad1)
+// normally; with step.pad0 == 1, the (time, height, width) positions given per token, the pair's
+// section choosing one (multimodal positions: image tokens, and text after an image).
+fn rpos(t: u32, i: u32) -> u32 {
+    if (step.pad0 == 0u) { return u32(i32(step.pos0 + t) + bitcast<i32>(step.pad1)); }
+    var sec = 0u;
+    if (p.interleaved == 1u) {
+        if (i % 3u == 1u && i < 3u * p.s1) { sec = 1u; } else if (i % 3u == 2u && i < 3u * p.s2) { sec = 2u; }
+    } else if (i >= p.s0 + p.s1) { sec = 2u; } else if (i >= p.s0) { sec = 1u; }
+    return mpos[t * 3u + sec];
+}
+fn cs_at(t: u32, i: u32) -> vec2<f32> { return table[rpos(t, i) * p.half_rot + i]; }
+
+fn rot_k(base: u32, d: u32, t: u32) -> f32 {
     let x = k[base + d];
     if (d >= 2u * p.half_rot) { return x; }
     if (p.neox == 1u) {
         let h = p.half_rot;
         if (d < h) {
-            let cs = table[cs_base + d];
+            let cs = cs_at(t, d);
             return x * cs.x - k[base + d + h] * cs.y;
         }
-        let cs = table[cs_base + d - h];
+        let cs = cs_at(t, d - h);
         return k[base + d - h] * cs.y + x * cs.x;
     }
-    let cs = table[cs_base + d / 2u];
+    let cs = cs_at(t, d / 2u);
     if ((d & 1u) == 0u) { return x * cs.x - k[base + d + 1u] * cs.y; }
     return k[base + d - 1u] * cs.y + x * cs.x;
 }
@@ -493,12 +510,11 @@ fn rot_k(base: u32, d: u32, cs_base: u32) -> f32 {
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let t = wg.y;
     let pos = step.pos0 + t;
-    let cs_base = pos * p.half_rot;
     let hd = p.head_dim;
     if (wg.x < p.n_head) {
         let base = t * p.q_dim + wg.x * hd + p.rot_offset;
         for (var i = li; i < p.half_rot; i += 64u) {
-            let cs = table[cs_base + i];
+            let cs = cs_at(t, i);
             var a = base + 2u * i;
             var b = a + 1u;
             if (p.neox == 1u) { a = base + i; b = base + i + p.half_rot; }
@@ -514,7 +530,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let cache = (pos * p.kv_dim + kvh * hd) >> 1u;
     for (var e = li; e < hd / 2u; e += 64u) {
         let d = 2u * e;
-        kc[cache + e] = pack2x16float(vec2<f32>(rot_k(base, d, cs_base), rot_k(base, d + 1u, cs_base)));
+        kc[cache + e] = pack2x16float(vec2<f32>(rot_k(base, d, t), rot_k(base, d + 1u, t)));
         vc[cache + e] = pack2x16float(vec2<f32>(v[base + d], v[base + d + 1u]));
     }
 }

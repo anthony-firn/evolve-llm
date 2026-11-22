@@ -341,6 +341,7 @@ struct LayerOps {
 struct State {
     ctx: usize,
     step: wgpu::Buffer,
+    mpos: wgpu::Buffer,
     tokens: wgpu::Buffer,
     logits: wgpu::Buffer,
     staging: wgpu::Buffer,
@@ -407,6 +408,8 @@ pub struct Engine {
     /// GPU with a long context, a full chunk can outlast the driver's limit on one piece of GPU
     /// work (Linux i915 cancels after about 10 s). Learned from each chunk, kept between passes.
     batch: Cell<usize>,
+    rope_delta: Cell<i32>,
+    rope_positions: std::cell::RefCell<Option<(usize, Vec<u32>)>>,
     /// A second copy of the recurrent state, taken before verifying a draft (made on first use).
     spec_state: RefCell<Vec<(wgpu::Buffer, wgpu::Buffer)>>,
     spec_pos: Cell<usize>,
@@ -859,7 +862,7 @@ impl Engine {
             moe_sum: layout(device, "uurrrw"),
             norm: layout(device, "uurrw"),
             norm_inplace: layout(device, "uuwr"),
-            rope: layout(device, "uuwrrwwr"),
+            rope: layout(device, "uuwrrwwrr"),
             attention: layout(device, "uurrrw"),
             topk: layout(device, "uurrw"),
             mla: layout(device, "uurrrw"),
@@ -913,6 +916,8 @@ impl Engine {
             snapshot_pos: Cell::new(None),
             all_logits: Cell::new(false),
             batch: Cell::new(FIRST_BATCH),
+            rope_delta: Cell::new(0),
+            rope_positions: std::cell::RefCell::new(None),
             spec_state: RefCell::new(Vec::new()),
             spec_pos: Cell::new(0),
             stage,
@@ -1275,6 +1280,13 @@ impl Engine {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Per-token (time, height, width) rotary positions of a chunk, when given (images).
+        let mpos = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("multimodal positions"),
+            size: (SUPER_BATCH.max(MAX_BATCH) * 3 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging"),
             size: (c.n_vocab * 4) as u64,
@@ -1534,6 +1546,10 @@ impl Engine {
             c.kv_dim() as u32,
             c.q_dim() as u32,
             mla.as_ref().map_or(0, |m| m.nope) as u32,
+            c.rope_sections.map_or(half, |s| s[0]) as u32,
+            c.rope_sections.map_or(0, |s| s[1]) as u32,
+            c.rope_sections.map_or(0, |s| s[2]) as u32,
+            c.rope_interleaved as u32,
         ]));
         let mut attn_data = words(&[
             c.n_head as u32,
@@ -1724,7 +1740,7 @@ impl Engine {
                         when: When::Always,
                         kernel: Kernel::Rope,
                         grid: Grid::Heads(c.n_head as u32),
-                        bind: bind(&self.layouts.rope, "rope-q", &[&step, &rope_p, &q, dummy, dummy, &spare_a, &spare_b, &rope_table]),
+                        bind: bind(&self.layouts.rope, "rope-q", &[&step, &rope_p, &q, dummy, dummy, &spare_a, &spare_b, &rope_table, &mpos]),
                     });
                 }
                 ops.push(Op {
@@ -1795,7 +1811,7 @@ impl Engine {
                     when: When::Always,
                     kernel: Kernel::Rope,
                     grid: Grid::Heads((c.n_head + c.n_head_kv) as u32),
-                    bind: bind(&self.layouts.rope, "rope", &[&step, &rope_p, &q, &k, &v, &kc[l], &vc[l], &rope_table]),
+                    bind: bind(&self.layouts.rope, "rope", &[&step, &rope_p, &q, &k, &v, &kc[l], &vc[l], &rope_table, &mpos]),
                 });
                 ops.push(Op {
                     when: When::Always,
@@ -1983,6 +1999,7 @@ impl Engine {
             ck,
             ck_tokens,
             hidden_staging,
+            mpos,
         });
         match self.gpu.take_error() {
             Some(e) => Err(format!("could not prepare the model on the GPU: {e}")),
@@ -2148,9 +2165,35 @@ impl Engine {
     /// token within a prompt read layer by layer.
     fn write_step(&self, n: usize, pos: usize, chunk0: usize) {
         let st = self.state.as_ref().unwrap();
+        // Multimodal rotary positions for these tokens, when this pass was given them.
+        let mut mode = 0u32;
+        if let Some((p0, ref list)) = *self.rope_positions.borrow() {
+            if pos >= p0 && (pos - p0 + n) * 3 <= list.len() {
+                let i = (pos - p0) * 3;
+                self.gpu.queue.write_buffer(&st.mpos, 0, &words(&list[i..i + n * 3]));
+                mode = 1;
+            }
+        }
         let n = n as u32;
         let pos = pos as u32;
-        self.gpu.queue.write_buffer(&st.step, 0, &words(&[n, pos, pos + n, n - 1, chunk0 as u32, 0, 0, 0]));
+        self.gpu.queue.write_buffer(&st.step, 0, &words(&[n, pos, pos + n, n - 1, chunk0 as u32, mode, self.rope_delta.get() as u32, 0]));
+    }
+
+    /// Rotary positions minus cache slots for the tokens that follow (Qwen2-VL: an image of n
+    /// tokens fills n slots but moves positions on by its larger side only).
+    pub fn set_rope_delta(&self, delta: i32) {
+        self.rope_delta.set(delta);
+    }
+
+    /// Like `forward_hidden`, with each token's (time, height, width) rotary positions.
+    pub async fn forward_hidden_positioned(&self, hidden: &[f32], n: usize, pos0: usize, positions: &[[u32; 3]]) -> Result<Vec<f32>, String> {
+        if positions.len() != n {
+            return Err(format!("{} positions for {n} tokens", positions.len()));
+        }
+        *self.rope_positions.borrow_mut() = Some((pos0, positions.iter().flatten().copied().collect()));
+        let out = self.forward_hidden(hidden, n, pos0).await;
+        *self.rope_positions.borrow_mut() = None;
+        out
     }
 
     /// Record ops into an encoder (with copies around them, for the layer-by-layer prompt).
@@ -2469,9 +2512,13 @@ impl Engine {
                 match &remote {
                     Some(r) if self.stage.head => {
                         let mut call = r.forward(h, n, pos0 + s);
-                        // Started now (a call begins when first polled), awaited after the loop.
-                        let _ = call.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
-                        sent.push(call);
+                        // Started now (a call begins when first polled), awaited after the loop. A call
+                        // that finishes on that first poll (a remote in this page) keeps its result: a
+                        // finished future must not be polled again.
+                        match call.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+                            std::task::Poll::Ready(v) => sent.push(Box::pin(std::future::ready(v))),
+                            std::task::Poll::Pending => sent.push(call),
+                        }
                     }
                     _ => hidden.extend(h),
                 }

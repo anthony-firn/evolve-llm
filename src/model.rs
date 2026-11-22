@@ -135,6 +135,8 @@ pub struct Config {
     /// Multimodal rotary positions (qwen2vl): rotary pairs per section (time, height, width),
     /// each section rotated by its own position. None for text-only models.
     pub rope_sections: Option<[usize; 3]>,
+    /// Sections interleaved pair by pair (Qwen3-VL) instead of contiguous (Qwen2-VL).
+    pub rope_interleaved: bool,
     /// Linear position scaling factor (1 = none).
     pub rope_linear_scale: f32,
     pub has_rope_freqs: bool,
@@ -213,6 +215,10 @@ pub fn arch_of(g: &Gguf) -> Result<Arch, String> {
         // Qwen2-VL and Qwen2.5-VL (and their fine-tunes such as UI-TARS and Holo): Qwen2 with
         // multimodal rotary positions, which equal plain ones for text.
         "qwen2" | "qwen2vl" => Arch::Qwen2,
+        // Qwen3-VL and its fine-tunes (GUI-Owl, Holo2, MAI-UI): Qwen3 with interleaved
+        // multimodal rotary positions.
+        "qwen3vl" => Arch::Qwen3,
+        "qwen3vlmoe" => Arch::Qwen3Moe,
         "qwen3" => Arch::Qwen3,
         "qwen3moe" => Arch::Qwen3Moe,
         "deepseek2" => Arch::Deepseek2,
@@ -421,6 +427,7 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
             .unwrap_or(head_dim),
         rope_neox: !matches!(arch, Arch::Llama | Arch::Deepseek2),
         rope_sections: rope_sections(g, &prefix),
+        rope_interleaved: prefix.starts_with("qwen3vl"),
         rope_linear_scale,
         has_rope_freqs: g.tensor("rope_freqs.weight").is_some(),
         tied_embeddings: g.tensor("output.weight").is_none(),
