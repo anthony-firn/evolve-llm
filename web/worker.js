@@ -684,11 +684,14 @@ const handlers = {
       return;
     }
     // A vision model's image encoder: downloaded beside it, read whole, and put on its GPU.
+    let visionFile = source.kind === 'file' ? source.visionFile : null;
     if (source.vision && !source.stream && source.kind !== 'file') {
       const [part] = await download({ ...source.vision, parts: null });
-      const file = await (await (await modelsDir()).getFileHandle(part)).getFile();
-      post('progress', { phase: 'vision', loaded: 0, total: file.size });
-      result.vision = { unit: chat.attach_vision(new Uint8Array(await file.arrayBuffer())) };
+      visionFile = await (await (await modelsDir()).getFileHandle(part)).getFile();
+    }
+    if (visionFile) {
+      post('progress', { phase: 'vision', loaded: 0, total: visionFile.size });
+      result.vision = { unit: chat.attach_vision(new Uint8Array(await visionFile.arrayBuffer())) };
     }
     const name = source.kind === 'file' ? (source.files || [source.file])[0].name : null;
     post('loaded', { ...result, source: source.kind === 'file' ? { kind: 'file', name } : { kind: 'hf', key: source.key, id: source.id } });

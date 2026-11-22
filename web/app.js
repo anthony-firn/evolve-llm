@@ -1233,7 +1233,10 @@ $('hf-form').addEventListener('submit', async (e) => {
 $('file-input').addEventListener('change', (e) => {
   const files = [...(e.target.files || [])].sort((a, b) => a.name.localeCompare(b.name));
   e.target.value = '';
-  if (files.length) startLoad({ kind: 'file', files, key: null, id: null });
+  // An image encoder (llama.cpp names them mmproj) picked with the model goes beside it.
+  const vision = files.find((f) => /mmproj/i.test(f.name)) || null;
+  const model = files.filter((f) => f !== vision);
+  if (model.length) startLoad({ kind: 'file', files: model, key: null, id: null, visionFile: vision });
 });
 
 // Drawer on narrow screens.
