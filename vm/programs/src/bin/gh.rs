@@ -1068,10 +1068,12 @@ fn gh(args: &[String]) -> R<()> {
             println!("{}", serde_json::to_string_pretty(&api(method, &format!("/{}", path.trim_start_matches('/')), None)?).unwrap());
             Ok(())
         }
-        _ => {
+        (None, _) | (Some("help" | "--help" | "-h"), _) => {
             println!("{GH_HELP}");
             Ok(())
         }
+        // A command that is not here fails, so a chain stops and the model sees it.
+        (Some(a), b) => Err(format!("gh {a}{}: not available here. gh help lists what works", b.map(|b| format!(" {b}")).unwrap_or_default())),
     }
 }
 

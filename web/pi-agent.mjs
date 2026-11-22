@@ -36,7 +36,7 @@ You work in a small Linux system inside this web page. Each request says the wor
 Tools: bash runs shell commands (pipes, &&, redirections; ls cat grep find head tail wc sort diff mkdir rm cp mv and more). read shows a file. write creates or replaces a file. edit replaces one exact piece of text in a file you have read.
 
 git and gh work on GitHub repositories. Use them in this order, one step per bash call, reading each result before the next step:
-1. gh repo clone OWNER/REPO (it makes a folder named REPO), then cd REPO
+1. Clone the repository the person names with gh repo clone and its owner/name (it makes a folder with the name after the slash), then cd into that folder
 2. git checkout -b NEW-BRANCH before changing files
 3. Change files with write or edit, then check with git status and git diff
 4. git commit -m "What changed" (it includes every change; git add is not needed)
@@ -66,6 +66,20 @@ const shellText = r => [`exit code ${r.code}${r.timedOut?' (timed out)':''}, in 
 /** What a small model needs to recover from a failed command: which folders exist when a cd
  *  missed, that a && chain stopped at its first error, that read/write/edit are tools, and that
  *  it is repeating a command that already failed. */
+/** What a request in the Linux workspace starts with: the working directory and, for a GitHub
+ *  repository the request names, where it is cloned or the exact command to clone it. Small
+ *  models otherwise skip the clone or copy a placeholder like OWNER/REPO. */
+async function preamble(prompt, workspace, cwd) {
+  const lines = [`Working directory: ${cwd}.`];
+  for (const [, owner, name] of String(prompt).matchAll(/(?:github\.com\/|\brepo(?:sitory)?\s+)([\w.-]+)\/([\w.-]+?)(?:\.git)?(?=[\s,.;:)]|$)/gi)) {
+    const dir = `${cwd.replace(/\/$/, '')}/${name}`;
+    const config = await workspace.vm?.read(`${dir}/.evolve-git/config.json`).catch(() => null);
+    const here = config?.ok && config.data.includes(`"owner": "${owner}"`) && config.data.includes(`"repo": "${name}"`);
+    lines.push(here ? `${owner}/${name} is already cloned in ${dir}: run cd ${dir}` : `To work on ${owner}/${name}, first run: gh repo clone ${owner}/${name}, then cd ${name}`);
+  }
+  return `(${lines.join(' ')})`;
+}
+
 /** Small models write each command as if it started where the task began ("cd app && ..."),
  *  though a cd carries over. A leading cd to a folder that is not here, but is where the task
  *  began, goes there: [command to run, note or null]. */
@@ -322,5 +336,5 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
-  return {async run(prompt){await agent.prompt(linux?`(Working directory: ${linux.cwd})\n\n${prompt}`:prompt);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
+  return {async run(prompt){await agent.prompt(linux?`${await preamble(prompt,workspace,linux.cwd)}\n\n${prompt}`:prompt);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
 }
