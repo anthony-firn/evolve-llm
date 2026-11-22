@@ -814,19 +814,22 @@ fn run_cmd(r: &Repo, args: &[String]) -> R<()> {
                     let branch = args.iter().position(|a| a == "--branch" || a == "-b").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| r.branch());
                     let mut found = None;
                     // A pushed branch's run can take a little while to appear.
-                    for _ in 0..24 {
+                    for _ in 0..12 {
                         found = api("GET", &format!("/repos/{or}/actions/runs?per_page=1&branch={}", url_path(&branch)), None)?["workflow_runs"].get(0).map(|w| w["id"].to_string());
                         if found.is_some() {
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_secs(5));
                     }
-                    found.ok_or(format!("no CI run for branch {branch} after 2 minutes (gh run list shows the runs)"))?
+                    found.ok_or(format!("no CI run for branch {branch} after a minute (gh run list shows the runs)"))?
                 }
             };
+            // At most 8 minutes here: a command in the VM is stopped after 10, and CI can take longer.
             eprint!("Waiting for run {id}");
-            for _ in 0..360 {
+            let mut done = false;
+            for _ in 0..48 {
                 if api("GET", &format!("/repos/{or}/actions/runs/{id}"), None)?["status"].as_str() == Some("completed") {
+                    done = true;
                     break;
                 }
                 eprint!(".");
@@ -834,6 +837,9 @@ fn run_cmd(r: &Repo, args: &[String]) -> R<()> {
             }
             eprintln!();
             run_summary(&or, &id)?;
+            if !done {
+                println!("Run {id} is still running after 8 minutes. To keep waiting, run: gh run watch {id}");
+            }
         }
         Some(other) => return Err(format!("gh run {other}: not available here (list, view, watch)")),
     }
