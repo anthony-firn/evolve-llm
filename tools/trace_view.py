@@ -26,10 +26,16 @@ def short(text, full):
 def line(e, full):
     t = e.get("time", "")[11:19]
     kind = e.get("type")
+    if kind == "split":
+        where = f"layers {e.get('here')} on this GPU, {e.get('others') or 'none'} on the other"
+        return f"{t} ⇆ {e.get('model')}: {where} ({e.get('n_layer')} layers; {e.get('freeGB')} GB free on the faster GPU)"
     if kind in ("run", "chat"):
         return f"\n{t} ▶ {e.get('model')}: {short(e.get('question'), True)}"
     if kind == "turn":
-        return f"{t}   model {e.get('ms', 0) / 1000:.1f}s, {e.get('promptTokens', '?')} prompt + {e.get('tokens', '?')} tokens ({e.get('reason')}): {short(e.get('text'), full)}"
+        speed = ""
+        if e.get("prefillMs") and e.get("computed"):
+            speed = f" [read {e['computed']} at {e['computed'] / (e['prefillMs'] / 1000):.0f}/s, wrote at {e.get('tokens', 0) / max(e.get('decodeMs', 1) / 1000, 1e-3):.1f}/s]"
+        return f"{t}   model {e.get('ms', 0) / 1000:.1f}s, {e.get('promptTokens', '?')} prompt + {e.get('tokens', '?')} tokens ({e.get('reason')}){speed}: {short(e.get('text'), full)}"
     if kind == "turn-error":
         return f"{t}   model stopped: {e.get('error')}"
     if kind == "tool":

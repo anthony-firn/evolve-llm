@@ -337,12 +337,27 @@ export class Helpers {
 }
 
 /**
+ * Two ends of a link inside one page, for a helper that is this machine's other GPU: what one
+ * end sends arrives at the other's onMessage, with the same shape as a data channel's.
+ */
+export function localLinkPair() {
+  const a = { onMessage: null, close() {} };
+  const b = { onMessage: null, close() {} };
+  a.send = (m, bytes = null) => { queueMicrotask(() => b.onMessage?.(m, bytes)); return Promise.resolve(); };
+  b.send = (m, bytes = null) => { queueMicrotask(() => a.onMessage?.(m, bytes)); return Promise.resolve(); };
+  return [a, b];
+}
+
+/**
  * A helper's side: answers the chat device's messages with its own worker. `about` is what it
  * tells the chat device ({name, capacity, gpu}); `load(msg)` starts loading in the worker.
+ * `local`: the helper is this machine's other GPU, which reads the model from where the main
+ * worker does (a file, this browser's storage) instead of each part from Hugging Face.
  */
 export class Helping {
-  constructor({ link, worker, about, settings, onState = () => {} }) {
+  constructor({ link, worker, about, settings, onState = () => {}, local = false }) {
     this.link = link;
+    this.local = local;
     this.worker = worker;
     this.settings = settings;
     this.onState = onState;
@@ -370,7 +385,7 @@ export class Helping {
       this.served = 0;
       this.onState({ state: 'loading', stage: m.stage, name: m.source?.name });
       const s = this.settings();
-      this.worker.postMessage({ type: 'load', source: { ...m.source, stream: true }, ctx: m.ctx, stage: m.stage, gpu: s.gpu, gpuMemory: s.gpuMemory, cacheGb: Number(s.cacheGb) });
+      this.worker.postMessage({ type: 'load', source: this.local ? m.source : { ...m.source, stream: true }, ctx: m.ctx, stage: m.stage, gpu: s.gpu, gpuMemory: s.gpuMemory, cacheGb: Number(s.cacheGb) });
     } else if (m.t === 'fwd' && bytes) {
       const id = ++this.seq;
       this.calls.set(id, m.id);

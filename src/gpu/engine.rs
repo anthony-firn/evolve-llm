@@ -12,6 +12,9 @@ use wgpu::util::DeviceExt;
 
 /// Tokens processed per submission while reading a prompt.
 pub const MAX_BATCH: usize = 128;
+/// The smallest prompt chunk, and the time past which the next chunk is halved.
+const MIN_BATCH: usize = 16;
+const SLOW_CHUNK_MS: f64 = 2000.0;
 
 /// Marks an expert that is not resident in the expert-to-slot map.
 pub const ABSENT: u32 = u32::MAX;
@@ -396,6 +399,10 @@ pub struct Engine {
     snapshot_pos: Cell<Option<usize>>,
     /// The next pass returns logits for every token (speculative verification).
     all_logits: Cell<bool>,
+    /// Tokens per prompt chunk, sized so one chunk finishes in about a second or two: on a slow
+    /// GPU with a long context, a full chunk can outlast the driver's limit on one piece of GPU
+    /// work (Linux i915 cancels after about 10 s). Learned from each chunk, kept between passes.
+    batch: Cell<usize>,
     /// A second copy of the recurrent state, taken before verifying a draft (made on first use).
     spec_state: RefCell<Vec<(wgpu::Buffer, wgpu::Buffer)>>,
     spec_pos: Cell<usize>,
@@ -901,6 +908,7 @@ impl Engine {
             recurrent_pos: Cell::new(0),
             snapshot_pos: Cell::new(None),
             all_logits: Cell::new(false),
+            batch: Cell::new(MAX_BATCH),
             spec_state: RefCell::new(Vec::new()),
             spec_pos: Cell::new(0),
             stage,
@@ -2430,10 +2438,18 @@ impl Engine {
             return Err("drafts are not verified while other devices run part of the model".into());
         }
         let (k_in, k_out) = (self.ckpts_before(self.stage.first), self.ckpts_before(self.stage.end));
-        let chunks: Vec<(usize, usize)> = (0..total).step_by(MAX_BATCH).map(|s| (s, MAX_BATCH.min(total - s))).collect();
+        let mut chunks: Vec<(usize, usize)> = Vec::new();
         let mut hidden = Vec::new();
-        for (i, &(s, n)) in chunks.iter().enumerate() {
-            let last = i + 1 == chunks.len();
+        // With later layers on another device (or this machine's other GPU), each chunk goes on
+        // as soon as this GPU has it, so both work at once: this GPU reads chunk i+1 while the
+        // other runs chunk i. The other device takes chunks in the order sent.
+        let mut sent: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>, String>> + '_>>> = Vec::new();
+        let mut s = 0;
+        while s < total {
+            let n = self.batch.get().clamp(MIN_BATCH, MAX_BATCH).min(total - s);
+            let last = s + n == total;
+            chunks.push((s, n));
+            let started = super::now_ms();
             self.write_step(n, pos0 + s, 0);
             match input.slice(s, n) {
                 Feed::Tokens(t) => self.gpu.queue.write_buffer(&st.tokens, 0, &words(t)),
@@ -2442,19 +2458,46 @@ impl Engine {
             let cmd = self.encode_chunk(n, last && !hand_on);
             self.gpu.queue.submit([cmd]);
             if hand_on {
-                hidden.extend(self.read_hidden(n, k_out, &st.x, 0, 0).await?);
+                let h = self.read_hidden(n, k_out, &st.x, 0, 0).await?;
+                match &remote {
+                    Some(r) if self.stage.head => {
+                        let mut call = r.forward(h, n, pos0 + s);
+                        // Started now (a call begins when first polled), awaited after the loop.
+                        let _ = call.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+                        sent.push(call);
+                    }
+                    _ => hidden.extend(h),
+                }
             } else if !last {
                 // One chunk at a time: drivers cancel queued work that waits too long (Linux i915
                 // after about 10 s), and a long prompt on a slow GPU queues far more than that.
                 super::wait_idle(&self.gpu).await?;
             }
+            // The next chunk's size from this one's time (each chunk sees a longer context).
+            if !last && n == self.batch.get().min(MAX_BATCH) {
+                let ms = super::now_ms() - started;
+                if ms > SLOW_CHUNK_MS && n > MIN_BATCH {
+                    self.batch.set((n / 2).max(MIN_BATCH));
+                } else if ms < SLOW_CHUNK_MS / 4.0 && n < MAX_BATCH {
+                    self.batch.set((n * 2).min(MAX_BATCH));
+                }
+            }
+            s += n;
         }
         if !self.stage.head {
             return Ok(hidden);
         }
-        if let Some(r) = &remote {
+        if remote.is_some() {
             let &(s, n) = chunks.last().unwrap();
-            self.through_remote(r.as_ref(), hidden, total, pos0, s, n, 0).await?;
+            // The last chunk's state after every later layer comes back for the head.
+            let mut back = Vec::new();
+            for call in sent {
+                back = call.await?;
+            }
+            if back.len() != n * self.hidden_width(self.cfg.n_layer) {
+                return Err("another device returned a hidden state of the wrong size".into());
+            }
+            self.write_hidden(&back, n, self.ckpts_before(self.cfg.n_layer), &st.x, 0, 0);
             self.write_step(n, pos0 + s, 0);
             let mut enc = self.gpu.device.create_command_encoder(&Default::default());
             self.record_head(&mut enc, n);

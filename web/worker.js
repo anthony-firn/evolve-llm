@@ -5,7 +5,7 @@ import { assistantWithCalls, nativeToolFormat, toolResult, toolTransport } from 
 import { openModelReaders, storageError } from './model-readers.mjs';
 import { RangeCache, RemoteModel } from './remote-reader.mjs';
 import { CHUNK as SWARM_CHUNK } from './swarm-protocol.mjs';
-import { capacityOf, planSplit } from './split.mjs';
+import { capacityOf, planFill, planSplit } from './split.mjs';
 import { TOOL_SCHEMAS, displayText, parseToolCalls, rawPiece, runTool, schemaTypes, webSearch } from './tools.js';
 
 const CHUNK = 16 << 20; // bytes read from the file per upload call
@@ -342,7 +342,34 @@ function readHeader(reader) {
   }
 }
 
-async function loadModel(source, wantCtx, lowPower, budgetPref, { stage = null, split = null } = {}) {
+/**
+ * Free memory on this worker's GPU, measured: 256 MB buffers are allocated (and touched) until
+ * the GPU refuses or `need` bytes are found, then freed. Browsers do not say how much memory a
+ * GPU has free, and another program may be holding most of it.
+ */
+async function freeGpuBytes(lowPower, need) {
+  const adapter = await navigator.gpu?.requestAdapter({ powerPreference: lowPower ? 'low-power' : 'high-performance' });
+  if (!adapter) return 0;
+  const device = await adapter.requestDevice({ requiredLimits: { maxBufferSize: adapter.limits.maxBufferSize } });
+  const step = 256 * 2 ** 20;
+  const buffers = [];
+  try {
+    while (buffers.length * step < need) {
+      device.pushErrorScope('out-of-memory');
+      const b = device.createBuffer({ size: step, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(b, step - 4, new Uint32Array([1]));
+      if (await device.popErrorScope()) { b.destroy(); break; }
+      buffers.push(b);
+    }
+    await device.queue.onSubmittedWorkDone();
+  } finally {
+    buffers.forEach((b) => b.destroy());
+    device.destroy();
+  }
+  return buffers.length * step;
+}
+
+async function loadModel(source, wantCtx, lowPower, budgetPref, { stage = null, split = null, pool = false } = {}) {
   readers = source.remote ? source.remote.readers() : await openModelReaders(source, modelsDir);
   remote = source.remote || null;
   // Headers come over the network together; later reads of a longer header fall back to
@@ -373,9 +400,25 @@ async function loadModel(source, wantCtx, lowPower, budgetPref, { stage = null, 
   const budget = budgetPref === 'all' ? null
     : budgetPref && budgetPref !== 'auto' ? Number(budgetPref) * 2 ** 30
     : (model.fast_bytes > AUTO ? AUTO : null);
+  // Pooled with this machine's other GPU (`pool`, one local helper): this, the faster GPU, keeps
+  // the embedding, the head and as many layers as its free memory holds, and the other GPU the
+  // rest, all on the GPU (nothing streamed). A model that fits here is not split.
+  let pooled = false;
+  if (pool && split?.length === 1) {
+    const lb = JSON.parse(layer_bytes(headers));
+    const fileBytes = lb.layers.reduce((a, b) => a + b, 0) + lb.embed + (lb.tied ? 0 : lb.head);
+    const scale = Math.max(1, (model.fast_bytes || fileBytes) / fileBytes);
+    const need = (model.fast_bytes || fileBytes) + (lb.kv_per_token || 0) * ctx * lb.n_layer;
+    const free = await freeGpuBytes(lowPower, need * 1.15);
+    const [, rest] = planFill(lb, free, ctx, scale);
+    const helpers = rest.end > rest.first ? [{ helper: 0, stage: { first: rest.first, end: rest.end, embed: false, head: false } }] : [];
+    if (helpers.length) stage = { first: 0, end: rest.first, embed: true, head: true };
+    pooled = helpers.length > 0;
+    post('split-plan', { helpers, ctx, n_layer: lb.n_layer, mine: stage, pooled, free });
+  }
   // Shared with the person's other devices (`split`: what each can hold): this one keeps the
   // embedding, the head and the first layers, and the page has the others load the rest.
-  if (split?.length) {
+  else if (split?.length) {
     const lb = JSON.parse(layer_bytes(headers));
     const stages = planSplit(lb, [capacityOf(budgetPref, MOBILE), ...split]);
     const helpers = stages.slice(1).map((s, helper) => ({ helper, stage: { first: s.first, end: s.end, embed: false, head: false } })).filter((h) => h.stage.end > h.stage.first);
@@ -384,7 +427,7 @@ async function loadModel(source, wantCtx, lowPower, budgetPref, { stage = null, 
   }
   let loader;
   try {
-    loader = await create_loader(headers, JSON.stringify({ low_power: lowPower, budget, stage }));
+    loader = await create_loader(headers, JSON.stringify({ low_power: lowPower, budget: pooled ? null : budget, stage }));
   } catch (e) {
     throw new Error(`Could not start the model on the GPU: ${e?.message || e}`);
   }
@@ -521,7 +564,7 @@ async function turn(messages, opts, maxTokens, ctx, emit = post, preserveTask = 
   }
   raw += chat.flush();
   show();
-  return { text: raw, display: displayText(raw), n, reason, ms: performance.now() - t1, promptTokens: tokens.length };
+  return { text: raw, display: displayText(raw), n, reason, ms: performance.now() - t1, promptTokens: tokens.length, computed: pre.computed, prefillMs: t1 - t0 };
 }
 
 const MAX_TOOL_ROUNDS = 3;
@@ -601,7 +644,7 @@ const handlers = {
   async adapter({ gpu }) {
     post('adapter', { adapter: await describeAdapter(gpu) });
   },
-  async load({ source, ctx, gpu, gpuMemory, cacheGb, share, stage, split }) {
+  async load({ source, ctx, gpu, gpuMemory, cacheGb, share, stage, split, pool }) {
     cancelLoad = false;
     swarmOn = Boolean(share);
     unload();
@@ -615,7 +658,7 @@ const handlers = {
       files = { names: await download(source) };
       post('cache', await listCached().catch(() => ({ models: [], supported: false })));
     }
-    const result = await loadModel(files, ctx, gpu === 'low-power', gpuMemory, { stage, split });
+    const result = await loadModel(files, ctx, gpu === 'low-power', gpuMemory, { stage, split, pool });
     if (result.stageLoaded) {
       post('stage-loaded', { stage: result.stage, placement: result.placement });
       return;

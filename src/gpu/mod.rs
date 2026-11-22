@@ -178,6 +178,18 @@ pub async fn read_back(gpu: &Gpu, buffer: &wgpu::Buffer, len: u64) -> Result<Vec
     Ok(data)
 }
 
+/// Milliseconds on a wall clock, native and in the browser (for timing GPU work).
+pub fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
+    }
+}
+
 /// Wait until the GPU has finished all submitted work.
 pub async fn wait_idle(gpu: &Gpu) -> Result<(), String> {
     let (send, done) = oneshot();

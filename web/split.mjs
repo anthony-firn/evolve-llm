@@ -35,3 +35,20 @@ export function capacityOf(pref, mobile = false) {
   if (pref && pref !== 'auto' && Number(pref) > 0) return Number(pref) * 2 ** 30;
   return (mobile ? 1.5 : 4) * 2 ** 30;
 }
+
+/**
+ * Two GPUs in one machine, for speed: the first (the faster, which also holds the embedding and
+ * the head) takes as many layers as fit in `fastBytes` of free memory, and the second the rest.
+ * A layer needs its weights on the GPU (`scale` times their size in the file, for the faster
+ * layout) and its attention cache for `ctx` tokens. Returns [{first, end}, {first, end}]; when
+ * the whole model fits on the first, the second gets first === end.
+ */
+export function planFill(lb, fastBytes, ctx, scale = 1, margin = 0.9) {
+  const n = lb.n_layer;
+  const fixed = (lb.embed + (lb.tied ? 0 : lb.head)) * scale;
+  const perLayer = (l) => lb.layers[l] * scale + (lb.kv_per_token || 0) * ctx;
+  let room = fastBytes * margin - fixed;
+  let l = 0;
+  while (l < n && room - perLayer(l) >= 0) room -= perLayer(l++);
+  return [{ first: 0, end: l }, { first: l, end: n }];
+}
