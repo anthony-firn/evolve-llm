@@ -459,3 +459,19 @@ test('an answer without a link, when sources were asked for, is sent back with t
  assert.equal(n,3);
  assert.match(prompts[2],/your answer has no link\. Give your answer again with the link of the page it came from\. Pages you opened: https:\/\/en\.wikipedia\.org\/wiki\/Lighthouse/);
 });
+
+test('a button clicked again on the same page is held once and explained, then allowed', async () => {
+  const pages = { 'https://shop.example/': '# Shop\nCart: 1 item(s)\n[1] button "Add Red Kettle to cart"  [2] button "Add Blue Kettle to cart"' };
+  const browser = fakeBrowser(pages); let n = 0; const seen = [];
+  const task = createPiTask({ browser, workspace: { request: async () => ({}) }, network, turn: async (messages) => {
+    if (n) seen.push(messages.at(-1).content);
+    n++;
+    if (n === 1) return call('browser_open', { url: 'https://shop.example/' });
+    if (n <= 4) return call('browser_click', { ref: 2 });
+    if (n === 5) return call('browser_click', { ref: 1 });
+    return { text: 'Done.', reason: 'end' };
+  } });
+  await task.run('Add the blue kettle to the cart');
+  assert.deepEqual(browser.log.filter(l => l[0] === 'click').map(l => l[1]), [2, 2, 1]);
+  assert.match(JSON.stringify(seen[2]), /was not done: you already clicked button \\"Add Blue Kettle to cart\\" on this page, and the page then said: \\"Cart: 1 item\(s\)\\"/);
+});

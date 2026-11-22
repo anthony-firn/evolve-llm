@@ -227,6 +227,9 @@ function refLine(snapshotText, ref) {
 /** Browser tools that act on the shared live page through a BrowserClient (browser/API.md §4). */
 function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, confirmBrowserAction } = {}) {
   let client=null, last=null;
+  // Buttons already clicked, by page and label, with what the page said after: a second click
+  // (small models go back and click "Add to cart" again and again) is held once and explained.
+  const pressed=new Map(), held=new Set();
   const getClient=async()=>{if(!client){client=typeof browser==='function'?await browser():browser;if(!client)throw new Error('The browser is not available.');}return client;};
   const settle=async(b,ms)=>{if(typeof b.waitForIdle==='function'){try{await b.waitForIdle(ms);}catch{/* a slow page still gets a snapshot */}}};
   const snapshot=async b=>{last=await b.snapshot(snapshotChars);return last;};
@@ -272,7 +275,18 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
         const ok=typeof confirmBrowserAction==='function'?await confirmBrowserAction(`Pi wants to click [${ref}] ${line}`):false;
         if(!ok)return {ok:false,text:`Click [${ref}] was not done: ${line} may buy, send, post, delete or change an account, so it needs the person's approval. Tell the person what this would do and ask them to click it in the browser themselves (or to approve it).`};
       }
+      const key=/^(button|clickable|menuitem)\b/.test(line)?`${last.url}|${label0}`:null;
+      if(key&&pressed.has(key)&&!held.has(key)){
+        held.add(key);
+        return {ok:true,text:`Click [${ref}] was not done: you already clicked ${label0} on this page, and the page then said: "${pressed.get(key)}". Clicking it again would do it a second time. If the request asks for it more than once, click it again; otherwise go on with the next step.`,snap:last};
+      }
       action=await b.click(ref);
+      if(key&&action?.ok!==false){
+        await settle(b,action?.navigated?20000:3000);
+        const after=await b.snapshot(snapshotChars);
+        const said=String(after?.text||'').split('\n').map(l=>l.trim()).filter(l=>l&&!/^#|\[\d+\]/.test(l)).join(' ').slice(0,160);
+        pressed.set(key,said||'(no message)');held.delete(key);
+      }
     }else if(name==='browser_type'){
       label=`Type into [${ref}]`;
       if(/^password\b/.test(line))return {ok:false,text:failure(label,'password')};
