@@ -228,6 +228,7 @@ cargo install wasm-bindgen-cli --version 0.2.130 --locked
 cargo install wasm-opt --locked      # optional: a 24% smaller engine
 python3 tools/build_web.py           # writes dist/
 python3 -m http.server 8080 --directory dist
+python3 tools/serve_local.py           # or this: http://localhost:8080/play/evolve-llm/ with a live trace of each chat
 ```
 
 Open http://localhost:8080. Any static host works. The app needs these content security policy
