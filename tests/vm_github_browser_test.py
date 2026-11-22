@@ -48,6 +48,9 @@ class Fake:
         self.commits[C0] = {"tree": self.tree_id(tree), "parents": [], "message": "Initial commit"}
         self.refs = {"main": C0}
         self.pulls = []
+        # Actions runs: each {id, status, conclusion, name, head_branch, jobs: [{id, name, conclusion,
+        # steps: [{name, conclusion}], annotations: [{path, start_line, message}]}]}.
+        self.runs = [{"id": 7, "status": "completed", "conclusion": "failure", "name": "CI", "head_branch": "feature", "jobs": []}]
         self.corrupt = None
         self.auth = []
 
@@ -136,6 +139,9 @@ class Fake:
         if rest == "/merges" and method == "POST":
             status, sha = self.merge(body["base"], body["head"], body.get("commit_message", "Merge"))
             return status, ({"sha": sha} if sha else {"message": "Merge conflict"} if status == 409 else b"")
+        if rest.startswith("/check-runs/") and rest.endswith("/annotations"):
+            job = int(rest.split("/")[2])
+            return 200, next((j.get("annotations", []) for r in self.runs for j in r["jobs"] if j["id"] == job), [])
         if "/check-runs" in rest:
             return 200, {"check_runs": [{"name": "CI", "status": "completed", "conclusion": "success"}]}
         if rest.startswith("/pulls/") and rest.endswith("/merge") and method == "PUT":
@@ -188,8 +194,16 @@ class Fake:
         if rest == "/pulls":
             head = query.get("head", "").partition(":")[2]
             return 200, [self.pull_json(p) for p in self.pulls if not p.get("merged") and head in ("", p["head"])]
+        if rest.startswith("/actions/runs/") and rest.endswith("/jobs"):
+            run = next((r for r in self.runs if str(r["id"]) == rest.split("/")[3]), None)
+            return (200, {"jobs": run["jobs"]}) if run else (404, {"message": "Not Found"})
+        if rest.startswith("/actions/runs/"):
+            run = next((r for r in self.runs if str(r["id"]) == rest.split("/")[3]), None)
+            return (200, {k: v for k, v in run.items() if k != "jobs"}) if run else (404, {"message": "Not Found"})
+        if rest == "/actions/runs" and query.get("branch"):
+            return 200, {"workflow_runs": [{k: v for k, v in r.items() if k != "jobs"} for r in self.runs if r["head_branch"] == query["branch"]]}
         if rest == "/actions/runs":
-            return 200, {"workflow_runs": [{"id": 7, "status": "completed", "conclusion": "failure", "name": "CI", "head_branch": "feature"}]}
+            return 200, {"workflow_runs": [{k: v for k, v in r.items() if k != "jobs"} for r in self.runs]}
         if rest.startswith("/commits"):
             out, c = [], query.get("sha", C0)
             while c and len(out) < 10:

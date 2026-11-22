@@ -103,6 +103,27 @@ def check_merge(fake, page, run):
     return (tree(fake, "main")["README.md"] == b"# Demo\n\nA small calculator.\n"), "merged; main has the change"
 
 
+TEST_CALC = "import unittest\nfrom calc import add, sub\n\n\nclass T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_sub(self):\n        self.assertEqual(sub(5, 3), 2)\n\n\nunittest.main()\n"
+
+
+def setup_ci():
+    fake = gh.Fake({"README.md": b"# Calculator\n", "calc.py": CALC.encode(), "test_calc.py": TEST_CALC.encode()})
+    fake.runs = [{"id": 41, "status": "completed", "conclusion": "failure", "name": "CI", "head_branch": "main", "jobs": [
+        {"id": 4101, "name": "test", "conclusion": "failure", "steps": [{"name": "Run python3 test_calc.py", "conclusion": "failure"}],
+         "annotations": [{"path": "test_calc.py", "start_line": 7, "message": "AssertionError: -1 != 5 (add(2, 3) returned -1)"}]}]}]
+    return fake
+
+
+def check_ci(fake, page, run):
+    t = tree(fake, "fix-ci")
+    if not t:
+        return False, "no fix-ci branch on GitHub"
+    if t.get("calc.py", b"").decode() != CALC.replace("return a - b", "return a + b", 1):
+        return False, f"calc.py on fix-ci is {t.get('calc.py', b'').decode()!r}"
+    tested = " (ran python3)" if run.get("ran_python") else " (did not run python3)"
+    return (True, "add() fixed, pull request open" + tested) if pr_from(fake, "fix-ci") and unchanged_except(fake, "fix-ci", "calc.py") else (False, "no pull request or other files changed")
+
+
 def check_html(fake, page, run):
     html = page.evaluate("async () => { for (const p of ['/home/user/counter.html']) { const r = await (await import('./vm/client.mjs')).sharedVm().read(p); if (r.ok) return r.data; } return ''; }")
     if "<button" not in html.lower():
@@ -123,6 +144,7 @@ TASKS = {
                  check_new_file),
     "question": (lambda: gh.Fake(), "What does git checkout -b NAME do? Answer in one sentence.", check_question),
     "merge": (setup_merge, "Merge pull request #1 in the GitHub repository demo/app.", check_merge),
+    "ci-fix": (setup_ci, "CI is failing for the GitHub repository demo/app. Find out why, fix it on a new branch named fix-ci, test the fix, push it and open a pull request.", check_ci),
     "html-app": (lambda: gh.Fake(), "Make a small web page counter.html with a button that counts how many times it is clicked. Test it and show it to me.", check_html),
 }
 
@@ -184,6 +206,7 @@ def main():
                 "turns": sum(e["type"] == "turn" for e in events), "calls": sum(e["type"] == "tool" for e in events),
                 "failed": sum(e["type"] == "result" and e.get("error") for e in events), "repairs": sum(e["type"] == "retry" for e in events),
                 "reply": page.locator(".msg.assistant .bubble").last.inner_text() if page.locator(".msg.assistant").count() else "",
+                "ran_python": any(e["type"] == "tool" and "python3" in e.get("args", "") for e in events),
                 "questions": questions, "page_errors": errors,
             }
             try:
