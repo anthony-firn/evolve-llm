@@ -58,7 +58,8 @@ async function shellNotes(command, r, workspace, failed, signal) {
     const dirs = (ls?.stdout || '').split('\n').filter(l => l.endsWith('/'));
     notes.push(`there is no ${missing[1]} here (${r.cwd}). ${dirs.length ? `Folders here: ${dirs.join(' ')}` : 'There are no folders here.'}`);
   }
-  const misused = /\b(read|write|edit): (?:command )?not found/.exec(err);
+  // read is also a shell builtin (it reads input), so look at the command itself as well.
+  const misused = /\b(read|write|edit): (?:command )?not found/.exec(err) || /(?:^|&&|\|\||;|\|)\s*(read|write|edit)\s+[\w./-]+\.\w+/.exec(command);
   if (misused) notes.push(`${misused[1]} is a tool, not a shell command. Call the ${misused[1]} tool instead.`);
   if (/&&/.test(command)) notes.push('the command stopped at the first error, so the steps after it did not run. Run one step per command.');
   const key = command.trim();
@@ -206,8 +207,15 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       if(linux&&result.code)result.notes=await shellNotes(String(args.command||''),result,workspace,failedCommands,signal);
     }
     else if(['read','write','edit'].includes(name)){
-      if(name==='edit'&&!readFiles.has(args.path))throw new Error('Read this file first, then edit an exact nonempty oldText from the read result.');
-      if(name==='edit'&&(!args.oldText||!readFiles.get(args.path).includes(args.oldText)))throw new Error('oldText must be a nonempty exact substring from the latest read result. Read the file and retry.');
+      // A small model often edits without reading, or with text the file does not have: the
+      // error then shows the file, so the next edit can copy exact text from it.
+      if(name==='edit'&&(!readFiles.has(args.path)||!args.oldText||!readFiles.get(args.path).includes(args.oldText))){
+        const unread=!readFiles.has(args.path);
+        const file=await workspace.request('read',{path:args.path},{signal}).catch(()=>null);
+        if(!file)throw new Error(`${args.path} does not exist. Use write to create it.`);
+        readFiles.set(args.path,file.text);
+        throw new Error(`${unread?`${args.path} had not been read yet`:`oldText is not in ${args.path}`}, so nothing was changed. Its current text is below; call edit again with oldText copied exactly from it.\n--- ${args.path}\n${file.text.slice(0,3000)}`);
+      }
       result=await workspace.request(name,args,{signal});if(name==='read')readFiles.set(args.path,result.text);else readFiles.delete(args.path);
       if(['write','edit'].includes(name)){changes++;if(/\.html?$/i.test(args.path))previewPath=args.path;}
     }

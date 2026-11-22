@@ -102,7 +102,7 @@ class Fake:
 
     def pull_json(self, p):
         merged = p.get("merged", False)
-        mergeable = None if merged else self.merged_tree(self.refs[p["base"]], self.refs[p["head"]]) is not None
+        mergeable = None if merged or p["head"] not in self.refs else self.merged_tree(self.refs[p["base"]], self.refs[p["head"]]) is not None
         return {"number": p["number"], "title": p["title"], "body": p.get("body", ""), "state": "closed" if merged else "open", "merged": merged, "mergeable": mergeable,
                 "head": {"ref": p["head"], "sha": self.refs.get(p["head"])}, "base": {"ref": p["base"]}, "html_url": f"https://github.com/demo/app/pull/{p['number']}"}
 
@@ -180,6 +180,8 @@ class Fake:
             self.refs[body["ref"][len("refs/heads/"):]] = body["sha"]
             return 201, {}
         if rest == "/pulls" and method == "POST":
+            if body["head"] not in self.refs:
+                return 422, {"message": "Validation Failed"}
             n = len(self.pulls) + 1
             self.pulls.append({**body, "number": n})
             return 201, {"number": n, "html_url": f"https://github.com/demo/app/pull/{n}"}
@@ -345,7 +347,14 @@ def main():
         check(code != 0 and "has merge conflicts with main" in err and FAKE.refs["main"] == cid, f"a conflicting pull request is not merged ({err!r})")
         code, out, err = sh("cd app && git checkout main && git merge fix")
         check(code != 0 and "merge conflict" in err and "Tell the person" in err and FAKE.refs["main"] == cid, f"a conflicting git merge changes nothing ({out!r} {err!r})")
-        code, out, err = sh("cd app && git checkout -b fix")
+        code, out, err = sh("cd app && git checkout -b empty && git commit -m 'Nothing'")
+        check(code != 0 and "nothing to commit: no file has changed" in err, f"committing nothing fails, so a chain stops ({err!r})")
+        code, out, err = sh("cd app && git push")
+        check(code != 0 and "has no commits to push yet" in err, f"pushing a new branch without commits says to commit ({err!r})")
+        page.evaluate("window.vmQuestions = []")
+        code, out, err = sh("cd app && gh pr create --title 'Empty'")
+        check(code != 0 and "is not on GitHub yet" in err and page.evaluate("window.vmQuestions") == [], f"an empty pull request is refused before asking ({err!r})")
+        code, out, err = sh("cd app && git checkout fix && git checkout -b fix")
         check(code != 0 and "already exists on GitHub. Switch to it with: git checkout fix" in err, f"a new branch may not reuse a name on GitHub ({err!r})")
         code, out, _ = sh("git help && gh help")
         check("git merge BRANCH" in out and "gh pr merge" in out and "always asks the person" in out, "help lists merging")

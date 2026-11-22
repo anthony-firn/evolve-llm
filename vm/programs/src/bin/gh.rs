@@ -517,8 +517,8 @@ fn commit(r: &Repo, args: &[String]) -> R<()> {
     let work = r.work()?;
     let (a, m, d) = changes(&head, &work);
     if a.is_empty() && m.is_empty() && d.is_empty() {
-        println!("nothing to commit, working tree clean");
-        return Ok(());
+        // A failure, as in Git, so a chain such as `git commit -m X && git push` stops here.
+        return Err("nothing to commit: no file has changed since the last commit. Change a file first, then commit".into());
     }
     for p in a.iter().chain(&m) {
         let full = r.root.join(p);
@@ -541,6 +541,9 @@ fn commit(r: &Repo, args: &[String]) -> R<()> {
 fn push(r: &mut Repo) -> R<()> {
     let log = r.log();
     if log.is_empty() {
+        if branch_head(&r.owner_repo(), &r.branch())?.is_none() {
+            return Err(format!("branch {} has no commits to push yet. Change a file and run git commit -m \"MESSAGE\" first", r.branch()));
+        }
         println!("Everything up-to-date");
         return Ok(());
     }
@@ -667,6 +670,14 @@ fn pr(r: &Repo, args: &[String]) -> R<()> {
             let head = opt("--head").unwrap_or(r.branch());
             if !r.log().is_empty() {
                 return Err("push your commits first (git push)".into());
+            }
+            // Checked before asking the person: a pull request needs commits on GitHub.
+            if branch_head(&or, &head)?.is_none() {
+                return Err(format!("branch {head} is not on GitHub yet. Commit a change, then git push, then gh pr create"));
+            }
+            let cmp = api("GET", &format!("/repos/{or}/compare/{}...{}", url_path(&base), url_path(&head)), None)?;
+            if cmp["ahead_by"].as_u64() == Some(0) {
+                return Err(format!("branch {head} has no commits that {base} does not have, so there is nothing to review. Commit a change and git push first"));
             }
             allowed(&format!("Open a pull request on {or}: {head} into {base}, \"{title}\""), false)?;
             let p = api("POST", &format!("/repos/{or}/pulls"), Some(json!({ "title": title, "body": opt("--body").or(opt("-b")).unwrap_or_default(), "head": head, "base": base })))?;
