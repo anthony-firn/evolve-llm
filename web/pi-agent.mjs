@@ -186,7 +186,15 @@ async function shellNotes(command, r, workspace, failed, signal) {
   // (edit FILE OLD NEW is also a command in the VM, so only read and write get this note.)
   const misused = /\b(read|write): (?:command )?not found/.exec(err) || /(?:^|&&|\|\||;|\|)\s*(read|write)\s+[\w./-]+\.\w+/.exec(command);
   if (misused) notes.push(`${misused[1]} is a tool, not a shell command. Call the ${misused[1]} tool instead.`);
-  if (/&&/.test(command)) notes.push('the command stopped at the first error, so the steps after it did not run. Run one step per command.');
+  // grep finding nothing (status 1, no error) is an answer, not a failure: say so, and where the
+  // text is when another file holds it.
+  const grep = /(?:^|&&|;)\s*grep\s+(?:-\w+\s+)*(['"])(.+?)\1\s+([\w./-]+)\s*$/.exec(command) || /(?:^|&&|;)\s*grep\s+(?:-\w+\s+)*([^\s'"-][^\s]*)\s+([\w./-]+)\s*$/.exec(command);
+  const nothing = grep && r.code === 1 && !err.trim() && !(r.stdout || '').trim();
+  if (nothing) {
+    const [pattern, file] = grep.length === 4 ? [grep[2], grep[3]] : [grep[1], grep[2]];
+    const elsewhere = await whereElse(pattern, file, workspace, signal);
+    notes.push(`grep found no "${pattern}" in ${file}.${elsewhere.length ? ` It is in ${elsewhere.join(', ')}.` : ''}`);
+  } else if (/&&/.test(command)) notes.push('the command stopped at the first error, so the steps after it did not run. Run one step per command.');
   const key = command.trim();
   const times = (failed.get(key) || 0) + 1;
   failed.set(key, times);

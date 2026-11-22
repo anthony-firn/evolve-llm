@@ -430,3 +430,18 @@ test('sedWithoutInPlace finds a substitution that leaves its file unchanged',()=
  assert.equal(sedWithoutInPlace("sed -n '1,20p' calc.py"),null);
  assert.equal(sedWithoutInPlace("cat calc.py | sed 's/a/b/'"),null);
 });
+
+test('grep finding nothing is said plainly, with the file that has the text',async()=>{
+ const results=[];let n=0;
+ const workspace={cwd:'/home/user/app',vm:{read:async()=>({ok:false})},path:p=>p,request:async(name,args)=>{
+  if(name!=='exec')return{};
+  if(args.command.startsWith('grep -rlF'))return{code:0,stdout:'calc.py\n',stderr:''};
+  return{code:1,stdout:'',stderr:'',cwd:'/home/user/app'};
+ }};
+ const task=createPiTask({linux:{cwd:'/home/user/app'},workspace,network:{options:()=>({enabled:false})},onEvent:e=>{if(e.type==='tool-result')results.push(e.result.content[0].text)},turn:async()=>{
+  n++;return{text:n===1?'<tool_call>'+JSON.stringify({name:'bash',arguments:{command:"cd app && grep -n 'def add' test_calc.py"}})+'</tool_call>':'Done.',reason:'end'};
+ }});
+ await task.run('Find add');
+ assert.match(results[0],/grep found no "def add" in test_calc\.py\. It is in calc\.py\./);
+ assert.doesNotMatch(results[0],/stopped at the first error/);
+});
