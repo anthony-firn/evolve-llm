@@ -190,45 +190,7 @@ impl Vision {
                 x[i * d + o] = s;
             }
         }
-        // Rotary angles: the first quarter of each head by patch row, the second by column.
-        let quarter = hd / 4;
-        let inv: Vec<f32> = (0..quarter).map(|j| 1.0 / 10000f32.powf((2 * j) as f32 / (hd / 2) as f32)).collect();
-        let mut angles = vec![0f32; n * hd / 2];
-        let (gh, gw) = (px.grid_h, px.grid_w);
-        let mut i = 0;
-        for bh in 0..gh / MERGE {
-            for bw in 0..gw / MERGE {
-                for mh in 0..MERGE {
-                    for mw in 0..MERGE {
-                        let (r, col) = ((bh * MERGE + mh) as f32, (bw * MERGE + mw) as f32);
-                        for j in 0..quarter {
-                            angles[i * hd / 2 + j] = r * inv[j];
-                            angles[i * hd / 2 + quarter + j] = col * inv[j];
-                        }
-                        i += 1;
-                    }
-                }
-            }
-        }
-        // Window order: merge units grouped into windows of `ws x ws` units, row by row.
-        let (lh, lw) = (gh / MERGE, gw / MERGE);
-        let ws = WINDOW / MERGE / c.patch;
-        let (nh, nw) = (lh.div_ceil(ws), lw.div_ceil(ws));
-        let mut order = Vec::with_capacity(lh * lw);
-        let mut windows = Vec::new(); // (start, len) in patches
-        for wy in 0..nh {
-            for wx in 0..nw {
-                let start = order.len();
-                for y in wy * ws..((wy + 1) * ws).min(lh) {
-                    for x in wx * ws..((wx + 1) * ws).min(lw) {
-                        order.push(y * lw + x);
-                    }
-                }
-                if order.len() > start {
-                    windows.push((start * unit, (order.len() - start) * unit));
-                }
-            }
-        }
+        let (order, windows, angles) = layout(c, px);
         let permute = |v: &[f32], width: usize| {
             let mut out = vec![0f32; v.len()];
             for (k, &u) in order.iter().enumerate() {
@@ -237,7 +199,6 @@ impl Vision {
             out
         };
         x = permute(&x, d);
-        let angles = permute(&angles, hd / 2);
         let whole = [(0usize, n)];
         for l in 0..c.layers {
             let b = |s: &str| format!("v.blk.{l}.{s}");
@@ -271,6 +232,60 @@ impl Vision {
         }
         Ok(out)
     }
+}
+
+/// The order the encoder works in, for an image's patches: the merge units grouped into
+/// windows of 4x4 units (row by row), the windows as (start, len) in patches, and each patch's
+/// rotary angles (`head_dim / 2`: by row, then by column) in that order.
+pub fn layout(c: &VisionConfig, px: &Patches) -> (Vec<usize>, Vec<(usize, usize)>, Vec<f32>) {
+    let hd = c.dim / c.heads;
+    let n = px.grid_h * px.grid_w;
+    let unit = MERGE * MERGE;
+    // Rotary angles: the first quarter of each head by patch row, the second by column.
+    let quarter = hd / 4;
+    let inv: Vec<f32> = (0..quarter).map(|j| 1.0 / 10000f32.powf((2 * j) as f32 / (hd / 2) as f32)).collect();
+    let mut angles = vec![0f32; n * hd / 2];
+    let (gh, gw) = (px.grid_h, px.grid_w);
+    let mut i = 0;
+    for bh in 0..gh / MERGE {
+        for bw in 0..gw / MERGE {
+            for mh in 0..MERGE {
+                for mw in 0..MERGE {
+                    let (r, col) = ((bh * MERGE + mh) as f32, (bw * MERGE + mw) as f32);
+                    for j in 0..quarter {
+                        angles[i * hd / 2 + j] = r * inv[j];
+                        angles[i * hd / 2 + quarter + j] = col * inv[j];
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    // Window order: merge units grouped into windows of `ws x ws` units, row by row.
+    let (lh, lw) = (gh / MERGE, gw / MERGE);
+    let ws = WINDOW / MERGE / c.patch;
+    let (nh, nw) = (lh.div_ceil(ws), lw.div_ceil(ws));
+    let mut order = Vec::with_capacity(lh * lw);
+    let mut windows = Vec::new(); // (start, len) in patches
+    for wy in 0..nh {
+        for wx in 0..nw {
+            let start = order.len();
+            for y in wy * ws..((wy + 1) * ws).min(lh) {
+                for x in wx * ws..((wx + 1) * ws).min(lw) {
+                    order.push(y * lw + x);
+                }
+            }
+            if order.len() > start {
+                windows.push((start * unit, (order.len() - start) * unit));
+            }
+        }
+    }
+    let mut permuted = vec![0f32; angles.len()];
+    let w = hd / 2;
+    for (k, &u) in order.iter().enumerate() {
+        permuted[k * unit * w..(k + 1) * unit * w].copy_from_slice(&angles[u * unit * w..(u + 1) * unit * w]);
+    }
+    (order, windows, permuted)
 }
 
 /// `y = x W^T + b` for `x` of rows of `k`; `w` is GGUF `[k, m]` (rows of `k` per output).
@@ -381,10 +396,15 @@ fn erf(x: f32) -> f32 {
 }
 
 #[cfg(test)]
+pub(crate) fn tests_base64(s: &str) -> Vec<u8> {
+    tests::base64(s)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn base64(s: &str) -> Vec<u8> {
+    pub(super) fn base64(s: &str) -> Vec<u8> {
         let val = |c: u8| match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,

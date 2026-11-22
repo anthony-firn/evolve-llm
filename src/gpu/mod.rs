@@ -4,6 +4,7 @@
 pub mod blocks;
 pub mod engine;
 pub mod shaders;
+pub mod vision;
 
 use serde::Serialize;
 use std::future::Future;
