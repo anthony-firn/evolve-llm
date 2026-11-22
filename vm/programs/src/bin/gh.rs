@@ -776,23 +776,60 @@ fn run_cmd(r: &Repo, args: &[String]) -> R<()> {
         }
         Some("view") => {
             let id = args.get(1).ok_or("usage: gh run view RUN_ID")?;
-            let w = api("GET", &format!("/repos/{or}/actions/runs/{id}"), None)?;
-            println!("{} ({}): {} {}", w["name"].as_str().unwrap_or(""), w["head_branch"].as_str().unwrap_or(""), w["status"].as_str().unwrap_or(""), w["conclusion"].as_str().unwrap_or(""));
-            for j in api("GET", &format!("/repos/{or}/actions/runs/{id}/jobs"), None)?["jobs"].as_array().cloned().unwrap_or_default() {
-                println!("job {}: {}", j["name"].as_str().unwrap_or(""), j["conclusion"].as_str().or(j["status"].as_str()).unwrap_or(""));
-                for s in j["steps"].as_array().cloned().unwrap_or_default() {
-                    if s["conclusion"].as_str() != Some("success") && s["conclusion"].as_str() != Some("skipped") {
-                        println!("  step {}: {}", s["name"].as_str().unwrap_or(""), s["conclusion"].as_str().or(s["status"].as_str()).unwrap_or(""));
+            run_summary(&or, id)?;
+        }
+        // Wait for a run to finish (the newest on a branch, by default this one), then show it:
+        // one command instead of many model turns spent checking.
+        Some("watch") => {
+            let id = match args.iter().skip(1).find(|a| !a.starts_with('-')) {
+                Some(id) => id.clone(),
+                None => {
+                    let branch = args.iter().position(|a| a == "--branch" || a == "-b").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| r.branch());
+                    let mut found = None;
+                    // A pushed branch's run can take a little while to appear.
+                    for _ in 0..24 {
+                        found = api("GET", &format!("/repos/{or}/actions/runs?per_page=1&branch={}", url_path(&branch)), None)?["workflow_runs"].get(0).map(|w| w["id"].to_string());
+                        if found.is_some() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(5));
                     }
+                    found.ok_or(format!("no CI run for branch {branch} after 2 minutes (gh run list shows the runs)"))?
                 }
-                if j["conclusion"].as_str() == Some("failure") {
-                    for a in api("GET", &format!("/repos/{or}/check-runs/{}/annotations", j["id"]), None)?.as_array().cloned().unwrap_or_default() {
-                        println!("  {}:{}: {}", a["path"].as_str().unwrap_or(""), a["start_line"], a["message"].as_str().unwrap_or(""));
-                    }
+            };
+            eprint!("Waiting for run {id}");
+            for _ in 0..360 {
+                if api("GET", &format!("/repos/{or}/actions/runs/{id}"), None)?["status"].as_str() == Some("completed") {
+                    break;
                 }
+                eprint!(".");
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+            eprintln!();
+            run_summary(&or, &id)?;
+        }
+        Some(other) => return Err(format!("gh run {other}: not available here (list, view, watch)")),
+    }
+    Ok(())
+}
+
+/// A run's result: its status, each job, the steps that did not pass and the annotations
+/// (file:line: message) of failed jobs.
+fn run_summary(or: &str, id: &str) -> R<()> {
+    let w = api("GET", &format!("/repos/{or}/actions/runs/{id}"), None)?;
+    println!("{} ({}): {} {}", w["name"].as_str().unwrap_or(""), w["head_branch"].as_str().unwrap_or(""), w["status"].as_str().unwrap_or(""), w["conclusion"].as_str().unwrap_or(""));
+    for j in api("GET", &format!("/repos/{or}/actions/runs/{id}/jobs"), None)?["jobs"].as_array().cloned().unwrap_or_default() {
+        println!("job {}: {}", j["name"].as_str().unwrap_or(""), j["conclusion"].as_str().or(j["status"].as_str()).unwrap_or(""));
+        for s in j["steps"].as_array().cloned().unwrap_or_default() {
+            if s["conclusion"].as_str() != Some("success") && s["conclusion"].as_str() != Some("skipped") {
+                println!("  step {}: {}", s["name"].as_str().unwrap_or(""), s["conclusion"].as_str().or(s["status"].as_str()).unwrap_or(""));
             }
         }
-        Some(other) => return Err(format!("gh run {other}: not supported (list, view)")),
+        if j["conclusion"].as_str() == Some("failure") {
+            for a in api("GET", &format!("/repos/{or}/check-runs/{}/annotations", j["id"]), None)?.as_array().cloned().unwrap_or_default() {
+                println!("  {}:{}: {}", a["path"].as_str().unwrap_or(""), a["start_line"], a["message"].as_str().unwrap_or(""));
+            }
+        }
     }
     Ok(())
 }
@@ -1031,7 +1068,7 @@ const GH_HELP: &str = "gh here works on GitHub through its API.
   gh pr create --title \"TITLE\" --body \"TEXT\" [--base BRANCH]   (push first; may ask the person)
   gh pr list            gh pr view [NUMBER]       gh pr checks [NUMBER]   (add -R OWNER/REPO outside a clone)
   gh pr merge [NUMBER] [--squash|--rebase]        (always asks the person; no NUMBER = this branch's pull request)
-  gh run list [--branch B]    gh run view RUN_ID  (CI results: failed steps and errors)
+  gh run list [--branch B]    gh run view RUN_ID  gh run watch [RUN_ID]  (CI results: failed steps and errors; watch waits for the run)
   gh api PATH
 
 Local work (git status, diff, commit, push, pull, checkout, merge): git help";

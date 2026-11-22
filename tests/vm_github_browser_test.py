@@ -300,6 +300,9 @@ def main():
         check(head and FAKE.commits[head]["parents"] == [C0] and FAKE.refs["main"] == C0, "parented on the original commit; main untouched")
         code, out, _ = sh("cd app && gh pr create --title 'Change things' --body 'Done' && gh pr list && gh run list")
         check(code == 0 and "pull/1" in out and "#1\tChange things\tfeature -> main" in out and "failure\tCI\tfeature" in out, f"pull request and CI runs ({out!r})")
+        FAKE.runs[0]["jobs"] = [{"id": 70, "name": "test", "conclusion": "failure", "steps": [{"name": "Run tests", "conclusion": "failure"}], "annotations": [{"path": "src/main.rs", "start_line": 1, "message": "expected 2, got 3"}]}]
+        code, out, err = sh("cd app && gh run watch")
+        check(code == 0 and "CI (feature): completed failure" in out and "step Run tests: failure" in out and "src/main.rs:1: expected 2, got 3" in out, f"gh run watch shows the finished run with its annotations ({out!r} {err!r})")
         config(0)
         code, out, err = sh("cd app && echo again >> README.md && git commit -m 'Again' && git push")
         check(code != 0 and "not allowed (autonomy: local commits only" in err, f"local-only refuses to push ({err!r})")
