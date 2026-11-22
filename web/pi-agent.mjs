@@ -120,6 +120,17 @@ async function fromStart(command, workspace, start, noted) {
   return [command.replace(lead[0], lead[0].replace(lead[1], there)), note];
 }
 
+/** Files under the working directory (not `skip`) that hold the first line of `text`: an
+ *  edit aimed at the wrong file (test_calc.py instead of calc.py) is told where the text is. */
+async function whereElse(text, skip, workspace, signal) {
+  const line = String(text).split('\n').map(l => l.trim()).find(Boolean);
+  if (!line || line.length < 4) return [];
+  const quoted = `'${line.slice(0, 200).replace(/'/g, `'\\''`)}'`;
+  const r = await workspace.request('exec', { command: `grep -rlF -e ${quoted} .` }, { signal }).catch(() => null);
+  const self = workspace.path ? workspace.path(skip) : skip;
+  return (r?.stdout || '').split('\n').map(f => f.trim()).filter(f => f && (workspace.path ? workspace.path(f) : f) !== self).slice(0, 3);
+}
+
 /** A relative file path that is not in the working directory but is where the task began
  *  (`app/calc.py` from inside app) means that file. */
 async function pathFromStart(path, workspace, start) {
@@ -264,9 +275,9 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(!st||st.code)return null;
     if(/Changes not committed/.test(st.stdout||''))return {why:'Your changes are not committed yet.',cmd:'git commit -m "What changed"'};
     if(asked.push&&/is ahead of/.test(st.stdout||''))return {why:'Your commits are not pushed yet.',cmd:'git push'};
-    if(asked.pr){const v=await workspace.request('exec',{command:'gh pr view'},{signal}).catch(()=>null);if(v&&v.code)return {why:'The pull request is not open yet.',cmd:'gh pr create --title "Title" --body "What and why"'};}
+    if(asked.pr&&pushed){const v=await workspace.request('exec',{command:'gh pr view'},{signal}).catch(()=>null);if(v&&v.code)return {why:'The pull request is not open yet.',cmd:'gh pr create --title "Title" --body "What and why"'};}
     return null;
-  };let ghRepo=null, stuck=null, asked=null, declined=false, nudges=0;
+  };let ghRepo=null, stuck=null, asked=null, declined=false, nudges=0, pushed=false;
   const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction}):null;
   const limits=linux?LINUX_LIMITS:browserTools?BROWSER_LIMITS:LIMITS;
   const declarations=(linux?[
@@ -303,6 +314,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       if(linux&&result.code)try{result.notes=await shellNotes(String(args.command||''),result,workspace,failedCommands,signal)}catch(error){stuck=String(error.message||error);agent.abort();throw error}
       if(moved)result.notes=[moved,...(result.notes||[])];
       if(/declined by the person/.test(`${result.stdout||''}${result.stderr||''}`))declined=true;
+      if(/^To github\.com\/|^Everything up-to-date/m.test(result.stdout||''))pushed=true;
     }
     else if(['read','write','edit'].includes(name)){
       if(linux)args={...args,path:await pathFromStart(args.path,workspace,linux.cwd)};
@@ -315,6 +327,8 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
         if(failure){
           const file=await workspace.request('read',{path:args.path},{signal}).catch(()=>null);
           if(!file)throw new Error(`${args.path} does not exist. Use write to create it.`);
+          const elsewhere=linux&&/is not in/.test(failure)?await whereElse(args.oldText,args.path,workspace,signal):[];
+          if(elsewhere.length)throw new Error(`${failure.replace(/[.;]\s*(read the file|include more).*$/i,'')}, so nothing was changed. That text is in ${elsewhere.join(', ')}: call edit with that path.`);
           throw new Error(`${failure.replace(/[.;]\s*(read the file|include more).*$/i,'')}, so nothing was changed. ${closestLines(file.text,args.oldText,args.path)}`);
         }
       }
@@ -335,6 +349,15 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     const body=full.length<=limits.result?full:full.slice(0,limits.result)+(name==='read'?`\n… (${full.length-limits.result} more characters not shown. To find a line, run: grep -n "SOME WORDS" ${args.path}; edit needs only the exact text to replace.)`:'\n… (output cut)');
     return {content:[{type:'text',text:body}],details:{sandbox:true},isError:result.ok===false||Boolean(result.code)||(['web_search','open_url'].includes(name)&&!result.sources?.length)};
   }}));
+  // The same failing call a third time (an edit with the same wrong oldText) stops the task, as
+  // a repeated failing bash command does.
+  for(const tool of tools.filter(t=>t.name!=='bash')){
+    const run=tool.execute;
+    tool.execute=async(id,args,signal)=>{
+      const failed=()=>{const key=`${tool.name} ${JSON.stringify(args)}`;const times=(failedCommands.get(key)||0)+1;failedCommands.set(key,times);if(times>=3){stuck=`The same ${tool.name} call failed ${times} times, so the task stopped: ${key.slice(0,160)}`;agent.abort();}};
+      try{const r=await run(id,args,signal);if(r?.isError)failed();return r}catch(error){failed();throw error}
+    };
+  }
   const schemas=declarations.map(([name,description,parameters])=>({type:'function',function:{name,description,parameters}}));
   const types=schemaTypes(schemas);
   const agent=new Agent({
@@ -404,5 +427,5 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
-  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;const pre=linux?await preamble(prompt,workspace,linux.cwd):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
+  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;pushed=false;const pre=linux?await preamble(prompt,workspace,linux.cwd):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
 }

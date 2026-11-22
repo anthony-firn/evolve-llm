@@ -354,7 +354,21 @@ test('a final reply before the asked commit, push and pull request gets at most 
  assert.match(seen[1],/Your commits are not pushed yet\. Make that tool call now: git push\./);
  status='On branch fix\nnothing to commit, working tree clean\n';
  seen.length=0;await task.run('Open a pull request for it.');
- assert.match(seen[1],/The pull request is not open yet\. Make that tool call now: gh pr create/);
+ assert.equal(seen.length,1,'no pull request nudge before anything was pushed');
  seen.length=0;await task.run('What does calc.py do?');
  assert.equal(seen.length,1);
+});
+
+test('an edit aimed at the wrong file is told where the text is, and the same failing edit a third time stops',async()=>{
+ const files=new Map([['/home/user/app/calc.py','def add(a, b):\n    return a - b\n'],['/home/user/app/test_calc.py','from calc import add\n']]);const results=[];
+ const workspace={cwd:'/home/user/app',vm:{read:async p=>({ok:files.has(p)})},path:p=>p.startsWith('/')?p:`/home/user/app/${p.replace(/^\.\//,'')}`,request:async(name,args)=>{
+  if(name==='read'){const t=files.get(workspace.path(args.path));if(t==null)throw Error('no such file');return{text:t}}
+  if(name==='edit'){const t=files.get(workspace.path(args.path));if(!t.includes(args.oldText))throw Error(`oldText is not in ${args.path}; read the file again`);return{}}
+  if(name==='exec'&&args.command.startsWith('grep -rlF'))return{code:0,stdout:'calc.py\n',stderr:''};
+  return{code:0,stdout:'',stderr:''};
+ }};
+ const call={name:'edit',arguments:{path:'test_calc.py',oldText:'def add(a, b):\n    return a - b',newText:'def add(a, b):\n    return a + b'}};
+ const task=createPiTask({linux:{cwd:'/home/user/app'},workspace,network:{options:()=>({enabled:false})},onEvent:e=>{if(e.type==='tool-result')results.push(e.result.content[0].text)},turn:async()=>({text:'<tool_call>'+JSON.stringify(call)+'</tool_call>',reason:'end'})});
+ await assert.rejects(task.run('Fix add in calc.py'),/The same edit call failed 3 times, so the task stopped/);
+ assert.match(results[0],/oldText is not in test_calc\.py, so nothing was changed\. That text is in calc\.py: call edit with that path\./);
 });

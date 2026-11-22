@@ -43,6 +43,8 @@ CASES = [
     # sed: s with g, \( \) groups and & (+ and ( ) are plain in basic regexes), addresses, ranges, d, a, -n, -i.
     ("printf 'a+b x\naaa\none\ntwo\nlast\n' > s.txt && sed -i 's/a+b/(&)/' s.txt && sed -n '1p;2s/a/b/gp;3s/\\(o\\)n/[\\1]/p' s.txt", 0, "(a+b) x\nbbb\n[o]e\n"),
     ("sed -e '1,2d' -e '/one/a inserted\\n2' -e '$s/last/END/' s.txt && sed -n '$=' s.txt 2>&1; sed 's//x/' s.txt 2>&1; rm s.txt", 0, "one\ninserted\n2\ntwo\nEND\nsed: unknown command = (s, d, p, q, a, i, c are available)\nsed: empty regular expression: write the text to find, as in s/old/new/\n"),
+    # The agent's "that text is in FILE" lookup: a quoted first line, with ' in it.
+    ("""mkdir -p w/sub && printf "it's here\\n" > w/sub/q.txt && printf 'other\\n' > w/o.txt && cd w && grep -rlF -e 'it'\\''s here' . && cd .. && rm -r w""", 0, "sub/q.txt\n"),
     ("read notes.txt 2>&1; echo status=$?", 0, "read: notes.txt is not a variable name (read takes a line of input; to show a file, use: cat notes.txt)\nstatus=2\n"),
     # python3: RustPython, loaded on first use; scripts, the standard library and unittest.
     ("python3 -c 'import json; print(json.dumps({\"sum\": 2 + 3}))'", 0, '{"sum": 5}\n'),
