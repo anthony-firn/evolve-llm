@@ -85,6 +85,9 @@ async function preamble(prompt, workspace, cwd) {
   // A request about failing CI: say where the reason is, or a small model guesses at git commands.
   if (/\b(CI|checks?|workflows?|GitHub Actions|builds? (is |are )?(failing|broken|red))\b/i.test(prompt))
     lines.push('To find out why CI fails, run gh run list, then gh run view ID: it shows the failed step and the error with its file and line.');
+  // Placing a line relative to another: >> would put it at the end of the file instead.
+  if (/\b(right )?(after|before|below|above|under) the line\b/i.test(prompt))
+    lines.push('To put a line after another line, use edit with oldText "that line" and newText "that line\\nnew line" (before it: "new line\\nthat line"). >> adds at the end of the file, not there.');
   return { text: `(${lines.join(' ')})`, repo };
 }
 

@@ -321,4 +321,7 @@ test('a request about failing CI says where the reason is',async()=>{
  assert.match(seen[0],/To find out why CI fails, run gh run list, then gh run view ID/);
  await task.run('Add a line to README.md in demo/app.');
  assert.doesNotMatch(seen.at(-1),/find out why CI fails/);
+ assert.doesNotMatch(seen.at(-1),/To put a line after another line/);
+ await task.run('In README.md of demo/app, right after the line "npm test", add the line "npm run lint".');
+ assert.match(seen.at(-1),/To put a line after another line, use edit with oldText "that line" and newText "that line\\nnew line"/);
 });
