@@ -401,7 +401,7 @@ async function startLoad(source, { keepChat = false } = {}) {
     // Split models and pasted files: ask Hugging Face for every part and its size first.
     try {
       const r = await resolveParts(source.repo, source.file, source.revision);
-      source = { ...source, bytes: r.bytes, parts: r.parts.length > 1 || source.stream ? r.parts : null, url: r.parts[0].url };
+      source = { ...source, bytes: r.bytes, parts: r.parts.length > 1 || source.stream ? r.parts : null, url: r.parts[0].url, sha256: r.parts[0].sha256 || source.sha256 || null };
     } catch (e) {
       onError({ during: 'load', message: e.message });
       return;
