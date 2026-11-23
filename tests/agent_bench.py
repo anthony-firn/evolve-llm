@@ -258,6 +258,16 @@ class Shop(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def reply_text(page):
+    """The last reply as a person reads it: its text, then each link's address (a Markdown link
+    shows only its title on the page, and a check for a link must still find it)."""
+    if not page.locator(".msg.assistant").count():
+        return ""
+    bubble = page.locator(".msg.assistant .bubble").last
+    hrefs = bubble.evaluate("b => [...b.querySelectorAll('a[href]')].map(a => a.href)")
+    return bubble.inner_text() + ("\n" + "\n".join(hrefs) if hrefs else "")
+
+
 def check_browser(fake, page, run):
     if Shop.added != ["blue-kettle"]:
         return False, f"cart has {Shop.added or 'nothing'}"
@@ -401,7 +411,7 @@ def main():
                 "task": name, "seconds": round(time.time() - t0), "timed_out": timed_out,
                 "turns": sum(e["type"] == "turn" for e in events), "calls": sum(e["type"] == "tool" for e in events),
                 "failed": sum(e["type"] == "result" and e.get("error") for e in events), "repairs": sum(e["type"] == "retry" for e in events),
-                "reply": page.locator(".msg.assistant .bubble").last.inner_text() if page.locator(".msg.assistant").count() else "",
+                "reply": reply_text(page),
                 "ran_python": any(e["type"] == "tool" and "python3" in e.get("args", "") for e in events),
                 "web_calls": sum(e["type"] == "tool" and e.get("name") in ("web_search", "open_url") for e in events),
                 "questions": questions, "page_errors": errors,
