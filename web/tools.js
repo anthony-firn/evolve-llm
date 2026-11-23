@@ -123,6 +123,18 @@ function familyCalls(text, types) {
  * Llama 3 writes it). `types` maps tool name -> parameter -> JSON-schema type, for syntaxes
  * whose values are untyped text. A reply whose calls are all invalid yields none.
  */
+// A shell command written where the tool name goes, with its quotes unescaped so the JSON does
+// not parse ({"name": "gh pr create --title "Fix" --body "..."}): small models do this. When
+// the name starts with a common command and bash is a tool, it is that bash command.
+const SHELL_WORDS = /^(git|gh|ls|cat|cd|grep|sed|echo|mkdir|touch|rm|mv|cp|python3|node|npm|npx|cargo|head|tail|wc|find|diff|edit)\s/;
+function commandAsName(body, allowed) {
+  const m = /^\{\s*"name"\s*:\s*"([\s\S]+)"\s*\}$/.exec(String(body).trim());
+  if (!m || !SHELL_WORDS.test(m[1]) || ![...allowed].includes('bash')) return null;
+  // The JSON string's closing quote often also closes the last argument ("--body "Done."}).
+  const quotes = (m[1].match(/(?<!\\)"/g) || []).length;
+  return call({ name: 'bash', arguments: { command: quotes % 2 ? `${m[1]}"` : m[1] } }, allowed);
+}
+
 export function parseToolCalls(text, allowed = NAMES, types = null) {
   text = String(text);
   const native = familyCalls(text, types);
@@ -132,7 +144,7 @@ export function parseToolCalls(text, allowed = NAMES, types = null) {
   }
   const calls = [];
   for (const m of text.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g)) {
-    const c = call(parseJson(m[1]), allowed);
+    const c = call(parseJson(m[1]), allowed) || commandAsName(m[1], allowed);
     if (c) calls.push(c);
   }
   // Small models often end the reply right after the JSON, without </tool_call>. What follows

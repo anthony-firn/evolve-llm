@@ -492,7 +492,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
             }
             if(repairs>=limits.repairs)throw new Error(failure==='empty reply'?'The model kept replying with nothing after its tool results.':'The model kept returning invalid or incomplete tool calls. No tools from the invalid replies were executed.');
             repairs++;
-            if(empty){
+            if(failure==='empty reply'){
               onEvent({type:'retry',attempt:repairs,message:'The reply was empty; asking the model to continue.',output:''});
               messages=[...original,{role:'user',content:'Your reply was empty. Continue the task: make the next tool call, or say briefly what you did and what is left.'}];
               continue;
