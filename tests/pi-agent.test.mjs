@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement, sedWithoutInPlace, wantsMore, sedInPlaceFile, changedLines } from '../web/pi-agent.mjs';
+import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement, sedWithoutInPlace, wantsMore, sedInPlaceFile, changedLines, unreachable } from '../web/pi-agent.mjs';
 
 test('real Pi agent loop invokes sandbox tools and feeds their results back to the local transport',async()=>{
  const files=new Map(),events=[];let round=0;
@@ -615,4 +615,11 @@ test('a file changed in place by sed is shown as it now reads', async () => {
   } });
   await task.run('Fix add');
   assert.match(results[0], /calc\.py now reads:\n1: def add\(a, b\):\n2:     return a \+ b\n3:     return a - b\n4: /);
+});
+
+test('a line left under a return at the same indent is named as unreachable', () => {
+  assert.equal(unreachable('1: def add(a, b):\n2:     return a + b\n3:     return a - b\n4: '), 'line 3 can never run: it comes right after a return at the same indent. If the new line replaces it, remove line 3.');
+  assert.equal(unreachable('1: def add(a, b):\n2:     return a + b\n3: \n4: def sub(a, b):'), null);
+  assert.equal(unreachable('1:   if (x) {\n2:     return 1;\n3:   }\n4:   return 2;'), null);
+  assert.equal(unreachable('1:     if x:\n2:         return 1\n3:     else:'), null);
 });

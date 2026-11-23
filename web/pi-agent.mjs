@@ -70,6 +70,19 @@ const shellText = r => [`exit code ${r.code}${r.timedOut?' (timed out)':''}, in 
 /** What a request in the Linux workspace starts with: the working directory and, for a GitHub
  *  repository the request names, where it is cloned or the exact command to clone it. Small
  *  models otherwise skip the clone or copy a placeholder like OWNER/REPO. */
+/** In numbered lines ("3:     return a - b"), a line right after a return at the same indent,
+ *  which can never run (an old line left under its replacement), as a note. */
+export function unreachable(numbered) {
+  const lines = String(numbered || '').split('\n').map((l) => /^(\d+): (.*)$/.exec(l)).filter(Boolean);
+  for (let i = 0; i + 1 < lines.length; i++) {
+    const [, , a] = lines[i], [, n, b] = lines[i + 1];
+    const indent = (t) => /^\s*/.exec(t)[0].length;
+    if (/^\s*return\b/.test(a) && b.trim() && indent(a) === indent(b) && !/^\s*(else|elif|except|finally|case|default|catch)\b|^\s*[})\]]/.test(b))
+      return `line ${n} can never run: it comes right after a return at the same indent. If the new line replaces it, remove line ${n}.`;
+  }
+  return null;
+}
+
 /** The file a command changes in place with sed -i, if it has one. */
 export function sedInPlaceFile(command) {
   for (const part of String(command).split(/&&|\|\||;|\|/)) {
@@ -441,7 +454,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       // sed with a substitution on a file but no -i prints the result and leaves the file as it was.
       const printed=linux&&!result.code?sedWithoutInPlace(String(args.command||'')):null;
       const changed=before!=null&&!result.code?changedLines(before,await readText()??before):null;
-      if(changed)result.notes=[...(result.notes||[]),`${target} now reads:\n${changed}`];
+      if(changed)result.notes=[...(result.notes||[]),`${target} now reads:\n${changed}`,...[unreachable(changed)].filter(Boolean)];
       if(printed)result.notes=[...(result.notes||[]),`sed without -i only printed the result; ${printed} is unchanged. To change the file: sed -i 's/old/new/' ${printed} (or edit ${printed} 'old text' 'new text')`];
       if(appended)result.notes=[...(result.notes||[]),`>> added the text at the end of ${appended[1]}, but the request asks for it next to a particular line. Undo it with: git restore ${appended[1]}, then: edit ${appended[1]} 'that line' 'that line\nnew line'`];
       if(/^To github\.com\/|^Everything up-to-date/m.test(result.stdout||''))pushed=true;
@@ -476,7 +489,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     else if(['preview','browser_test'].includes(name)){if(!preview)throw new Error('Preview is unavailable.');if(name==='preview'&&pendingChangeError)throw new Error('A file change failed. Read the file and correct the failed write or edit before final preview.');result=await preview(args.path,{signal,smoke:name==='browser_test'});if(name==='preview'&&result.ok===true)completedPreview=true;}
     else{result=await network.run(name,args,signal);webCalls++;for(const src of result.sources||[]){const list=name==='open_url'?opened:found;if(src.url&&!list.includes(src.url))list.push(src.url);}}
     const {now,...rest}=result||{};
-    const full=name==='read'?`File: ${args.path}\n${result.text}`:name==='bash'&&linux?shellText(result):name==='edit'&&now?`${JSON.stringify(rest)}\nThose lines now read:\n${now}`:JSON.stringify(result);
+    const full=name==='read'?`File: ${args.path}\n${result.text}`:name==='bash'&&linux?shellText(result):name==='edit'&&now?`${JSON.stringify(rest)}\nThose lines now read:\n${now}${unreachable(now)?`\nNote: ${unreachable(now)}`:''}`:JSON.stringify(result);
     const body=full.length<=limits.result?full:full.slice(0,limits.result)+(name==='read'?`\n… (${full.length-limits.result} more characters not shown. To find a line, run: grep -n "SOME WORDS" ${args.path}; edit needs only the exact text to replace.)`:'\n… (output cut)');
     return {content:[{type:'text',text:body}],details:{sandbox:true},isError:result.ok===false||Boolean(result.code)||(['web_search','open_url'].includes(name)&&!result.sources?.length)};
   }}));
