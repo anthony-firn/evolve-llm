@@ -81,6 +81,11 @@ export function sedWithoutInPlace(command) {
   return null;
 }
 
+/** Whether a request asks for something more than once ("two kettles", "another", "3 times"). */
+export function wantsMore(prompt) {
+  return /\b(two|three|four|five|six|seven|eight|nine|ten|another|again|several|both|each|more than one|twice)\b|\b[2-9]\d*\s*(x\b|times\b|of\b|items?\b|pieces?\b|kettles?\b|copies\b)/i.test(String(prompt));
+}
+
 /** Whether a request places a line relative to another ("right after the line ..."). */
 export function wantsPlacement(prompt) {
   return /\b(right )?(after|before|below|above|under) the line\b/i.test(String(prompt));
@@ -227,7 +232,7 @@ function refLine(snapshotText, ref) {
 }
 
 /** Browser tools that act on the shared live page through a BrowserClient (browser/API.md §4). */
-function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, confirmBrowserAction, vision = null } = {}) {
+function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, confirmBrowserAction, vision = null, request = () => '' } = {}) {
   let client=null, last=null;
   // Buttons already clicked, by page and label, with what the page said after: a second click
   // (small models go back and click "Add to cart" again and again) is held once and explained.
@@ -293,9 +298,11 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
         if(!ok)return {ok:false,text:`Click [${ref}] was not done: ${line} may buy, send, post, delete or change an account, so it needs the person's approval. Tell the person what this would do and ask them to click it in the browser themselves (or to approve it).`};
       }
       const key=/^(button|clickable|menuitem)\b/.test(line)?`${last.url}|${label0}`:null;
-      if(key&&pressed.has(key)&&!held.has(key)){
+      // Held once; held again unless the request asks for more than one ("two", "another", "3 times").
+      if(key&&pressed.has(key)&&(!held.has(key)||!wantsMore(request()))){
+        const again=held.has(key);
         held.add(key);
-        return {ok:true,text:`Click [${ref}] was not done: you already clicked ${label0} on this page, and the page then said: "${pressed.get(key)}". Clicking it again would do it a second time. If the request asks for it more than once, click it again; otherwise go on with the next step.`,snap:last};
+        return {ok:true,text:again?`Click [${ref}] was not done again: the request asks for it once, and it is done (the page said: "${pressed.get(key)}"). Go on with the next step.`:`Click [${ref}] was not done: you already clicked ${label0} on this page, and the page then said: "${pressed.get(key)}". Clicking it again would do it a second time. If the request asks for it more than once, click it again; otherwise go on with the next step.`,snap:last};
       }
       action=await b.click(ref);
       if(action?.ok!==false)clicked={ref,version:null};
@@ -363,7 +370,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(asked.pr&&pushed){const v=await workspace.request('exec',{command:'gh pr view'},{signal}).catch(()=>null);if(v&&v.code)return {why:'The pull request is not open yet.',cmd:'gh pr create --title "Title" --body "What and why"'};}
     return null;
   };let ghRepo=null, stuck=null, asked=null, declined=false, nudges=0, pushed=false, webCalls=0, currentPrompt='', opened=[], found=[];
-  const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction,vision}):null;
+  const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction,vision,request:()=>currentPrompt}):null;
   const limits=linux?LINUX_LIMITS:browserTools?BROWSER_LIMITS:LIMITS;
   const declarations=(linux?[
     ['bash','Run a shell command in the Linux VM (POSIX-style shell with pipes, &&, git and gh). Returns stdout, stderr and the exit code.',fields({command:string('Shell command')})],

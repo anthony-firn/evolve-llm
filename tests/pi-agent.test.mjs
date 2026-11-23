@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement, sedWithoutInPlace } from '../web/pi-agent.mjs';
+import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement, sedWithoutInPlace, wantsMore } from '../web/pi-agent.mjs';
 
 test('real Pi agent loop invokes sandbox tools and feeds their results back to the local transport',async()=>{
  const files=new Map(),events=[];let round=0;
@@ -475,7 +475,7 @@ test('a button clicked again on the same page is held once and explained, then a
     if (n === 5) return call('browser_click', { ref: 1 });
     return { text: 'Done.', reason: 'end' };
   } });
-  await task.run('Add the blue kettle to the cart');
+  await task.run('Add two blue kettles to the cart');
   assert.deepEqual(browser.log.filter(l => l[0] === 'click').map(l => l[1]), [2, 2, 1]);
   assert.match(JSON.stringify(seen[2]), /was not done: you already clicked button \\"Add Blue Kettle to cart\\" on this page, and the page then said: \\"Cart: 1 item\(s\)\\"/);
 });
@@ -581,4 +581,20 @@ test('an answer from search results alone, without a link, is sent back with the
   await task.run('When was the lighthouse first lit? Include the link you used.');
   assert.equal(n, 3);
   assert.match(prompts[2], /Pages your search found: https:\/\/en\.wikipedia\.org\/wiki\/Lighthouse https:\/\/example\.org\/b/);
+});
+
+test('a button clicked again stays held when the request asks for it once', async () => {
+  assert.ok(wantsMore('Add two kettles')); assert.ok(wantsMore('click it 3 times')); assert.ok(!wantsMore('Go to http://127.0.0.1:37187/ and add the Blue Kettle'));
+  const pages = { 'https://shop.example/': '# Shop\nCart: 1 item(s)\n[1] button "Add Red Kettle to cart"  [2] button "Add Blue Kettle to cart"' };
+  const browser = fakeBrowser(pages); let n = 0; const seen = [];
+  const task = createPiTask({ browser, workspace: { request: async () => ({}) }, network, turn: async (messages) => {
+    if (n) seen.push(JSON.stringify(messages.at(-1).content));
+    n++;
+    if (n === 1) return call('browser_open', { url: 'https://shop.example/' });
+    if (n <= 4) return call('browser_click', { ref: 2 });
+    return { text: 'Done.', reason: 'end' };
+  } });
+  await task.run('Go to https://shop.example/ and add the Blue Kettle to the cart.');
+  assert.deepEqual(browser.log.filter(l => l[0] === 'click').map(l => l[1]), [2]);
+  assert.match(seen[3], /was not done again: the request asks for it once/);
 });
