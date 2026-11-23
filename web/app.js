@@ -21,13 +21,6 @@ if (REMOTE_CODE) app.dataset.remote = '';
 const IS_MOBILE = navigator.userAgentData?.mobile ?? /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
 
 const DEFAULTS = { system: '', temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, repeat_penalty: 1.1, maxTokens: 1024, ctx: 4096, thinking: true, gpu: 'high-performance', gpuMemory: 'auto', cacheGb: 10, share: false, shareUpload: 2, internet: false, jinaKey: '', githubToken: '', autonomy: 1, poolGpus: true };
-const SUGGESTIONS = [
-  'Make me a Snake game I can play.',
-  'Write a haiku about running AI on my own laptop.',
-  'Give me three tips for writing clear Rust code.',
-  'Plan a relaxed weekend in Lisbon in five bullet points.',
-];
-
 const state = {
   phase: 'starting', // starting | idle | loading | ready | generating | preparing | agent
   adapter: null,
@@ -91,12 +84,13 @@ function setPhase(phase) {
   const generating = phase === 'generating' || (agentBusy && Boolean(state.live?.assistant));
   $('file-input').disabled = agentBusy;
   $('hf-input').disabled = agentBusy;
-  $('prompt').disabled = !(ready || phase === 'generating');
-  $('prompt').placeholder = state.loaded ? 'Ask anything, or describe what to build…' : 'Choose a model to start';
-  $('send').disabled = !ready;
+  const canStart = phase === 'idle' && !state.loaded && Boolean(state.adapter?.ok) && Boolean(startingModel());
+  $('prompt').disabled = !(ready || canStart || phase === 'generating');
+  $('send').disabled = !(ready || canStart);
   $('send').hidden = generating;
   $('stop').hidden = !generating;
   $('new-chat').disabled = !(ready && state.messages.length);
+  $('first-run').hidden = Boolean(state.loaded) || !$('first-run').textContent;
   $('welcome').hidden = Boolean(state.loaded) || phase === 'loading';
   $('loading').hidden = phase !== 'loading';
   $('ready').hidden = !(state.loaded && !state.messages.length && phase !== 'loading');
@@ -130,7 +124,6 @@ function showGpu(adapter) {
       ),
     );
     notice.hidden = false;
-    $('start-recommended').hidden = true;
     return;
   }
   chip.dataset.state = adapter.fallback ? 'warn' : 'ok';
@@ -143,7 +136,6 @@ function showGpu(adapter) {
   } else {
     notice.hidden = true;
   }
-  $('start-recommended').hidden = Boolean(state.loaded);
   setPhase(state.phase === 'starting' ? 'idle' : state.phase);
 }
 
@@ -293,9 +285,10 @@ const ladder = () => frontier(MODELS, device());
 
 function updatePick() {
   state.pick = pickModel(MODELS, device());
-  const start = $('start-recommended');
   const m = startingModel();
-  if (m) start.textContent = `Start with ${m.name} (${formatBytes(m.bytes)})`;
+  const saved = m && cachedEntry(keyOf(m))?.complete;
+  $('first-run').textContent = m && !saved ? `Your first message downloads ${m.name} (${formatBytes(m.bytes)}) into this browser. After that, everything runs on this device.` : '';
+  setPhase(state.phase);
 }
 
 /** The model "Start" loads: the device's pick when saved, else the best saved rung, else the pick. */
@@ -375,6 +368,7 @@ async function startLoad(source, { keepChat = false } = {}) {
   if (['agent','preparing'].includes(state.phase)) { $('status-line').textContent = 'Stop the current reply before loading another model.'; return; }
   if (!state.adapter?.ok) return;
   closeDrawer();
+  if ($('settings').open) $('settings').close();
   if (state.phase === 'generating') return;
   // A file from disk that is one of the catalog models gets its friendly name.
   const first = source.kind === 'file' ? source.files[0].name : '';
@@ -819,21 +813,19 @@ function onLoaded(msg) {
   const secs = (performance.now() - loadStarted) / 1000;
   const cfg = model.config;
   const types = Object.keys(model.weight_types).join(', ');
-  $('ready-title').textContent = state.split?.plan?.helpers.length ? (state.split.local ? `${label} is running on both GPUs` : `${label} is running on your devices`) : `${label} is running on your GPU`;
   const active = model.active_parameters < model.parameters * 0.9 ? `, ${formatParams(model.active_parameters)} active per token` : '';
   const pl = chat.placement || {};
   const where = pl.streaming
     ? ` · ${formatBytes(chat.weight_bytes + chat.state_bytes)} on the GPU, ${formatBytes(pl.streamed_bytes)} read from storage as needed${pl.expert_slots ? ` (an expert cache of ${pl.expert_slots.toLocaleString()} of ${pl.experts_total.toLocaleString()} experts)` : ` (${pl.resident_layers} of ${cfg.n_layer} layers on the GPU)`}`
     : ` · ${formatBytes(chat.weight_bytes + chat.state_bytes)} of GPU memory`;
   $('ready-meta').textContent = `${formatParams(model.parameters)} parameters${active} · ${types} · ${cfg.n_layer} layers · ${chat.context.toLocaleString()}-token context${where}${splitSummary()} · ready in ${secs.toFixed(1)} s`;
-  $('suggestions').replaceChildren(...SUGGESTIONS.map((s) => el('button', { type: 'button', text: s, onclick: () => send(s) })));
   $('status-line').textContent = 'Replies are generated on this device. Responses can be wrong; check anything important.';
   setPhase('ready');
   $('prompt').focus();
   // A switch for a kind of request: answer the request that asked for it.
   const after = state.afterLoad;
   state.afterLoad = null;
-  if (after) { $('status-line').textContent = after.note; after.run?.(); }
+  if (after) { if (after.note) $('status-line').textContent = after.note; after.run?.(); }
 }
 
 function formatParams(n) {
@@ -956,16 +948,12 @@ function conversation() {
   return msgs;
 }
 
-function syncWebToggle() {
-  const on = Boolean(state.settings.internet);
-  const b = $('web-toggle');
-  b.setAttribute('aria-pressed', String(on));
-  b.title = on ? 'Web search is on: search terms go to Wikipedia, DuckDuckGo and Jina' : 'Let the model search the web';
-}
 
 function send(text) {
   text = text.trim();
-  if (!text || state.phase !== 'ready') return;
+  if (!text) return;
+  if (state.phase === 'idle' && !state.loaded) { startWith(text); return; }
+  if (state.phase !== 'ready') return;
   state.messages.push({ role: 'user', content: text });
   state.retried = false;
   // "That didn't work" moves the conversation up a level, as a failed turn does.
@@ -978,6 +966,19 @@ function send(text) {
     return;
   }
   runResponse();
+}
+
+/** No model loaded yet: load the one this first request needs, if saved (else the best saved, or
+ *  the device's pick, which downloads), then answer it there. */
+function startWith(text) {
+  const m = startingModel();
+  if (!m) return;
+  const want = managed() ? rungFor(ladder(), levelOf(text))?.model : null;
+  const first = want && cachedEntry(keyOf(want))?.complete ? want : m;
+  state.messages.push({ role: 'user', content: text });
+  renderMessages();
+  state.afterLoad = { run: () => { state.messages.pop(); send(text); } };
+  startLoad(catalogEntry(first), { keepChat: true });
 }
 
 // ---- Scaling along the frontier (model-manager.mjs) ----
@@ -1139,7 +1140,7 @@ function saveCurrentChat(){
   if(!messages.length)return;
   const title=(messages.find(m=>m.role==='user')?.content||'Chat').replace(/\s+/g,' ').slice(0,80);
   saveChat({id:state.chatId,title,updated:Date.now(),model:state.loaded?.label||'',
-    messages:messages.map(m=>({role:m.role,content:m.content,...(m.error&&{error:true}),...(m.stats&&{stats:m.stats}),...(m.workView&&m.workView.record)}))}).catch(()=>{});
+    messages:messages.map(m=>({role:m.role,content:m.content,...(m.error&&{error:true}),...(m.stats&&{stats:m.stats}),...(m.workView&&m.workView.record)}))}).then(showChats,()=>{});
 }
 async function openChat(id){
   if(!['ready','idle'].includes(state.phase))return;
@@ -1148,19 +1149,18 @@ async function openChat(id){
   const openFile=async path=>(await getAssistant()).read(path);
   state.messages=chat.messages.map(m=>({...m,steps:undefined,preview:undefined,...(m.role==='assistant'&&(m.steps?.length||m.preview)&&{workView:createWorkView({restore:{steps:m.steps,preview:m.preview},openFile})})}));
   state.chatId=chat.id;assistant?.reset();state.floor=0;state.level=null;state.rung=null;
-  setPhase(state.phase);renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;
+  setPhase(state.phase);renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;showChats();
 }
 async function showChats(){
   const list=$('chat-list');
   const chats=await listChats().catch(()=>[]);
   const when=t=>new Date(t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
   list.replaceChildren(...chats.map(c=>el('li',{class:c.id===state.chatId?'current':''},
-    el('button',{type:'button',class:'chat-open',onclick:()=>{$('chats').close();openChat(c.id);}},el('strong',{text:c.title}),el('small',{text:`${when(c.updated)}${c.model?' · '+c.model:''}`})),
+    el('button',{type:'button',class:'chat-open',onclick:()=>{closeDrawer();openChat(c.id);}},el('strong',{text:c.title}),el('small',{text:when(c.updated)})),
     el('button',{type:'button',class:'ghost chat-delete','aria-label':`Delete “${c.title}”`,text:'Delete',onclick:async()=>{await deleteChat(c.id).catch(()=>{});showChats();}}))));
   $('chats-empty').hidden=chats.length>0;
-  if(!$('chats').open)$('chats').showModal();
 }
-$('open-chats').addEventListener('click',()=>{showChats();});
+$('open-chats').addEventListener('click',()=>(app.dataset.drawer?closeDrawer():openDrawer()));
 
 function runGeneration() {
   const now = new Date();
@@ -1219,7 +1219,8 @@ function onDone(d) {
   state.live = null;
   trace({ type: 'reply', chat: state.chatId, tokens: d.tokens, ms: Math.round(d.ms), reason: d.reason, text: m.content });
   saveCurrentChat();
-  $('status-line').textContent = `Context: ${d.used.toLocaleString()} of ${d.context.toLocaleString()} tokens used`;
+  // Only worth a word when the conversation is close to what the model can hold.
+  $('status-line').textContent = d.used > d.context * 0.75 ? `This conversation is near the model's limit (${d.used.toLocaleString()} of ${d.context.toLocaleString()} tokens); a new chat starts fresh.` : '';
   setPhase('ready');
   renderMessages();
 }
@@ -1326,7 +1327,8 @@ prompt.addEventListener('keydown', (e) => {
 });
 $('composer').addEventListener('submit', (e) => {
   e.preventDefault();
-  if (state.phase !== 'ready') return;
+  // Before any model is loaded, the first message starts one (send -> startWith).
+  if (state.phase !== 'ready' && !(state.phase === 'idle' && !state.loaded)) return;
   const text = prompt.value;
   if (!text.trim()) return;
   prompt.value = '';
@@ -1335,15 +1337,6 @@ $('composer').addEventListener('submit', (e) => {
 });
 function stopCurrent(){if(state.live?.assistant){state.live.cancelRequested=true;if(state.live.localComputer)localComputer.cancel();else assistant?.cancel();}else worker.postMessage({type:'stop'});}
 $('stop').addEventListener('click',stopCurrent);
-$('web-toggle').addEventListener('click', () => {
-  state.settings.internet = !state.settings.internet;
-  networkChanged();
-  saveSettings();
-  syncWebToggle();
-  $('status-line').textContent = state.settings.internet
-    ? 'Web search is on. Search terms and pages the model opens go to Wikipedia, DuckDuckGo and Jina Reader; the conversation stays here.'
-    : 'Web search is off. Nothing leaves this device.';
-});
 document.addEventListener('keydown', (e) => {
   if(e.key==='Escape'&&['generating','agent','preparing'].includes(state.phase))stopCurrent();
 });
@@ -1360,10 +1353,7 @@ $('new-chat').addEventListener('click', () => {
   prompt.focus();
   // The first request picks its own rung, lighter or heavier than the last conversation's.
   state.floor = 0; state.level = null; state.rung = null;
-});
-$('start-recommended').addEventListener('click', () => {
-  const m = startingModel();
-  if (m) startLoad(catalogEntry(m));
+  closeDrawer(); showChats();
 });
 const HF_HELP = $('hf-help').textContent;
 
@@ -1411,13 +1401,10 @@ $('file-input').addEventListener('change', (e) => {
 });
 
 // Drawer on narrow screens.
-function openDrawer() { app.dataset.drawer = 'open'; $('open-models').setAttribute('aria-expanded', 'true'); $('scrim').hidden = false; }
-function closeDrawer() { delete app.dataset.drawer; $('open-models').setAttribute('aria-expanded', 'false'); $('scrim').hidden = true; }
-$('open-models').addEventListener('click', () => (app.dataset.drawer ? closeDrawer() : openDrawer()));
+function openDrawer() { app.dataset.drawer = 'open'; $('open-chats').setAttribute('aria-expanded', 'true'); $('scrim').hidden = false; }
+function closeDrawer() { delete app.dataset.drawer; $('open-chats').setAttribute('aria-expanded', 'false'); $('scrim').hidden = true; }
 $('scrim').addEventListener('click', closeDrawer);
-const topBar = document.querySelector('.top');
-const syncTop = () => document.documentElement.style.setProperty('--top-h', `${topBar.offsetHeight}px`);
-new ResizeObserver(syncTop).observe(topBar);
+
 
 // Settings dialog.
 const dialog = $('settings');
@@ -1450,7 +1437,7 @@ form.addEventListener('input', (e) => {
   if (!t.name) return;
   if (t.type === 'checkbox') {
     state.settings[t.name] = t.checked;
-    if (t.name === 'internet') { syncWebToggle(); networkChanged(); }
+    if (t.name === 'internet') networkChanged();
   }
   else if (t.type === 'range') {
     state.settings[t.name] = Number(t.value);
@@ -1472,19 +1459,18 @@ $('reset-settings').addEventListener('click', () => {
   state.settings = { ...DEFAULTS };
   saveSettings();
   fillSettings();
-  syncWebToggle();
   networkChanged();
   worker.postMessage({ type: 'adapter', gpu: state.settings.gpu });
 });
 
 setPhase('starting');
-syncWebToggle();
+showChats();
 
 // ---- Terminal and Pi: a lease on the existing model, not a second GPU copy ----
 let workbench=null, workbenchPromise=null, agentRequest=null, agentSequence=0;
 worker.onmessage=onWorkerMessage;worker.onerror=onWorkerError;
 const terminalButton=el('button',{class:'ghost',type:'button',id:'open-terminal',text:'Terminal',title:'A Linux terminal on the same files the assistant works on'});
-$('open-settings').before(terminalButton);
+$('dev-tools').append(terminalButton);
 function finishAgent(error,value) {
   const request=agentRequest;if(!request)return;agentRequest=null;clearTimeout(request.timer);clearTimeout(request.cancelTimer);request.signal?.removeEventListener('abort',request.abort);
   error?request.reject(error):request.resolve(value);
@@ -1527,19 +1513,21 @@ async function ensureWorkbench(){
     ready:()=>['ready','preparing'].includes(state.phase)&&Boolean(state.loaded),turn:agentTurn,modelName:()=>state.loaded?.label||'Local model',taskTimeLimit:()=>piLimits().task,
     lease:()=>{if(state.phase!=='ready'||!state.loaded)throw new Error('The model is busy or not loaded.');setPhase('agent');let released=false;return()=>{if(!released){released=true;setPhase(state.loaded?'ready':'idle');}};},
     getNetwork:()=>({enabled:Boolean(state.settings.internet),jinaKey:state.settings.jinaKey||''}),
-    setNetwork:enabled=>{state.settings.internet=enabled;saveSettings();syncWebToggle();networkChanged();},
+    setNetwork:enabled=>{state.settings.internet=enabled;saveSettings();networkChanged();},
   })).catch(error=>{workbenchPromise=null;throw error;});
   workbench=await workbenchPromise;return workbench;
 }
 terminalButton.addEventListener('click',async()=>{
+  if($('settings').open)$('settings').close();
   terminalButton.disabled=true;
   try{await(await ensureWorkbench()).open();}catch(error){$('status-line').textContent=String(error.message||error);}
   finally{terminalButton.disabled=false;}
 });
 // ---- Browser: a web engine compiled to WebAssembly, shared by the person and Pi ----
 const browserButton=el('button',{class:'ghost',type:'button',id:'open-browser',text:'Browser',title:'A web browser in this page, shared with the assistant'});
-$('open-settings').before(browserButton);
+$('dev-tools').append(browserButton);
 browserButton.addEventListener('click',async()=>{
+  if($('settings').open)$('settings').close();
   browserButton.disabled=true;
   try{const {openBrowser,isBrowserOpen,closeBrowser}=await import('./browser-session.mjs');if(isBrowserOpen())closeBrowser();else await openBrowser();}
   catch(error){$('status-line').textContent=String(error.message||error);}

@@ -109,8 +109,8 @@ A deployment can preset the default route in `web/browser-config.json`
 
 - The page is drawn on a canvas. Click, scroll and type as usual; text goes through a hidden
   field, so IME input and paste work. `<select>` menus open as panel menus.
-- Ask the main chat to browse ("go to news.ycombinator.com and open the top story") or click the
-  Browser button and use it yourself. Pi reads the page as a numbered outline
+- Ask the main chat to browse ("go to news.ycombinator.com and open the top story") or open
+  Browser from Settings (for developers) and use it yourself. Pi reads the page as a numbered outline
   (`[4] textbox "Email" value=""`) and acts with the same pointer and keyboard events you produce,
   so page scripts see ordinary input. An overlay shows where Pi clicks.
 - You and Pi can act at once. If you touch the page while Pi is working, Pi's next action is

@@ -4,7 +4,8 @@ The worker pretends to be this device: how much GPU memory a probe finds, which 
 and it reports what the app asks of it (loads, background downloads, removals) on a
 BroadcastChannel the test reads. Each visit is a page load with the saved models the earlier
 steps left. Checks:
-1. First visit, a 6 GB GPU: "Start" names Qwen3.5 4B and loads it.
+1. First visit, a 6 GB GPU: the page shows only the message box and the conversation list, says
+   the first message downloads Qwen3.5 4B, and the first message loads it and is answered.
 2. Next visit: the saved model loads by itself.
 3. A 2 GB GPU: the 4B (saved, last used) loads; when idle, Qwen3.5 2B downloads in the
    background, and the next request runs on it (the 4B does not fit this GPU's frontier).
@@ -119,14 +120,14 @@ def main():
 
             # 1. First visit on a 6 GB GPU.
             visit()
-            start = page.locator("#start-recommended")
-            start.wait_for(state="visible")
-            page.wait_for_function("() => /Qwen3\\.5 4B/.test(document.querySelector('#start-recommended').textContent)", timeout=10000)
-            check("Start with Qwen3.5 4B (2.74 GB)" in start.inner_text(), f"Start names the model for this GPU ({start.inner_text()!r})")
-            check(len(log("load")) == 0, "nothing loads before Start on a first visit")
-            start.click()
-            page.wait_for_selector("#ready:not([hidden])")
-            check([e["id"] for e in log("load")] == ["qwen3.5-4b"], f"Start loads Qwen3.5 4B ({log('load')})")
+            first = page.locator("#first-run")
+            first.wait_for(state="visible")
+            check("Qwen3.5 4B (2.74 GB)" in first.inner_text(), f"the page says what the first message downloads ({first.inner_text()!r})")
+            controls = page.eval_on_selector_all("button", "bs => bs.filter(b => b.offsetParent).map(b => b.getAttribute('aria-label') || b.textContent.trim())")
+            check(controls == ["New chat", "Settings", "Send"], f"the page has no other controls ({controls})")
+            check(len(log("load")) == 0, "nothing loads before the first message")
+            ask("Hello", 1)
+            check([e["id"] for e in log("load")] == ["qwen3.5-4b"], f"the first message loads Qwen3.5 4B and is answered ({log('load')})")
 
             # 2. Next visit, the 4B saved: it loads by itself.
             state["saved"] = saved("qwen3.5-4b")
@@ -178,13 +179,13 @@ def main():
             visit()
             page.wait_for_selector("#ready:not([hidden])", timeout=15000)
             check([e["id"] for e in log("load")] == ["qwen3.5-4b"], f"the model kept ready for real work loads first ({log('load')})")
-            if page.locator("#open-models").is_visible():
-                page.locator("#open-models").click()
+            # The model list is for developers, in Settings, and is not a picker.
+            page.locator("#open-settings").click()
+            page.locator("#dev-models > summary").click()
             check(page.locator("#model-list button.model").count() == 0, "the model list is not a picker")
             uses = page.locator("#model-list .model .tag.rec").all_inner_texts()
             check(uses == ["Everyday requests", "Real work", "Hard requests", "The hardest requests, thinking", "Pictures and screenshots"], f"it says what each model is for ({uses})")
-            if page.locator("#scrim").is_visible():
-                page.locator("#scrim").click()
+            page.keyboard.press("Escape")
             ask("Hello there", 1)
             check([e["id"] for e in log("load")][-1] == "qwen3-4b-2507", f"an everyday request runs on the fastest rung ({log('load')})")
             check("for an everyday request" in page.locator("#status-line").inner_text(), f"and says why ({page.locator('#status-line').inner_text()!r})")

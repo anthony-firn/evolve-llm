@@ -56,8 +56,10 @@ def main():
         page.wait_for_selector("#gpu-chip[data-state=ok]", timeout=30000)
 
         def load():
-            if page.is_visible("#open-models") and not page.is_visible("#sidebar"):
-                page.click("#open-models")
+            # Links and files are in Settings, for developers.
+            page.click("#open-settings")
+            if page.get_attribute("#dev-models", "open") is None:
+                page.click("#dev-models > summary")
             if not page.evaluate("document.getElementById('other-sources').open"):
                 page.click("#other-sources > summary")
             page.check("#hf-stream")

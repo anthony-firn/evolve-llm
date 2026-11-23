@@ -54,9 +54,10 @@ def main():
         return reply
 
     def load(page):
-        # On a phone the model list is a drawer: open it as a person would.
-        if page.is_visible("#open-models") and page.get_attribute("#app", "data-drawer") != "open":
-            page.click("#open-models")
+        # Links and files are in Settings, for developers.
+        page.click("#open-settings")
+        if page.get_attribute("#dev-models", "open") is None:
+            page.click("#dev-models > summary")
         if not page.evaluate("document.getElementById('other-sources').open"):
             page.click("#other-sources > summary")
         page.fill("#hf-input", a.hf)

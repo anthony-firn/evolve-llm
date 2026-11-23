@@ -31,7 +31,7 @@ def check(runtime, urls, timeout_s, route="tor:"):
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
         page.goto(base)
-        page.locator("#open-browser").click()
+        page.locator("#open-browser").dispatch_event("click")
         page.wait_for_selector("#browser-panel:not([hidden]) .browser-toolbar")
         client_call(page, "b.ready")
         client_call(page, f"b.setRelay({json.dumps(route)})")

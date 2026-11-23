@@ -77,7 +77,7 @@ def main():
         app.on("pageerror", lambda e: problems.append(f"app page error: {e}"))
         app.goto(base)
         app.wait_for_selector("#gpu-chip[data-state=ok]", state="attached", timeout=30000)
-        app.click("#open-terminal")
+        app.dispatch_event("#open-terminal", "click")
         app_text = lambda: app.evaluate("document.querySelector('.vm-console .vt-term:not([hidden])') ? 'ready' : ''")
         expect(wait_for(app_text), "the app opens the Linux terminal")
         time.sleep(1)
