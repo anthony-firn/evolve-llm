@@ -571,7 +571,9 @@ async function turn(messages, opts, maxTokens, ctx, emit = post, preserveTask = 
   try { opensThinking = /<think>\s*$/.test(chat.render(JSON.stringify(withImages(msgs)), JSON.stringify(opts))); } catch { /* no template */ }
   // The raw reply keeps the control tokens that carry markup (Kimi K3 channels, DeepSeek and
   // Kimi tool calls), so calls can be read from it; the person sees `displayText` of it.
-  let raw = '';
+  // When the prompt opened the thinking, the reply starts inside it: give it its opening tag, so
+  // it shows as thinking (not as the answer) and is read as such everywhere.
+  let raw = opensThinking ? '<think>\n' : '';
   let shown = '';
   const show = () => {
     const d = displayText(raw);
