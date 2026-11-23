@@ -232,6 +232,8 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
   // Buttons already clicked, by page and label, with what the page said after: a second click
   // (small models go back and click "Add to cart" again and again) is held once and explained.
   const pressed=new Map(), held=new Set();
+  // The element clicked last, for typing without a number (GUI models click a field, then type).
+  let clicked=null;
   const getClient=async()=>{if(!client){client=typeof browser==='function'?await browser():browser;if(!client)throw new Error('The browser is not available.');}return client;};
   const settle=async(b,ms)=>{if(typeof b.waitForIdle==='function'){try{await b.waitForIdle(ms);}catch{/* a slow page still gets a snapshot */}}};
   const snapshot=async b=>{last=await b.snapshot(snapshotChars);return last;};
@@ -252,7 +254,7 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
     ['browser_open','Open a web page in the browser the person can see and use at the same time as you. Returns what the page shows, with numbered elements [n].',fields({url:string('Web address, e.g. https://news.ycombinator.com',2048)})],
     ['browser_snapshot','Look at the current page again: its text, headings and numbered elements [n] you can act on.',fields({})],
     ['browser_click','Click element [ref] from the latest page snapshot (a link, button, checkbox, tab…).',fields({ref:intArg('Element number [n] from the latest snapshot')})],
-    ['browser_type','Replace the text in field [ref] with text. Set submit true to press Enter afterwards. Never use it for passwords, codes or payment details.',{type:'object',properties:{ref:intArg('Field number [n] from the latest snapshot'),text:string('Text to put in the field',4000),submit:{type:'boolean',description:'Press Enter after typing'}},required:['ref','text'],additionalProperties:false}],
+    ['browser_type','Replace the text in field [ref] with text. Set submit true to press Enter afterwards. Never use it for passwords, codes or payment details.',{type:'object',properties:{ref:intArg('Field number [n] from the latest snapshot (leave it out to type into the field you just clicked)'),text:string('Text to put in the field',4000),submit:{type:'boolean',description:'Press Enter after typing'}},required:['text'],additionalProperties:false}],
     ['browser_select','Choose an option in dropdown [ref] by its visible text or value.',fields({ref:intArg('Dropdown number [n] from the latest snapshot'),value:string('Option text or value',500)})],
     ['browser_scroll','Scroll the page up or down by most of a screen to see more.',fields({direction:{type:'string',enum:['up','down'],description:'up or down'}})],
     ['browser_key','Press a key on the focused element: Enter, Escape, Tab, ArrowDown, ArrowUp, Backspace, PageDown, PageUp.',fields({key:{type:'string',enum:['Enter','Escape','Tab','ArrowDown','ArrowUp','ArrowLeft','ArrowRight','Backspace','PageDown','PageUp','Home','End','Space'],description:'Key name'}})],
@@ -272,7 +274,7 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
       if(!at?.ok)return {ok:false,text:failure('Click at that point',at?.error),snap:last};
       return run('browser_click',{ref:at.ref},signal);
     }
-    const ref=Number(args.ref);
+    const ref=name==='browser_type'&&args.ref==null&&clicked&&last?.version===clicked.version?clicked.ref:Number(args.ref);
     if(['browser_click','browser_type','browser_select'].includes(name)&&!(Number.isInteger(ref)&&ref>0))return {ok:false,text:'ref must be an element number [n] from the latest snapshot. Take a browser_snapshot first.'};
     if(['browser_click','browser_type','browser_select'].includes(name)&&!last)return {ok:false,text:'Take a browser_snapshot (or browser_open a page) first, then use its element numbers.'};
     const line=ref?refLine(last?.text,ref):'';
@@ -296,6 +298,7 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
         return {ok:true,text:`Click [${ref}] was not done: you already clicked ${label0} on this page, and the page then said: "${pressed.get(key)}". Clicking it again would do it a second time. If the request asks for it more than once, click it again; otherwise go on with the next step.`,snap:last};
       }
       action=await b.click(ref);
+      if(action?.ok!==false)clicked={ref,version:null};
       if(key&&action?.ok!==false){
         await settle(b,action?.navigated?20000:3000);
         const after=await b.snapshot(snapshotChars);
@@ -319,6 +322,7 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
     signal?.throwIfAborted();
     if(action&&action.ok!==false&&name!=='browser_open'&&name!=='browser_back')await settle(b,action.navigated?20000:3000);
     const snap=await snapshot(b);
+    if(name==='browser_click'&&clicked&&clicked.version===null)clicked.version=snap?.version;
     const image=await look(b);
     if(action&&action.ok===false)return {ok:false,text:failure(label,action.error),snap,image};
     return {ok:true,text:label==='Snapshot'?'':`${label}: done${action?.navigated?' (the page changed)':''}.`,snap,image};

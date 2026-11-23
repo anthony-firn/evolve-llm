@@ -9,10 +9,14 @@ repairs) from the app's own trace, and writes them as JSON.
 
     python3 tools/build_web.py
     python3 tests/agent_bench.py --runtime dist MODEL.gguf [--tasks docs-line,bugfix] [--gpu pooled]
+
+With --vision MMPROJ.gguf (the model's image encoder) the vision tasks run too: "look" asks for
+the colour of a square that only the page's rendering shows, a colour chosen at random per run.
 """
 import argparse
 import http.server
 import json
+import random
 import re
 import sys
 import tempfile
@@ -217,8 +221,13 @@ def check_law(fake, page, run):
 SHOP_ITEMS = [("red-kettle", "Red Kettle", "19.00"), ("blue-kettle", "Blue Kettle", "24.50"), ("green-teapot", "Green Teapot", "31.00")]
 
 
+# A colour only a model that sees the page can name: the page's text does not say it.
+COLOURS = {"red": "#d22", "green": "#2a2", "blue": "#23d", "yellow": "#ed2", "purple": "#93c", "orange": "#f80"}
+
+
 class Shop(http.server.BaseHTTPRequestHandler):
     added = []  # item ids added to the cart, in order
+    colour = "green"  # the square on /look, chosen per run
 
     def page(self, body, title="Kettle Shop"):
         html = f"<!doctype html><html><head><meta charset='utf-8'><title>{title}</title></head><body><h1>Kettle Shop</h1>{body}</body></html>"
@@ -230,6 +239,9 @@ class Shop(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path.startswith("/look"):
+            square = f"<div style='width:240px;height:240px;background:{COLOURS[Shop.colour]}'></div>"
+            return self.page(f"<p>Today's colour is the square below.</p>{square}", title="Today's colour")
         rows = "".join(f"<li><h2>{name}</h2><p>Price: ${price}</p><form method='post' action='/cart'><input type='hidden' name='item' value='{key}'>"
                        f"<button type='submit'>Add {name} to cart</button></form></li>" for key, name, price in SHOP_ITEMS)
         self.page(f"<p>Cart: {len(Shop.added)} item(s)</p><ul>{rows}</ul>")
@@ -254,6 +266,13 @@ def check_browser(fake, page, run):
     return True, "Blue Kettle added and its price reported"
 
 
+def check_look(fake, page, run):
+    said = [c for c in COLOURS if re.search(rf"\b{c}\b", run["reply"].lower())]
+    if said == [Shop.colour]:
+        return True, f"named the square's colour ({Shop.colour})"
+    return False, f"the square is {Shop.colour}; the reply names {said or 'no colour'}: {run['reply'][:80]!r}"
+
+
 TASKS = {
     "docs-line": (lambda: gh.Fake({"README.md": LONG_README.encode(), "main.py": b"print('hi')\n"}),
                   f'Clone the GitHub repository demo/app. In README.md, right after the line "{TARGET}", add the line "{NEW_LINE}". Commit it on a new branch named docs-serve, push it and open a pull request.',
@@ -271,6 +290,7 @@ TASKS = {
     "law": (lambda: gh.Fake(), "Under the Sunvale City Code, how many days does a landlord have to return a tenant's security deposit after the tenant moves out? Cite the code section and link to it.", check_law),
     "browser": (lambda: gh.Fake(), "Go to {shop} in the browser. Find the price of the Blue Kettle, add it to the cart, and tell me the price.", check_browser),
     "html-app": (lambda: gh.Fake(), "Make a small web page counter.html with a button that counts how many times it is clicked. Test it and show it to me.", check_html),
+    "look": (lambda: gh.Fake(), "Open {shop}look in the browser. What colour is the square on the page? Answer with one word.", check_look),
 }
 
 # The same tasks said another way (--wording 2), so a harness change is judged on more than one
@@ -286,26 +306,29 @@ REWORDED = {
     "research": "Who designed the Marrowfield Lighthouse, and in what year was it first lit? Give me the source too.",
     "browser": "Open the shop at {shop} and put a Blue Kettle in my cart. How much is it?",
     "law": "My landlord in Sunvale still has my deposit. What's the deadline in the city code for returning it? Please cite the section with a link.",
+    "look": "In the browser, go to {shop}look and tell me the colour of the big square there, in one word.",
 }
 
 # What kind of work each task is, for scores per kind (and choosing a model per kind).
 KIND = {"docs-line": "coding", "bugfix": "coding", "new-file": "coding", "merge": "coding", "ci-fix": "coding", "html-app": "coding",
-        "question": "chat", "research": "research", "law": "law", "browser": "browser"}
+        "question": "chat", "research": "research", "law": "law", "browser": "browser", "look": "vision"}
 # Settings a task needs beyond the defaults, and whether it reads the fake web.
-NEEDS = {"research": {"settings": {"internet": True}, "web": True}, "law": {"settings": {"internet": True}, "web": True}, "browser": {"browser": True}}
+NEEDS = {"research": {"settings": {"internet": True}, "web": True}, "law": {"settings": {"internet": True}, "web": True}, "browser": {"browser": True}, "look": {"browser": True, "vision": True}}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runtime", type=Path, required=True)
     ap.add_argument("model", type=Path)
-    ap.add_argument("--tasks", default=",".join(TASKS))
+    ap.add_argument("--tasks", default=None, help="default: every task (the vision ones with --vision)")
+    ap.add_argument("--vision", type=Path, default=None, help="the model's image encoder (mmproj GGUF)")
     ap.add_argument("--gpu", choices=["pooled", "high", "low"], default="pooled")
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--minutes", type=float, default=20, help="per task")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--wording", type=int, choices=[1, 2], default=1, help="2: the tasks said another way")
     a = ap.parse_args()
+    a.tasks = a.tasks or ",".join(t for t in TASKS if a.vision or not NEEDS.get(t, {}).get("vision"))
     trace = Path(tempfile.mkstemp(suffix=".jsonl")[1])
     gh.Handler.trace_file = str(trace)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), lambda *x, **k: gh.Handler(*x, directory=str(a.runtime), **k))
@@ -329,6 +352,11 @@ def main():
             setup, prompt, check = TASKS[name]
             prompt = REWORDED[name] if a.wording == 2 else prompt
             need = NEEDS.get(name, {})
+            if need.get("vision") and not a.vision:
+                print(f"SKIP {name:10} needs --vision with the model's mmproj file", flush=True)
+                continue
+            if name == "look":
+                Shop.colour = random.choice(sorted(COLOURS))
             if need.get("browser"):
                 if not relay_url:
                     print(f"SKIP {name:10} build the browser engine (node tools/build_workbench.mjs) and the relay (cargo build --release --manifest-path browser/relay/Cargo.toml)", flush=True)
@@ -354,7 +382,7 @@ def main():
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.goto(origin + "/play/evolve-llm/")
             page.wait_for_selector("#gpu-chip[data-state=ok]", timeout=30000)
-            page.set_input_files("#file-input", str(a.model))
+            page.set_input_files("#file-input", [str(a.model)] + ([str(a.vision)] if a.vision else []))
             page.wait_for_selector("#ready:not([hidden])", timeout=900000)
             page.evaluate("async (o) => (await import('./vm/client.mjs')).sharedVm().configure({ github: { api: o + '/mockgh/api', raw: o + '/mockgh/raw', token: 't' } })", origin)
             seen = len(trace.read_text().splitlines())

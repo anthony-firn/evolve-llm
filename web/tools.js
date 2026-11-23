@@ -22,11 +22,37 @@ function call(obj, allowed = NAMES) {
   }
   if (!args || typeof args !== 'object') return null;
   if (allowed.has(name)) return { name, args };
+  const gui = guiAction(name, args, allowed);
+  if (gui) return gui;
   // A small model may call a command as if it were a tool: {"name": "git", "arguments":
   // {"command": "commit -m 'x'"}}. With a bash tool, that is the command line "git commit -m 'x'".
   const rest = typeof args.command === 'string' ? args.command : typeof args.args === 'string' ? args.args : Array.isArray(args.args) ? args.args.join(' ') : null;
   if (allowed.has('bash') && typeof name === 'string' && /^[a-z][\w.+-]*$/.test(name) && rest !== null && Object.keys(args).length === 1)
     return { name: 'bash', args: { command: rest.trim().startsWith(name + ' ') || rest.trim() === name ? rest.trim() : `${name} ${rest}`.trim() } };
+  return null;
+}
+
+// GUI models (GUI-Owl, Qwen-VL, Fara) act in their own vocabulary: a tool that opens a web
+// address, and computer_use {action, coordinate, text, keys, pixels} with points as 0-1000 of
+// the screenshot. Mapped onto the browser tools, so the same checks apply.
+const GUI_KEYS = { enter: 'Enter', return: 'Enter', esc: 'Escape', escape: 'Escape', tab: 'Tab', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', arrowup: 'ArrowUp', arrowdown: 'ArrowDown', arrowleft: 'ArrowLeft', arrowright: 'ArrowRight', backspace: 'Backspace', pagedown: 'PageDown', page_down: 'PageDown', pageup: 'PageUp', page_up: 'PageUp' };
+function guiAction(name, args, allowed) {
+  if (!allowed.has('browser_open')) return null;
+  const action = String(args.action || '').toLowerCase();
+  if (typeof args.url === 'string' && (!action || /^(open|visit|navigate|go_?to|web|browse|search)/.test(action))) return { name: 'browser_open', args: { url: args.url } };
+  if (!action) return null;
+  const pt = Array.isArray(args.coordinate) ? args.coordinate : Array.isArray(args.coordinates) ? args.coordinates : Array.isArray(args.point) ? args.point : Number.isFinite(args.x) ? [args.x, args.y] : null;
+  if (/^(left_)?click$|^double_click$|^tap$/.test(action) && pt && allowed.has('browser_click_at')) return { name: 'browser_click_at', args: { x: Math.round(Number(pt[0])), y: Math.round(Number(pt[1])) } };
+  if (action === 'type' && typeof args.text === 'string' && allowed.has('browser_type')) return { name: 'browser_type', args: { text: args.text, submit: false } };
+  if (/^(key|press|hotkey)$/.test(action) && allowed.has('browser_key')) {
+    const key = GUI_KEYS[String((Array.isArray(args.keys) ? args.keys.at(-1) : args.keys ?? args.key ?? args.text) || '').toLowerCase()];
+    if (key) return { name: 'browser_key', args: { key } };
+  }
+  if (action === 'scroll' && allowed.has('browser_scroll')) {
+    // Qwen-VL's convention: positive pixels scroll up.
+    const dir = typeof args.direction === 'string' ? args.direction.toLowerCase() : Number(args.pixels) > 0 ? 'up' : 'down';
+    return { name: 'browser_scroll', args: { direction: dir === 'up' ? 'up' : 'down' } };
+  }
   return null;
 }
 
