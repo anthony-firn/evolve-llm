@@ -143,3 +143,10 @@ test('pages open through Wikipedia or Jina Reader, and only web addresses open',
   assert.match((await openUrl('javascript:alert(1)', { fetchFn })).text, /Only http/);
   assert.match((await openUrl('not a url', { fetchFn })).text, /not a web address/);
 });
+
+test('the page has a title and exactly one h1 (evolvetech.dev checks both)', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const html = await readFile(new URL('../web/index.html', import.meta.url), 'utf8');
+  assert.match(html, /<title>[^<]+<\/title>/);
+  assert.equal((html.match(/<h1[\s>]/g) || []).length, 1);
+});
