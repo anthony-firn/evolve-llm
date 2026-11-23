@@ -1,9 +1,10 @@
 """Switching models by kind of request, in the real app with a scripted model worker.
 
-The worker says Qwen3 4B and Qwen3 4B Instruct 2507 are both saved on this device and answers
-with the name of the model loaded last. Checks: a coding request stays on Qwen3 4B (best for
-coding); a research request switches to 2507 (best for research), keeps the conversation and is
-answered after the switch, with a switch line in the trace; with the setting off, nothing switches.
+The worker says Qwen3 4B and Nanbeige4.1 3B are both saved on this device and answers with the
+name of the model loaded last. Of the two, Nanbeige ranks higher for coding and Qwen3 4B for chat
+(BEST_FOR in web/models.js). Checks: a coding request on Qwen3 4B switches to Nanbeige, keeps the
+conversation and is answered after the switch, with a switch line in the trace; a chat request
+switches back; with the setting off, nothing switches.
 
     python3 tests/model_switch_browser_test.py [--runtime web]
 """
@@ -20,7 +21,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 MODELS = {
     "Qwen__Qwen3-4B-GGUF__main__Qwen3-4B-Q4_K_M.gguf": ("Qwen/Qwen3-4B-GGUF", "Qwen3-4B-Q4_K_M.gguf"),
-    "unsloth__Qwen3-4B-Instruct-2507-GGUF__main__Qwen3-4B-Instruct-2507-Q4_K_M.gguf": ("unsloth/Qwen3-4B-Instruct-2507-GGUF", "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"),
+    "mradermacher__Nanbeige4.1-3B-GGUF__main__Nanbeige4.1-3B.Q4_K_M.gguf": ("mradermacher/Nanbeige4.1-3B-GGUF", "Nanbeige4.1-3B.Q4_K_M.gguf"),
 }
 WORKER = """
 const emit = (type, data = {}) => postMessage({ type, ...data });
@@ -75,13 +76,13 @@ def main():
                 return page.locator(".msg.assistant").last.inner_text()
 
             reply = send("Fix the bug in calc.py and run its tests")
-            check("Answered by Qwen3-4B-Q4_K_M.gguf" in reply, f"a coding request stays on Qwen3 4B ({reply!r})")
-            reply = send("Look up who designed the Marrowfield Lighthouse and when it was first lit")
-            check("Answered by Qwen3-4B-Instruct-2507-Q4_K_M.gguf" in reply, f"a research request switches to 2507 and is answered there ({reply!r})")
-            check(page.locator(".msg.user").count() == 2, "the conversation is kept across the switch")
-            check("Switched to Qwen3 4B Instruct 2507" in page.locator("#status-line").inner_text(), f"the status line says why ({page.locator('#status-line').inner_text()!r})")
+            check("Answered by Nanbeige4.1-3B.Q4_K_M.gguf" in reply, f"a coding request switches to Nanbeige and is answered there ({reply!r})")
+            check("Switched to Nanbeige4.1 3B" in page.locator("#status-line").inner_text(), f"the status line says why ({page.locator('#status-line').inner_text()!r})")
+            reply = send("Tell me a short joke about cats")
+            check("Answered by Qwen3-4B-Q4_K_M.gguf" in reply, f"a chat request switches back to Qwen3 4B ({reply!r})")
+            check(page.locator(".msg.user").count() == 2, "the conversation is kept across the switches")
             switches = [json.loads(l) for l in trace.read_text().splitlines() if '"switch"' in l]
-            check(len(switches) == 1 and switches[0]["kind"] == "research" and switches[0]["to"] == "Qwen3 4B Instruct 2507", f"the trace records the switch ({switches})")
+            check([(x["kind"], x["to"]) for x in switches] == [("coding", "Nanbeige4.1 3B"), ("chat", "Qwen3 4B")], f"the trace records both switches ({switches})")
             page.evaluate("""() => { const s = JSON.parse(localStorage.getItem('evolve-llm-settings') || '{}'); s.autoSwitch = false; localStorage.setItem('evolve-llm-settings', JSON.stringify(s)); }""")
             page.locator("#open-settings").click()
             box = page.locator("input[name=autoSwitch]")
@@ -89,7 +90,7 @@ def main():
                 box.uncheck()
             page.keyboard.press("Escape")
             reply = send("Fix the bug in calc.py again")
-            check("Answered by Qwen3-4B-Instruct-2507-Q4_K_M.gguf" in reply, f"with switching off, the coding request stays on 2507 ({reply!r})")
+            check("Answered by Qwen3-4B-Q4_K_M.gguf" in reply, f"with switching off, the coding request stays on Qwen3 4B ({reply!r})")
             check(not errors, f"no page errors ({errors})")
             browser.close()
     finally:
