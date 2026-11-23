@@ -1401,7 +1401,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /// Qwen3.5's gates: mode 0 splits the query projection (per head: head_dim query values, then
 /// head_dim gate values) into the query and the gate; mode 1 multiplies the attention output by
 /// sigmoid(gate); mode 2 multiplies by SiLU of a gate read from `qg` at (token stride, offset)
-/// (Gated DeltaNet's output gate, merged into its input projection).
+/// (Gated DeltaNet's output gate, merged into its input projection); mode 3 multiplies a token's
+/// row by sigmoid of one value per token, `qg` at (token stride, offset) (a shared expert's gate).
 pub const QGATE: &str = r#"
 struct P { q_dim: u32, hd: u32, mode: u32, stride: u32, off: u32, pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(1) var<uniform> p: P;
@@ -1420,9 +1421,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         g[i] = qg[src + p.hd];
     } else if (p.mode == 1u) {
         a[i] = a[i] / (1.0 + exp(-g[i]));
-    } else {
+    } else if (p.mode == 2u) {
         let z = qg[t * p.stride + p.off + j];
         a[i] = a[i] * z / (1.0 + exp(-z));
+    } else {
+        a[i] = a[i] / (1.0 + exp(-qg[t * p.stride + p.off]));
     }
 }
 "#;

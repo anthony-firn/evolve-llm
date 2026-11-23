@@ -1050,7 +1050,7 @@ impl Engine {
             let da = self.layouts.deep_add.clone();
             self.pipeline("deep-add".into(), shaders::deep_add(), &da);
         }
-        if self.cfg.q_gate {
+        if self.cfg.q_gate || self.cfg.moe.as_ref().is_some_and(|e| e.shared_gate) {
             let qg = self.layouts.qgate.clone();
             self.pipeline("qgate".into(), shaders::qgate(), &qg);
         }
@@ -1206,6 +1206,8 @@ impl Engine {
         let kqv = buf("kda-qkv", t * kda.as_ref().map_or(0, |k| k.channels() + if k.merged { k.width() } else { 0 }));
         // Qwen3.5's query projection with its gate, and the gate.
         let (qg_in, qg) = if c.q_gate { (buf("q-and-gate", t * 2 * c.q_dim()), buf("q-gate", t * c.q_dim())) } else { (buf("unused", 4), buf("unused", 4)) };
+        // One value per token: the shared expert's gate.
+        let shg = buf("shared-gate", if moe.as_ref().is_some_and(|e| e.shared_gate) { t } else { 1 });
         let gk = buf("kda-gate", t * kd);
         let fa = buf("kda-gate-a", t * kda.as_ref().map_or(1, |k| k.head_dim));
         let betab = buf("kda-beta", t * kda.as_ref().map_or(1, |k| k.n_head));
@@ -1982,6 +1984,18 @@ impl Engine {
                     if e.n_ff_shared > 0 {
                         matmul(&mut ops, &n("ffn_gate_shexp.weight"), &xn, &gate, 0, None, false, input);
                         matmul(&mut ops, &n("ffn_up_shexp.weight"), &xn, &gate, act_mode, None, false, input);
+                        if e.shared_gate {
+                            // sigmoid(gate · x) per token scales the shared expert: its activation
+                            // before the (linear) down projection, which is the same.
+                            matmul(&mut ops, &n("ffn_gate_inp_shexp.weight"), &xn, &shg, 0, None, false, input);
+                            let w = e.n_ff_shared as u32;
+                            ops.push(Op {
+                                when: When::Always,
+                                kernel: Kernel::QGate,
+                                grid: Grid::Width(w),
+                                bind: bind(&self.layouts.qgate, "shared-gate", &[&step, &params(&words(&[w, 0, 3, 1, 0, 0, 0, 0])), &shg, &gate, &qg]),
+                            });
+                        }
                         matmul(&mut ops, &n("ffn_down_shexp.weight"), &gate, &x, 1, None, false, Input::rows(e.n_ff_shared));
                     }
                 }
