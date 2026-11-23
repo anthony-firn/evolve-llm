@@ -57,6 +57,10 @@ export const MODELS = [
     vision: { file: 'GUI-Owl-1.5-4B-Instruct.mmproj-f16.gguf', bytes: 836180288 }, ...MIT },
   { id: 'qwen3.5-4b', name: 'Qwen3.5 4B', maker: 'Qwen', repo: 'unsloth/Qwen3.5-4B-GGUF',
     file: 'Qwen3.5-4B-Q4_K_M.gguf', bytes: 2740937888, quant: 'Q4_K_M', note: 'The February 2026 generation: a linear-attention hybrid with a far smaller cache for long chats. The best and fastest agent in our tests. Recommended.', thinking: true, recommended: true, ...APACHE },
+  { id: 'qwen3.5-2b', name: 'Qwen3.5 2B', maker: 'Qwen', repo: 'unsloth/Qwen3.5-2B-GGUF',
+    file: 'Qwen3.5-2B-Q4_K_M.gguf', bytes: 1280835840, quant: 'Q4_K_M', note: 'Qwen3.5 for smaller GPUs and phones: the same linear-attention design in half the size.', thinking: true, ...APACHE },
+  { id: 'qwen3.5-0.8b', name: 'Qwen3.5 0.8B', maker: 'Qwen', repo: 'unsloth/Qwen3.5-0.8B-GGUF',
+    file: 'Qwen3.5-0.8B-Q4_K_M.gguf', bytes: 532517120, quant: 'Q4_K_M', note: 'The smallest Qwen3.5: for phones and older computers.', thinking: true, ...APACHE },
   { id: 'nanbeige4.1-3b', name: 'Nanbeige4.1 3B', maker: 'Nanbeige', repo: 'mradermacher/Nanbeige4.1-3B-GGUF',
     file: 'Nanbeige4.1-3B.Q4_K_M.gguf', bytes: 2443113024, quant: 'Q4_K_M', note: 'A 3B model that leads small models at calling tools. Thinks before it answers.', thinking: true, ...APACHE },
 ];
