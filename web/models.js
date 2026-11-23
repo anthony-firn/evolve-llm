@@ -11,14 +11,15 @@ const KIMI_K31 = { license: 'Kimi K3.1 Pro License', licenseUrl: 'https://huggin
  *  work best in tests/agent_bench.py, best first. With "Switch models by kind of request" on, the
  *  chat loads the first one saved on this device before answering. Measured on a laptop with an
  *  RTX 3050 and an Intel GPU (2026-11-22); update from new benchmark runs. */
-// From the agent benchmark (tests/agent_bench.py), rounds 7 and 8: Qwen3 4B Instruct 2507 10/10
-// twice; Nanbeige4.1 3B 7/10 (coding 4/6, research, law and browsing 1/1 each); Qwen3 4B 4/10 twice.
+// From the agent benchmark (tests/agent_bench.py), rounds 7 to 10: Qwen3.5 4B 10/10 in 333 s
+// (round 9) and 10/10 reworded in 391 s (round 10); Qwen3 4B Instruct 2507 10/10 three times (417 s in
+// round 9); Nanbeige4.1 3B 6-7/10; Qwen3 4B 7/10 in round 9 (scored with link addresses).
 export const BEST_FOR = {
-  coding: ['qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
-  research: ['qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
-  law: ['qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
-  browser: ['qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
-  chat: ['qwen3-4b-2507', 'qwen3-4b', 'nanbeige4.1-3b'],
+  coding: ['qwen3.5-4b', 'qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
+  research: ['qwen3.5-4b', 'qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
+  law: ['qwen3.5-4b', 'qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
+  browser: ['qwen3.5-4b', 'qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
+  chat: ['qwen3.5-4b', 'qwen3-4b-2507', 'qwen3-4b', 'nanbeige4.1-3b'],
 };
 
 export const MODELS = [
@@ -27,7 +28,7 @@ export const MODELS = [
   { id: 'smollm2-360m', name: 'SmolLM2 360M', maker: 'Hugging Face', repo: 'HuggingFaceTB/SmolLM2-360M-Instruct-GGUF',
     file: 'smollm2-360m-instruct-q8_0.gguf', bytes: 386404992, quant: 'Q8_0', note: 'Small English assistant.', ...APACHE },
   { id: 'qwen2.5-0.5b', name: 'Qwen2.5 0.5B', maker: 'Qwen', repo: 'Qwen/Qwen2.5-0.5B-Instruct-GGUF',
-    file: 'qwen2.5-0.5b-instruct-q4_k_m.gguf', bytes: 491400032, quant: 'Q4_K_M', note: 'Fast and multilingual. Recommended.', recommended: true, ...APACHE },
+    file: 'qwen2.5-0.5b-instruct-q4_k_m.gguf', bytes: 491400032, quant: 'Q4_K_M', note: 'Fast and multilingual: the smallest download, for slow connections and phones.', ...APACHE },
   { id: 'qwen3-0.6b', name: 'Qwen3 0.6B', maker: 'Qwen', repo: 'Qwen/Qwen3-0.6B-GGUF',
     file: 'Qwen3-0.6B-Q8_0.gguf', bytes: 639446688, quant: 'Q8_0', note: 'Can think step by step before answering.', thinking: true, ...APACHE },
   { id: 'llama3.2-1b', name: 'Llama 3.2 1B', maker: 'Meta', repo: 'bartowski/Llama-3.2-1B-Instruct-GGUF',
@@ -55,7 +56,7 @@ export const MODELS = [
     file: 'GUI-Owl-1.5-4B-Instruct.Q4_K_M.gguf', bytes: 2497282208, quant: 'Q4_K_M', note: 'Trained to use computers: reads screenshots and points at what to click. Downloads its image encoder too.',
     vision: { file: 'GUI-Owl-1.5-4B-Instruct.mmproj-f16.gguf', bytes: 836180288 }, ...MIT },
   { id: 'qwen3.5-4b', name: 'Qwen3.5 4B', maker: 'Qwen', repo: 'unsloth/Qwen3.5-4B-GGUF',
-    file: 'Qwen3.5-4B-Q4_K_M.gguf', bytes: 2740937888, quant: 'Q4_K_M', note: 'The February 2026 generation: a linear-attention hybrid, much stronger than Qwen3 4B, with a far smaller cache for long chats.', thinking: true, ...APACHE },
+    file: 'Qwen3.5-4B-Q4_K_M.gguf', bytes: 2740937888, quant: 'Q4_K_M', note: 'The February 2026 generation: a linear-attention hybrid with a far smaller cache for long chats. The best and fastest agent in our tests. Recommended.', thinking: true, recommended: true, ...APACHE },
   { id: 'nanbeige4.1-3b', name: 'Nanbeige4.1 3B', maker: 'Nanbeige', repo: 'mradermacher/Nanbeige4.1-3B-GGUF',
     file: 'Nanbeige4.1-3B.Q4_K_M.gguf', bytes: 2443113024, quant: 'Q4_K_M', note: 'A 3B model that leads small models at calling tools. Thinks before it answers.', thinking: true, ...APACHE },
 ];
