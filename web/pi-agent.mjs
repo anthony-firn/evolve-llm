@@ -2,6 +2,7 @@
 import { Agent } from '@earendil-works/pi-agent-core';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
 import { attemptedToolCall, parseToolCalls, schemaTypes, stripToolCalls } from './tools.js';
+import { checkKind, pythonCheckCommand, syntaxNote } from './syntax-check.mjs';
 
 export const PI_VERSION = '1.5.1';
 const LIMITS = { turns: 10, repairs: 2, calls: 12, result: 6000 };
@@ -407,7 +408,7 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(asked.push&&/is ahead of/.test(st.stdout||''))return {why:'Your commits are not pushed yet.',cmd:'git push'};
     if(asked.pr&&pushed){const v=await workspace.request('exec',{command:'gh pr view'},{signal}).catch(()=>null);if(v&&v.code)return {why:'The pull request is not open yet.',cmd:'gh pr create --title "Title" --body "What and why"'};}
     return null;
-  };let ghRepo=null, stuck=null, asked=null, declined=false, nudges=0, pushed=false, webCalls=0, currentPrompt='', opened=[], found=[];
+  };let reviewed=false, ghRepo=null, stuck=null, asked=null, declined=false, nudges=0, pushed=false, webCalls=0, currentPrompt='', opened=[], found=[];
   const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction,vision,request:()=>currentPrompt}):null;
   const limits=linux?LINUX_LIMITS:browserTools?BROWSER_LIMITS:LIMITS;
   const declarations=(linux?[
@@ -439,6 +440,22 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       return {content:[{type:'text',text:browserTools.format(outcome,limits.result)}],details:{browser:true,...(outcome.image&&{image:outcome.image})},isError:outcome.ok===false};
     }
     if(name==='bash'){
+      // Before a task's first commit, its diff: is it exactly what was asked (no leftover or
+      // unrelated lines, nothing missing)? The commit runs when the model sends it again.
+      // Only when the steps before the commit are cd and git: an edit chained before it (sed -i …
+      // && git commit) would not have run yet, and sending the command again would run it twice.
+      const steps=String(args.command||'').split(/&&|\|\||;/);
+      const at=steps.findIndex(x=>/^\s*git\s+commit\b/.test(x));
+      if(linux&&!reviewed&&at>=0&&steps.slice(0,at).every(x=>/^\s*(cd|git)\s/.test(x))){
+        reviewed=true;
+        const prefix=(/^((?:\s*cd\s+[^&;|]+&&)*)/.exec(String(args.command||''))||['',''])[1];
+        const d=await workspace.request('exec',{command:`${ghRepo?`export GH_REPO=${ghRepo}; `:''}${prefix} git diff`},{signal}).catch(()=>null);
+        const diff=String(d&&!d.code?d.stdout||'':'').trim();
+        if(diff){
+          const shown=diff.length>3000?`${diff.slice(0,3000)}\n… (the rest is not shown; run git diff to see all of it)`:diff;
+          return {content:[{type:'text',text:`Not committed yet. Before the first commit, check that this diff is exactly what the request asks for: no leftover lines, nothing unrelated, nothing missing.\n\n${shown}\n\nIf it is right, run the same commit command again. If not, fix the files first.`}],details:{sandbox:true,review:true},isError:false};
+        }
+      }
       // A file changed in place by sed: read before and after, to show what it now says.
       const target=linux?sedInPlaceFile(String(args.command||'')):null;
       const where=target&&typeof workspace.path==='function'?workspace.path(target):target;
@@ -485,11 +502,18 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
         seen.add(key);
       }
       if(['write','edit'].includes(name)){changes++;if(/\.html?$/i.test(args.path))previewPath=args.path;}
+      // Edit-time check: the file's syntax as it now is (quiet when it is fine).
+      if(['write','edit'].includes(name)&&result&&result.ok!==false&&checkKind(String(args.path))){
+        const text=name==='write'?String(args.text??''):await workspace.request('read',{path:args.path},{signal}).then(r=>r?.text??null,()=>null);
+        const python=linux?async p=>{const r=await workspace.request('exec',{command:pythonCheckCommand(p)},{signal}).catch(()=>null);return r?.code?`${r.stdout||''}\n${r.stderr||''}`:'';}:null;
+        if(text!=null)result.check=await syntaxNote(String(args.path),text,{python}).catch(()=>null)||undefined;
+      }
     }
     else if(['preview','browser_test'].includes(name)){if(!preview)throw new Error('Preview is unavailable.');if(name==='preview'&&pendingChangeError)throw new Error('A file change failed. Read the file and correct the failed write or edit before final preview.');result=await preview(args.path,{signal,smoke:name==='browser_test'});if(name==='preview'&&result.ok===true)completedPreview=true;}
     else{result=await network.run(name,args,signal);webCalls++;for(const src of result.sources||[]){const list=name==='open_url'?opened:found;if(src.url&&!list.includes(src.url))list.push(src.url);}}
-    const {now,...rest}=result||{};
-    const full=name==='read'?`File: ${args.path}\n${result.text}`:name==='bash'&&linux?shellText(result):name==='edit'&&now?`${JSON.stringify(rest)}\nThose lines now read:\n${now}${unreachable(now)?`\nNote: ${unreachable(now)}`:''}`:JSON.stringify(result);
+    const {now,check,...rest}=result||{};
+    const changed=name==='edit'&&now?`${JSON.stringify(rest)}\nThose lines now read:\n${now}${unreachable(now)?`\nNote: ${unreachable(now)}`:''}`:JSON.stringify(rest);
+    const full=name==='read'?`File: ${args.path}\n${result.text}`:name==='bash'&&linux?shellText(result):['write','edit'].includes(name)?changed+(check?`\n${check}`:''):JSON.stringify(result);
     const body=full.length<=limits.result?full:full.slice(0,limits.result)+(name==='read'?`\n… (${full.length-limits.result} more characters not shown. To find a line, run: grep -n "SOME WORDS" ${args.path}; edit needs only the exact text to replace.)`:'\n… (output cut)');
     return {content:[{type:'text',text:body}],details:{sandbox:true},isError:result.ok===false||Boolean(result.code)||(['web_search','open_url'].includes(name)&&!result.sources?.length)};
   }}));
@@ -585,5 +609,5 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
-  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;cutoffs=0;pushed=false;webCalls=0;opened=[];found=[];currentPrompt=String(prompt);const pre=linux?await preamble(prompt,workspace,linux.cwd,linux.building?.()||null):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
+  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;cutoffs=0;reviewed=false;pushed=false;webCalls=0;opened=[];found=[];currentPrompt=String(prompt);const pre=linux?await preamble(prompt,workspace,linux.cwd,linux.building?.()||null):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
 }
