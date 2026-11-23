@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseBlocks, parseInline, splitThinking } from '../web/markdown.js';
-import { LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from '../web/models.js';
+import { MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from '../web/models.js';
 
 test('splits reasoning from the answer, including an unfinished thought', () => {
   assert.deepEqual(splitThinking('<think>a\nb</think>\n\nAnswer'), [
@@ -66,12 +66,13 @@ test('split models are found and listed part by part', async () => {
 
 test('catalog entries are complete and storage keys are stable', () => {
   const ids = new Set();
-  for (const m of [...MODELS, ...LARGE]) {
+  for (const m of MODELS) {
     assert.ok(m.repo && m.file.endsWith('.gguf') && m.bytes > 1e8 && m.license && m.licenseUrl, m.id);
     assert.ok(!ids.has(m.id), `duplicate ${m.id}`);
     ids.add(m.id);
   }
-  assert.equal(MODELS.filter((m) => m.recommended).length, 1);
+  // No model is marked recommended: the app chooses per request (web/model-manager.mjs).
+  assert.equal(MODELS.filter((m) => m.recommended).length, 0);
   assert.equal(cacheKey('Qwen/Qwen3-0.6B-GGUF', 'Qwen3-0.6B-Q8_0.gguf'), 'Qwen__Qwen3-0.6B-GGUF__main__Qwen3-0.6B-Q8_0.gguf');
   assert.equal(formatBytes(491400032), '491 MB');
   assert.equal(formatBytes(2497280256), '2.50 GB');

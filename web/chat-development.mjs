@@ -29,6 +29,28 @@ export function kindOf(text) {
   return 'chat';
 }
 
+// Signs a request is harder than its kind alone says: debugging, design, proofs, migrations.
+const HARD = /\b(refactor\w*|architect\w*|design (?:a|an|the)\b|optimi[sz]\w*|debug\w*|race condition|concurren\w*|deadlock|memory leak|algorithm\w*|prove|proof|complexity|migrat\w*|vulnerab\w*|security (?:review|audit)|why (?:does|is|do)\b[^.?!]{0,60}\b(?:fail|crash|break|hang)\w*|(?:fails?|crash\w*) (?:intermittently|randomly|sometimes))/i;
+
+/**
+ * How hard a request is, 0 to 2 (the app reaches 3 only after failures): everyday questions 0,
+ * work (coding, research, law, browsing) 1, and work with signs of difficulty (see HARD, a long
+ * brief, or four or more listed steps) 2. The app runs each level on a rung of the device's
+ * frontier (web/model-manager.mjs).
+ */
+export function levelOf(text) {
+  const t = String(text);
+  let level = kindOf(t) === 'chat' ? 0 : 1;
+  const steps = (t.match(/^\s*(?:\d+[.)]|[-*])\s+/gm) || []).length;
+  if (HARD.test(t) || t.length > 1200 || steps >= 4) level += 1;
+  return Math.min(2, level);
+}
+
+/** A person saying the last answer did not work: the conversation moves up a rung. */
+export function complaint(text) {
+  return /\b(?:(?:did|does|do)(?:n'?t| not) work|(?:still|it'?s|that'?s|is) (?:broken|wrong|failing|not working)|still (?:fails|failing|errors?)|wrong answer|not what I asked|try again)\b/i.test(String(text));
+}
+
 export function wantsSnakeStarter(text) {
   const creation=/\b(make|build|create|develop|implement|code)\b/i.test(text);
   const newGame=/\b(?:a|an|new|another)\s+(?:[\w-]+\s+){0,2}snake\s+(?:game|clone)\b/i.test(text);

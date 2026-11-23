@@ -1,4 +1,4 @@
-import { MODELS, LARGE, cacheKey, hfUrl, splitParts } from './models.js';
+import { MODELS, cacheKey, hfUrl, splitParts } from './models.js';
 
 export class EngineError extends Error {
   constructor(code, message) { super(message); this.name = 'EngineError'; this.code = code; }
@@ -80,10 +80,10 @@ export function createEngine({ workerURL = new URL('./worker.js', import.meta.ur
       if (!Number.isInteger(contextSize) || contextSize < 256 || contextSize > 32768) throw new TypeError('contextSize must be 256–32768');
       let source;
       if (typeof model === 'string') {
-        const m = [...MODELS, ...LARGE].find(m => m.id === model);
+        const m = MODELS.find(m => m.id === model);
         if (!m) throw new TypeError('Unknown catalog model ID.');
         source = { kind: 'hf', id: m.id, key: cacheKey(m.repo, m.file), repo: m.repo, file: m.file,
-          revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, name: m.name, resolve: Boolean(splitParts(m.file)) };
+          revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, sha256: m.sha256 || null, name: m.name, resolve: Boolean(splitParts(m.file)) };
       } else if (Array.isArray(model?.files) && model.files.length && model.files.every(f => typeof File !== 'undefined' && f instanceof File)) {
         source = { kind: 'file', files: model.files };
       } else throw new TypeError('Use a catalog model ID or { files: File[] }.');

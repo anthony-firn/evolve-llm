@@ -1,33 +1,70 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { pickModel, toRemove, shouldFetch, isMetered, LADDER } from '../web/model-manager.mjs';
+import { LEVELS, QUALITY_FLOOR, frontier, pickModel, rungFor, toRemove, shouldFetch, isMetered } from '../web/model-manager.mjs';
 import { MODELS } from '../web/models.js';
 
 const GB = 1e9;
-const catalog = [
-  { id: 'qwen3.5-4b', bytes: 2.74 * GB },
-  { id: 'qwen3.5-2b', bytes: 1.28 * GB },
-  { id: 'qwen3.5-0.8b', bytes: 0.53 * GB },
-];
+const DEVICES = {
+  laptop: { gpuBytes: 5 * GB, storageFree: 100 * GB },
+  'laptop, little storage': { gpuBytes: 5 * GB, storageFree: 8 * GB },
+  'small GPU': { gpuBytes: 2 * GB, storageFree: 50 * GB },
+  phone: { gpuBytes: 3 * GB, storageFree: 20 * GB, mobile: true },
+  'tiny GPU': { gpuBytes: 1 * GB, storageFree: 50 * GB },
+};
+const name = (r) => (r ? r.id + (r.thinking ? '+thinking' : '') : null);
+const levels = (device) => { const l = frontier(MODELS, device); return Array.from({ length: LEVELS }, (_, v) => name(rungFor(l, v))); };
 
-test('the ladder is in the catalog', () => {
-  for (const id of LADDER) assert.ok(MODELS.some((m) => m.id === id), id);
+test('every catalog model has what the frontier needs', () => {
+  for (const m of MODELS) {
+    assert.match(m.sha256, /^[0-9a-f]{64}$/, m.id);
+    assert.ok(m.speed > 0, m.id);
+    if (m.vision) continue;
+    assert.ok(m.modes?.length, m.id);
+    for (const mode of m.modes) assert.ok(mode.coding >= 0 && mode.tokens > 0 && typeof mode.thinking === 'boolean', m.id);
+  }
 });
 
-test('each device gets the best model that fits on its GPU, has room to save, and is quick enough', () => {
-  const pick = (device) => pickModel(catalog, device).id;
-  assert.equal(pick({ gpuBytes: 6 * GB, storageFree: 50 * GB }), 'qwen3.5-4b');
-  assert.equal(pick({ gpuBytes: 2.5 * GB, storageFree: 50 * GB }), 'qwen3.5-2b');
-  assert.equal(pick({ gpuBytes: 1 * GB, storageFree: 50 * GB }), 'qwen3.5-0.8b');
-  // Too little storage for the 4B, unless it is already saved.
-  assert.equal(pick({ gpuBytes: 6 * GB, storageFree: 2 * GB }), 'qwen3.5-2b');
-  assert.equal(pick({ gpuBytes: 6 * GB, storageFree: 2 * GB, saved: new Set(['qwen3.5-4b']) }), 'qwen3.5-4b');
-  // Phones: small models even with a large shared GPU.
-  assert.equal(pick({ gpuBytes: 8 * GB, storageFree: 50 * GB, mobile: true }), 'qwen3.5-2b');
-  // Nothing fits: the smallest (it streams what does not fit).
-  assert.equal(pick({ gpuBytes: 0.2 * GB, storageFree: 50 * GB }), 'qwen3.5-0.8b');
-  // Unknown GPU memory: the best.
-  assert.equal(pick({ storageFree: 50 * GB }), 'qwen3.5-4b');
+test('the catalog holds only frontier models: each one is used at some level on some device', () => {
+  const used = new Set(MODELS.filter((m) => m.vision).map((m) => m.id));
+  for (const device of Object.values(DEVICES)) {
+    const l = frontier(MODELS, device);
+    for (let v = 0; v < LEVELS; v++) used.add(rungFor(l, v)?.id);
+    used.add(pickModel(MODELS, device)?.id);
+  }
+  for (const m of MODELS) assert.ok(used.has(m.id), `${m.id} is never used: it is not on any device's frontier`);
+});
+
+test('each device climbs its own frontier, fastest for everyday requests and best for the hardest', () => {
+  assert.deepEqual(levels(DEVICES.laptop), ['qwen3-4b-2507', 'qwen3.5-4b', 'qwen3-coder-30b-a3b', 'qwen3.6-35b-a3b+thinking']);
+  // No room for the 13 and 17 GB experts models: Qwen3.5 4B thinking is the top.
+  assert.deepEqual(levels(DEVICES['laptop, little storage']), ['qwen3-4b-2507', 'qwen3.5-4b', 'qwen3.5-4b', 'qwen3.5-4b+thinking']);
+  // Already saved, an experts model counts even when storage is short.
+  assert.equal(levels({ ...DEVICES['laptop, little storage'], saved: new Set(['qwen3-coder-30b-a3b']) })[3], 'qwen3-coder-30b-a3b');
+  // Nothing clears the quality floor on a phone: its best model does everything.
+  assert.deepEqual(levels(DEVICES.phone), Array(LEVELS).fill('qwen3.5-2b'));
+  assert.deepEqual(levels(DEVICES['tiny GPU']), Array(LEVELS).fill('qwen3-0.6b'));
+});
+
+test('on the frontier, a faster rung never scores higher than a slower one', () => {
+  for (const device of Object.values(DEVICES)) {
+    const l = frontier(MODELS, device);
+    for (let i = 1; i < l.length; i++) assert.ok(l[i].time >= l[i - 1].time && l[i].coding > l[i - 1].coding);
+  }
+});
+
+test('rungs spread over the levels, and the floor keeps weak rungs for when nothing else fits', () => {
+  const r = (id, coding, time) => ({ id, coding, time, thinking: false });
+  assert.deepEqual([0, 1, 2, 3].map((v) => rungFor([r('a', 9, 1), r('b', 14, 2)], v).id), ['a', 'a', 'b', 'b']);
+  assert.deepEqual([0, 1, 2, 3].map((v) => rungFor([r('tiny', 1, 0.1), r('a', 9, 1)], v).id), ['a', 'a', 'a', 'a']);
+  assert.equal(rungFor([r('tiny', 1, 0.1), r('small', QUALITY_FLOOR - 1, 1)], 0).id, 'small');
+  assert.equal(rungFor([], 2), null);
+});
+
+test('the model kept ready runs wholly on the GPU', () => {
+  assert.equal(pickModel(MODELS, DEVICES.laptop).id, 'qwen3.5-4b');
+  assert.equal(pickModel(MODELS, DEVICES.phone).id, 'qwen3.5-2b');
+  assert.equal(pickModel(MODELS, { gpuBytes: 0.2 * GB, storageFree: 50 * GB }).id, 'qwen3-0.6b');
+  assert.equal(pickModel(MODELS, { storageFree: 50 * GB }).id, 'qwen3.5-4b');
 });
 
 test('removal frees what a download needs, least recently used first, and drops stale models', () => {

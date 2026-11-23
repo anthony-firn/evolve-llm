@@ -1,100 +1,50 @@
-// Models offered in the picker. Files download directly from Hugging Face into this browser.
-// Any other GGUF file on Hugging Face, or one already on the device, can be opened too.
+// The models the app runs, chosen by the app itself (web/model-manager.mjs): only models on the
+// frontier of coding quality against time per answer, so no model here is both slower and worse
+// than another that fits the same device. Files download from Hugging Face (and mirrors, see
+// web/mirrors.mjs) into this browser. Developers can still open other GGUF files.
+//
+// `modes`: Artificial Analysis's Coding Index (Terminal-Bench Hard and SciCode, run by them) and
+// the output tokens the model spent on their Intelligence Index, without and with thinking, from
+// their table of 2026-06-01 (Intelligence Index v4.0, the last with a Coding Index):
+// https://web.archive.org/web/20260601053007/https://artificialanalysis.ai/models
+// `speed`: tokens per second on the reference laptop (RTX 3050 6 GB, evolve-llm bench,
+// 2026-11-22; Qwen3 Coder 30B-A3B estimated from its reads per token, see docs/frontier.json). Time per
+// answer is tokens / speed, so a model that writes three times as much is three times slower.
+// `experts`: a mixture-of-experts model that keeps its attention on the GPU and reads the experts
+// each token picks from browser storage; it needs `minGpu` bytes of GPU memory and room to save it.
 
-const LLAMA = { license: 'Llama 3.2 Community License', licenseUrl: 'https://www.llama.com/llama3_2/license/' };
 const APACHE = { license: 'Apache 2.0', licenseUrl: 'https://www.apache.org/licenses/LICENSE-2.0' };
-const MIT = { license: 'MIT', licenseUrl: 'https://opensource.org/license/mit' };
-const KIMI = { license: 'Modified MIT', licenseUrl: 'https://huggingface.co/moonshotai/Kimi-K2-Instruct-0905/blob/main/LICENSE' };
-const KIMI_K31 = { license: 'Kimi K3.1 Pro License', licenseUrl: 'https://huggingface.co/moonshotai/Kimi-K3.1-Pro/blob/main/LICENSE' };
-
-/** For each kind of request (web/chat-development.mjs kindOf), the catalog models that did that
- *  work best in tests/agent_bench.py, best first. With "Switch models by kind of request" on, the
- *  chat loads the first one saved on this device before answering. Measured on a laptop with an
- *  RTX 3050 and an Intel GPU (2026-11-22); update from new benchmark runs. */
-// From the agent benchmark (tests/agent_bench.py), rounds 7 to 10: Qwen3.5 4B 10/10 in 333 s
-// (round 9) and 10/10 reworded in 391 s (round 10); Qwen3 4B Instruct 2507 10/10 three times (417 s in
-// round 9); Nanbeige4.1 3B 6-7/10; Qwen3 4B 7/10 in round 9 (scored with link addresses).
-export const BEST_FOR = {
-  coding: ['qwen3.5-4b', 'qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
-  research: ['qwen3.5-4b', 'qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
-  law: ['qwen3.5-4b', 'qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
-  browser: ['qwen3.5-4b', 'qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
-  chat: ['qwen3.5-4b', 'qwen3-4b-2507', 'qwen3-4b', 'nanbeige4.1-3b'],
-};
 
 export const MODELS = [
-  { id: 'smollm2-135m', name: 'SmolLM2 135M', maker: 'Hugging Face', repo: 'bartowski/SmolLM2-135M-Instruct-GGUF',
-    file: 'SmolLM2-135M-Instruct-Q8_0.gguf', bytes: 144811360, sha256: '5a1395716f7913741cc51d98581b9b1228d80987a9f7d3664106742eb06bba83', quant: 'Q8_0', note: 'Tiny. A quick first test.', ...APACHE },
-  { id: 'smollm2-360m', name: 'SmolLM2 360M', maker: 'Hugging Face', repo: 'HuggingFaceTB/SmolLM2-360M-Instruct-GGUF',
-    file: 'smollm2-360m-instruct-q8_0.gguf', bytes: 386404992, sha256: '48ab3034d0dd401fbc721eb1df3217902fee7dab9078992d66431f09b7750201', quant: 'Q8_0', note: 'Small English assistant.', ...APACHE },
-  { id: 'qwen2.5-0.5b', name: 'Qwen2.5 0.5B', maker: 'Qwen', repo: 'Qwen/Qwen2.5-0.5B-Instruct-GGUF',
-    file: 'qwen2.5-0.5b-instruct-q4_k_m.gguf', bytes: 491400032, sha256: '74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db', quant: 'Q4_K_M', note: 'Fast and multilingual: the smallest download, for slow connections and phones.', ...APACHE },
   { id: 'qwen3-0.6b', name: 'Qwen3 0.6B', maker: 'Qwen', repo: 'Qwen/Qwen3-0.6B-GGUF',
-    file: 'Qwen3-0.6B-Q8_0.gguf', bytes: 639446688, sha256: '9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031', quant: 'Q8_0', note: 'Can think step by step before answering.', thinking: true, ...APACHE },
-  { id: 'llama3.2-1b', name: 'Llama 3.2 1B', maker: 'Meta', repo: 'bartowski/Llama-3.2-1B-Instruct-GGUF',
-    file: 'Llama-3.2-1B-Instruct-Q4_K_M.gguf', bytes: 807694464, sha256: '6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83', quant: 'Q4_K_M', note: 'General assistant with a long context.', ...LLAMA },
-  { id: 'qwen2.5-coder-1.5b', name: 'Qwen2.5 Coder 1.5B', maker: 'Qwen', repo: 'bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF',
-    file: 'Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf', bytes: 986048800, sha256: 'f530705d447660a4336c329981af164b471b60b974b1d808d57e8ec9fe23b239', quant: 'Q4_K_M', note: 'Writes and explains code.', ...APACHE },
-  { id: 'smollm2-1.7b', name: 'SmolLM2 1.7B', maker: 'Hugging Face', repo: 'HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF',
-    file: 'smollm2-1.7b-instruct-q4_k_m.gguf', bytes: 1055609536, sha256: 'decd2598bc2c8ed08c19adc3c8fdd461ee19ed5708679d1c54ef54a5a30d4f33', quant: 'Q4_K_M', note: 'Stronger English assistant.', ...APACHE },
-  { id: 'qwen2.5-1.5b', name: 'Qwen2.5 1.5B', maker: 'Qwen', repo: 'Qwen/Qwen2.5-1.5B-Instruct-GGUF',
-    file: 'qwen2.5-1.5b-instruct-q4_k_m.gguf', bytes: 1117320736, sha256: '6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e', quant: 'Q4_K_M', note: 'Better answers, still quick on most GPUs.', ...APACHE },
-  { id: 'qwen3-1.7b', name: 'Qwen3 1.7B', maker: 'Qwen', repo: 'Qwen/Qwen3-1.7B-GGUF',
-    file: 'Qwen3-1.7B-Q8_0.gguf', bytes: 1834426016, sha256: '061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a', quant: 'Q8_0', note: 'Thinking mode with more knowledge.', thinking: true, ...APACHE },
-  { id: 'llama3.2-3b', name: 'Llama 3.2 3B', maker: 'Meta', repo: 'bartowski/Llama-3.2-3B-Instruct-GGUF',
-    file: 'Llama-3.2-3B-Instruct-Q4_K_M.gguf', bytes: 2019377696, sha256: '6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff', quant: 'Q4_K_M', note: 'Needs about 3 GB of GPU memory.', ...LLAMA },
-  { id: 'qwen3-4b', name: 'Qwen3 4B', maker: 'Qwen', repo: 'Qwen/Qwen3-4B-GGUF',
-    file: 'Qwen3-4B-Q4_K_M.gguf', bytes: 2497280256, sha256: '7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5', quant: 'Q4_K_M', note: 'Largest here. Needs about 3.5 GB of GPU memory.', thinking: true, ...APACHE },
-  { id: 'qwen3-4b-2507', name: 'Qwen3 4B Instruct 2507', maker: 'Qwen', repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF',
-    file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf', bytes: 2497281120, sha256: '3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597', quant: 'Q4_K_M', note: 'The July 2025 update of Qwen3 4B: better at using tools. A good coding assistant for most computers.', ...APACHE },
-  { id: 'qwen3-4b-thinking-2507', name: 'Qwen3 4B Thinking 2507', maker: 'Qwen', repo: 'unsloth/Qwen3-4B-Thinking-2507-GGUF',
-    file: 'Qwen3-4B-Thinking-2507-Q4_K_M.gguf', bytes: 2497281152, sha256: 'ddd52e18200baab281c5c46f70d544ce4d4fe4846eab1608f2fff48a64554212', quant: 'Q4_K_M', note: 'Thinks before it answers: stronger with tools, slower to reply.', thinking: true, ...APACHE },
-  { id: 'qwen3-vl-2b', name: 'Qwen3-VL 2B', maker: 'Qwen', repo: 'Qwen/Qwen3-VL-2B-Instruct-GGUF',
-    file: 'Qwen3VL-2B-Instruct-Q4_K_M.gguf', bytes: 1107409952, sha256: '089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae', quant: 'Q4_K_M', note: 'Sees images: reads screenshots and pictures you give it. Downloads its image encoder too.',
-    vision: { file: 'mmproj-Qwen3VL-2B-Instruct-F16.gguf', bytes: 819394848 }, ...APACHE },
-  { id: 'gui-owl-1.5-4b', name: 'GUI-Owl 1.5 4B', maker: 'mPLUG (Alibaba)', repo: 'mradermacher/GUI-Owl-1.5-4B-Instruct-GGUF',
-    file: 'GUI-Owl-1.5-4B-Instruct.Q4_K_M.gguf', bytes: 2497282208, sha256: '8e1793b69bb4064671ab6529b43f5b943850f73a9244ad139c16e93a44709232', quant: 'Q4_K_M', note: 'Trained to use computers: reads screenshots and points at what to click. Downloads its image encoder too.',
-    vision: { file: 'GUI-Owl-1.5-4B-Instruct.mmproj-f16.gguf', bytes: 836180288 }, ...MIT },
-  { id: 'qwen3.5-4b', name: 'Qwen3.5 4B', maker: 'Qwen', repo: 'unsloth/Qwen3.5-4B-GGUF',
-    file: 'Qwen3.5-4B-Q4_K_M.gguf', bytes: 2740937888, sha256: '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4', quant: 'Q4_K_M', note: 'The February 2026 generation: a linear-attention hybrid with a far smaller cache for long chats. The best and fastest agent in our tests. Recommended.', thinking: true, recommended: true, ...APACHE },
+    file: 'Qwen3-0.6B-Q8_0.gguf', bytes: 639446688, sha256: '9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031', quant: 'Q8_0',
+    note: 'For phones and small GPUs: quick answers to simple requests.', thinking: true, speed: 96.4,
+    modes: [{ thinking: false, coding: 1.35, tokens: 2.9e6 }, { thinking: true, coding: 0.93, tokens: 19.5e6 }], ...APACHE },
   { id: 'qwen3.5-2b', name: 'Qwen3.5 2B', maker: 'Qwen', repo: 'unsloth/Qwen3.5-2B-GGUF',
-    file: 'Qwen3.5-2B-Q4_K_M.gguf', bytes: 1280835840, sha256: 'aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223', quant: 'Q4_K_M', note: 'Qwen3.5 for smaller GPUs and phones: the same linear-attention design in half the size.', thinking: true, ...APACHE },
-  { id: 'qwen3.5-0.8b', name: 'Qwen3.5 0.8B', maker: 'Qwen', repo: 'unsloth/Qwen3.5-0.8B-GGUF',
-    file: 'Qwen3.5-0.8B-Q4_K_M.gguf', bytes: 532517120, sha256: 'bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517', quant: 'Q4_K_M', note: 'The smallest Qwen3.5: for phones and older computers.', thinking: true, ...APACHE },
-  { id: 'nanbeige4.1-3b', name: 'Nanbeige4.1 3B', maker: 'Nanbeige', repo: 'mradermacher/Nanbeige4.1-3B-GGUF',
-    file: 'Nanbeige4.1-3B.Q4_K_M.gguf', bytes: 2443113024, sha256: '0ba28f064c66071646e7959c752851abf02a096f1d37e7d0e443e3502e12ca02', quant: 'Q4_K_M', note: 'A 3B model that leads small models at calling tools. Thinks before it answers.', thinking: true, ...APACHE },
-];
-
-// Mixture-of-experts models. The ones larger than GPU memory keep their attention weights on the
-// GPU and read the experts each token chooses from browser storage, so they run slowly but run.
-// Models marked `stream` are larger than most devices can store: they are read from Hugging Face
-// while they run, with as much as the storage setting allows kept on the device.
-// `bytes` is the model's size; split models list their parts when they are chosen.
-export const LARGE = [
-  { id: 'olmoe-1b-7b', name: 'OLMoE 1B-7B', maker: 'Ai2', repo: 'allenai/OLMoE-1B-7B-0125-Instruct-GGUF',
-    file: 'OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf', bytes: 4210000000, quant: 'Q4_K_M', params: '7B, 1.3B active',
-    note: '64 experts, 8 per token. Fits on GPUs with about 5 GB.', ...APACHE },
+    file: 'Qwen3.5-2B-Q4_K_M.gguf', bytes: 1280835840, sha256: 'aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223', quant: 'Q4_K_M',
+    note: 'The strongest model for phones and GPUs under 3 GB.', thinking: true, speed: 47.3,
+    modes: [{ thinking: false, coding: 4.92, tokens: 100.2e6 }, { thinking: true, coding: 3.45, tokens: 389.5e6 }], ...APACHE },
+  { id: 'qwen3-4b-2507', name: 'Qwen3 4B Instruct 2507', maker: 'Qwen', repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF',
+    file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf', bytes: 2497281120, sha256: '3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597', quant: 'Q4_K_M',
+    note: 'Fast, short answers: the first choice for everyday requests on most computers.', speed: 22.5,
+    modes: [{ thinking: false, coding: 9.05, tokens: 21.8e6 }], ...APACHE },
+  { id: 'qwen3.5-4b', name: 'Qwen3.5 4B', maker: 'Qwen', repo: 'unsloth/Qwen3.5-4B-GGUF',
+    file: 'Qwen3.5-4B-Q4_K_M.gguf', bytes: 2740937888, sha256: '00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4', quant: 'Q4_K_M',
+    note: 'For coding and research that need more care. A small cache keeps long chats fast.', thinking: true, speed: 20.3,
+    modes: [{ thinking: false, coding: 13.67, tokens: 75.1e6 }, { thinking: true, coding: 17.49, tokens: 236.7e6 }], ...APACHE },
   { id: 'qwen3-coder-30b-a3b', name: 'Qwen3 Coder 30B-A3B', maker: 'Qwen', repo: 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF',
-    file: 'Qwen3-Coder-30B-A3B-Instruct-UD-IQ3_XXS.gguf', bytes: 12848766112, quant: 'UD-IQ3_XXS', params: '30B, 3.3B active',
-    note: 'Trained for coding agents. Runs on the GPU with 14 GB free; streams experts from storage with less.', ...APACHE },
-  { id: 'qwen3-30b-a3b', name: 'Qwen3 30B-A3B', maker: 'Qwen', repo: 'unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF',
-    file: 'Qwen3-30B-A3B-Instruct-2507-UD-Q2_K_XL.gguf', bytes: 11790000000, quant: 'UD-Q2_K_XL', params: '30B, 3.3B active',
-    note: 'Strong general model. Streams experts from storage when GPU memory is short.', ...APACHE },
-  { id: 'qwen3-235b-a22b', name: 'Qwen3 235B-A22B', maker: 'Qwen', repo: 'unsloth/Qwen3-235B-A22B-Instruct-2507-GGUF',
-    file: 'UD-Q2_K_XL/Qwen3-235B-A22B-Instruct-2507-UD-Q2_K_XL-00001-of-00002.gguf', bytes: 88770000000, quant: 'UD-Q2_K_XL', params: '235B, 22B active',
-    note: 'Read from Hugging Face as it runs, nothing to download first. Each token reads gigabytes: expect minutes per token on a home connection, faster as the device cache fills.', stream: true, ...APACHE },
-  { id: 'qwen3-coder-480b', name: 'Qwen3 Coder 480B-A35B', maker: 'Qwen', repo: 'unsloth/Qwen3-Coder-480B-A35B-Instruct-GGUF',
-    file: 'Qwen3-Coder-480B-A35B-Instruct-UD-IQ1_M.gguf', bytes: 149720000000, quant: 'UD-IQ1_M', params: '480B, 35B active',
-    note: 'Read from Hugging Face as it runs, nothing to download first. Very slow: minutes per token on a home connection.', stream: true, ...APACHE },
-  { id: 'deepseek-v3.1', name: 'DeepSeek V3.1', maker: 'DeepSeek', repo: 'unsloth/DeepSeek-V3.1-GGUF',
-    file: 'UD-IQ1_S/DeepSeek-V3.1-UD-IQ1_S-00001-of-00004.gguf', bytes: 192310000000, quant: 'UD-IQ1_S', params: '671B, 37B active',
-    note: 'Read from Hugging Face as it runs, nothing to download first. Latent attention keeps the context small. Very slow.', stream: true, ...MIT },
-  { id: 'kimi-k2', name: 'Kimi K2 Instruct', maker: 'Moonshot AI', repo: 'unsloth/Kimi-K2-Instruct-0905-GGUF',
-    file: 'UD-TQ1_0/Kimi-K2-Instruct-0905-UD-TQ1_0-00001-of-00006.gguf', bytes: 248610000000, quant: 'UD-TQ1_0', params: '1T, 32B active',
-    note: 'One trillion parameters, read from Hugging Face as it runs, nothing to download first. Very slow.', stream: true, ...KIMI },
-  { id: 'kimi-k3.1-pro', name: 'Kimi K3.1 Pro', maker: 'Moonshot AI', repo: 'KarLexAI/Kimi-K3.1-Pro-GGUF',
-    file: 'KLX-IQ1_S/Kimi-K3.1-Pro-KLX-IQ1_S-00001-of-00014.gguf', bytes: 592670000000, quant: 'IQ1_S', params: '2.8T, 106B active',
-    note: 'The strongest open coding model as of November 2026. Read from Hugging Face as it runs: every token reads about 57 GB, so expect a minute or more per token once your device storage holds it, and hours per token over a home connection.', stream: true, ...KIMI_K31 },
+    file: 'Qwen3-Coder-30B-A3B-Instruct-UD-IQ3_XXS.gguf', bytes: 12848766112, sha256: 'd6b85d2b6633c55be3751848acc74fab40d28d93b27dabacd96ceabe10962057', quant: 'UD-IQ3_XXS',
+    params: '30B, 3.3B active', note: 'For hard coding work: trained for coding agents. Reads its experts from storage.', speed: 2.0,
+    experts: { minGpu: 2.5e9 }, modes: [{ thinking: false, coding: 19.36, tokens: 13.2e6 }], ...APACHE },
+  { id: 'qwen3.6-35b-a3b', name: 'Qwen3.6 35B-A3B', maker: 'Qwen', repo: 'unsloth/Qwen3.6-35B-A3B-GGUF',
+    file: 'Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf', bytes: 16845511648, sha256: 'a832b9689925f1bd335bbe985cdfb06c36bf2cf268f4f8f6eceafa3ceb515617', quant: 'UD-Q3_K_XL',
+    params: '35B, 3B active', note: 'For the hardest requests: thinks before it answers, slowly. Reads its experts from storage.', thinking: true, speed: 1.5,
+    experts: { minGpu: 2.5e9 }, modes: [{ thinking: false, coding: 17.6, tokens: 24.3e6 }, { thinking: true, coding: 35.15, tokens: 143.2e6 }], ...APACHE },
+  // Images: the one catalog model that reads them. Used for requests with pictures or screenshots.
+  { id: 'qwen3-vl-2b', name: 'Qwen3-VL 2B', maker: 'Qwen', repo: 'Qwen/Qwen3-VL-2B-Instruct-GGUF',
+    file: 'Qwen3VL-2B-Instruct-Q4_K_M.gguf', bytes: 1107409952, sha256: '089d75c52f4b7ffc56ba998ffc50aae89fcafc755f9e7208aacca281dca6c2ae', quant: 'Q4_K_M',
+    note: 'Sees images: reads screenshots and pictures. Downloads its image encoder too.', speed: 53.1,
+    vision: { file: 'mmproj-Qwen3VL-2B-Instruct-F16.gguf', bytes: 819394848 }, ...APACHE },
 ];
 
 /** For `name-00001-of-00004.gguf`, every part's path; null for a single file. */

@@ -1,8 +1,8 @@
-import { BEST_FOR, LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from './models.js';
-import { GPU_OVERHEAD, LADDER, isMetered, pickModel, shouldFetch, toRemove } from './model-manager.mjs';
+import { MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from './models.js';
+import { GPU_OVERHEAD, LEVELS, frontier, isMetered, pickModel, rungFor, shouldFetch, toRemove } from './model-manager.mjs';
 import { renderMarkdown, splitThinking } from './markdown.js';
 import { stripToolCalls } from './tools.js';
-import { wantsSnakeStarter, wantsBrowser, createWorkView, kindOf } from './chat-development.mjs';
+import { wantsSnakeStarter, wantsBrowser, createWorkView, complaint, levelOf } from './chat-development.mjs';
 import { trace } from './trace.mjs';
 import { newChatId, saveChat, getChat, listChats, deleteChat } from './chats.mjs';
 
@@ -165,10 +165,16 @@ function catalogEntry(m) {
     resolve: split || stream, stream, vision, mirrors: state.settings.mirrors !== false };
 }
 
-const ALL = [...MODELS, ...LARGE];
+const ALL = MODELS;
 
 function renderModels() {
   const busy = state.phase === 'loading' || state.phase === 'generating' || ['agent','preparing'].includes(state.phase) || !state.adapter?.ok;
+  // What each model is used for on this device: its rung of the frontier.
+  const uses = new Map();
+  const names = ['Everyday requests', 'Real work', 'Hard requests', 'The hardest requests'];
+  const l = ladder();
+  for (let level = LEVELS - 1; level >= 0; level--) { const r = rungFor(l, level); if (r) uses.set(r.id, names[level] + (r.thinking ? ', thinking' : '')); }
+  for (const m of MODELS) if (m.vision) uses.set(m.id, 'Pictures and screenshots');
   const item = (m) => {
     const key = cacheKey(m.repo, m.file);
     const cached = cachedEntry(key);
@@ -179,20 +185,16 @@ function renderModels() {
       el('span', { class: 'tag', text: m.quant }),
       running ? el('span', { class: 'tag run', text: 'Running' }) : null,
       saved && !running ? el('span', { class: 'tag ok', text: 'Saved' }) : null,
-      m.stream && !saved ? el('span', { class: 'tag', text: 'Runs from Hugging Face' }) : null,
       partial ? el('span', { class: 'tag', text: `Paused at ${Math.round((cached.stored / cached.bytes) * 100)}%` }) : null,
-      m.recommended && !saved && !running ? el('span', { class: 'tag rec', text: 'Recommended' }) : null,
+      uses.get(m.id) ? el('span', { class: 'tag rec', text: uses.get(m.id) }) : null,
       m.params ? el('span', { class: 'tag', text: m.params }) : null,
       el('span', { class: 'tag', text: `${m.maker} · ${m.license}` }),
     ];
-    const button = el('button', {
-      class: 'model', type: 'button', disabled: busy || running, 'aria-current': running ? 'true' : null,
-      onclick: () => { pin(key); startLoad(catalogEntry(m)); },
-    },
+    const card = el('div', { class: 'model', 'aria-current': running ? 'true' : null },
     el('span', { class: 'row' }, el('span', { class: 'name', text: m.name }), el('span', { class: 'size', text: formatBytes(m.bytes) })),
     el('span', { class: 'note', text: m.note }),
     el('span', { class: 'meta' }, ...tags));
-    const li = el('li', {}, button);
+    const li = el('li', {}, card);
     if (cached && !running) {
       li.append(el('div', { class: 'model-actions' }, el('button', {
         class: 'remove', type: 'button', disabled: busy, text: saved ? 'Remove download' : 'Discard partial download',
@@ -202,8 +204,7 @@ function renderModels() {
     }
     return li;
   };
-  const items = MODELS.map(item);
-  $('large-list').replaceChildren(...LARGE.map(item));
+  const items = MODELS.filter((m) => uses.has(m.id) || cachedEntry(cacheKey(m.repo, m.file))).map(item);
   const list = $('model-list');
   // Downloads that are not in the catalog.
   for (const c of state.cache.models) {
@@ -211,7 +212,7 @@ function renderModels() {
     const running = state.loaded?.key === c.key;
     const entry = { kind: 'hf', id: c.key, key: c.key, repo: c.repo, file: c.file, revision: c.revision || 'main', url: c.url, bytes: c.bytes, name: c.file, parts: c.parts?.length > 1 ? c.parts.map((p) => ({ ...p, url: hfUrl(c.repo, p.file, c.revision || 'main') })) : null };
     items.push(el('li', {},
-      el('button', { class: 'model', type: 'button', disabled: busy || running, 'aria-current': running ? 'true' : null, onclick: () => { pin(c.key); startLoad(entry); } },
+      el('button', { class: 'model', type: 'button', disabled: busy || running, 'aria-current': running ? 'true' : null, onclick: () => startLoad(entry) },
         el('span', { class: 'row' }, el('span', { class: 'name', text: c.file.split('/').pop().replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '') }), el('span', { class: 'size', text: formatBytes(c.bytes) })),
         el('span', { class: 'note', text: c.repo }),
         el('span', { class: 'meta' }, running ? el('span', { class: 'tag run', text: 'Running' }) : el('span', { class: 'tag ok', text: c.complete ? 'Saved' : 'Partial' }))),
@@ -253,12 +254,10 @@ function renderStorage() {
 const managed = () => state.settings.manageModels !== false && !REMOTE_CODE;
 function readJson(key, fallback) { try { return JSON.parse(recall(key)) ?? fallback; } catch { return fallback; } }
 function markUsed(key) { const used = readJson('evolve-llm-used', {}); used[key] = Date.now(); remember('evolve-llm-used', JSON.stringify(used)); }
-function pin(key) { remember('evolve-llm-pinned', JSON.stringify([...new Set([...readJson('evolve-llm-pinned', []), key])])); }
-const pinned = () => new Set(readJson('evolve-llm-pinned', []));
 const keyOf = (m) => cacheKey(m.repo, m.file);
 const savedIds = () => new Set(MODELS.filter((m) => cachedEntry(keyOf(m))?.complete).map((m) => m.id));
-// Whether the person chose the running model themselves (a file, a pasted link, the model list).
-const chosen = () => Boolean(state.loaded && (state.loaded.kind === 'file' || pinned().has(state.loaded.key)));
+// Whether a developer opened the running model themselves (a file or a Hugging Face link).
+const chosen = () => Boolean(state.loaded && (state.loaded.kind === 'file' || !MODELS.some((m) => keyOf(m) === state.loaded.key)));
 
 // GPU memory free for a model, measured once per GPU (and both GPUs when they are pooled).
 let gpuBytes = null;
@@ -267,7 +266,7 @@ async function probeGpu(adapter) {
   const id = `evolve-llm-gpu-${describeGpu(adapter)}`;
   const known = readJson(id, null);
   if (known && Date.now() - known.at < 30 * 864e5) { gpuBytes = known.bytes; updatePick(); return; }
-  const need = Math.max(...LADDER.map((i) => MODELS.find((m) => m.id === i)?.bytes || 0)) * GPU_OVERHEAD;
+  const need = Math.max(...MODELS.filter((m) => !m.experts).map((m) => m.bytes)) * GPU_OVERHEAD;
   // Set before waiting, so loading a saved model waits for the measurement (both use the GPU).
   probing = { id, need, gpus: [], bytes: 0 };
   probing.gpus = (await poolingGpus()) ? ['high-performance', 'low-power'] : [state.settings.gpu];
@@ -285,25 +284,30 @@ function onProbed(msg) {
   onCache();
 }
 
-function updatePick() {
+function device() {
   const { usage, quota } = state.cache;
-  state.pick = pickModel(MODELS, { gpuBytes: gpuBytes ?? undefined, storageFree: quota ? quota - usage : undefined, mobile: IS_MOBILE, saved: savedIds() });
+  return { gpuBytes: gpuBytes ?? undefined, storageFree: quota ? quota - usage : undefined, mobile: IS_MOBILE, saved: savedIds() };
+}
+/** This device's frontier of speed against quality (model-manager.mjs), fastest first. */
+const ladder = () => frontier(MODELS, device());
+
+function updatePick() {
+  state.pick = pickModel(MODELS, device());
   const start = $('start-recommended');
   const m = startingModel();
   if (m) start.textContent = `Start with ${m.name} (${formatBytes(m.bytes)})`;
 }
 
-/** The model "Start" loads: a model the person chose that is saved, else the device's pick. */
+/** The model "Start" loads: the device's pick when saved, else the best saved rung, else the pick. */
 function startingModel() {
   const last = ALL.find((m) => m.id === recall('evolve-llm-last'));
-  if (!managed()) return last || MODELS.find((m) => m.recommended);
-  const lastSaved = last && cachedEntry(keyOf(last))?.complete;
-  if (lastSaved && pinned().has(keyOf(last))) return last;
+  if (!managed()) return last || state.pick;
   if (state.pick && cachedEntry(keyOf(state.pick))?.complete) return state.pick;
-  if (lastSaved) return last;
-  // Something saved starts now (the pick downloads in the background): the best saved one.
-  const anySaved = [...LADDER.map((id) => MODELS.find((m) => m.id === id)), ...MODELS].find((m) => m && cachedEntry(keyOf(m))?.complete);
-  return anySaved || state.pick || MODELS.find((m) => m.recommended);
+  // Something saved starts now (the pick downloads in the background): the best saved rung, else
+  // the model used last, else any saved model (it streams what does not fit).
+  const isSaved = (m) => m && cachedEntry(keyOf(m))?.complete;
+  const rung = ladder().filter((r) => !r.model.experts && isSaved(r.model)).at(-1)?.model;
+  return rung || (isSaved(last) ? last : null) || MODELS.find((m) => !m.vision && !m.experts && isSaved(m)) || state.pick;
 }
 
 /** The device's pick, once saved, when the running model was not the person's own choice. */
@@ -320,7 +324,7 @@ function onFetched() {
     const better = pickToSwitchTo();
     if (better) { state.afterLoad = { note: `Switched to ${better.name}, the best model for this device.` }; startLoad(catalogEntry(better), { keepChat: true }); return; }
   }
-  $('status-line').textContent = `${name} is saved on this device. It takes over at your next new conversation.`;
+  $('status-line').textContent = `${name} is saved on this device. It answers the requests it suits from now on.`;
 }
 
 // On a later visit, the saved model loads by itself.
@@ -336,9 +340,9 @@ function onCache() {
 
 // After half a minute idle: remove what is not used, and fetch the device's pick.
 let upkeepTimer = 0;
-function scheduleUpkeep() {
+function scheduleUpkeep(ms = 30000) {
   clearTimeout(upkeepTimer);
-  if (managed()) upkeepTimer = setTimeout(upkeep, 30000);
+  if (managed()) upkeepTimer = setTimeout(upkeep, ms);
 }
 function upkeep() {
   if (!managed() || !state.cache.supported || !['ready', 'idle'].includes(state.phase)) return;
@@ -346,10 +350,11 @@ function upkeep() {
   // Models saved before this existed count as used today.
   for (const c of state.cache.models) used[c.key] ??= Date.now();
   remember('evolve-llm-used', JSON.stringify(used));
-  const p = state.pick;
+  const pickSaved = state.pick && cachedEntry(keyOf(state.pick))?.complete;
+  const p = pickSaved && state.wanted && !cachedEntry(keyOf(state.wanted))?.complete ? state.wanted : state.pick;
   const pickKey = p ? keyOf(p) : null;
   const fetchNow = !state.fetching && !chosen() && shouldFetch({ pick: p, saved: savedIds(), running: state.loaded?.id, metered: isMetered(navigator.connection), idle: true });
-  const keep = new Set([state.loaded?.key, pickKey, ...pinned()].filter(Boolean));
+  const keep = new Set([state.loaded?.key, pickKey, ...ladder().map((r) => keyOf(r.model))].filter(Boolean));
   const { usage = 0, quota = 0 } = state.cache;
   const need = fetchNow ? p.bytes - (cachedEntry(pickKey)?.stored || 0) + (p.vision?.bytes || 0) : 0;
   const gone = toRemove(state.cache.models, { need, free: quota ? quota - usage : Infinity, keep, lastUsed: used });
@@ -962,30 +967,65 @@ function send(text) {
   text = text.trim();
   if (!text || state.phase !== 'ready') return;
   state.messages.push({ role: 'user', content: text });
-  const better = betterModelFor(text);
-  if (better) {
-    trace({ type: 'switch', chat: state.chatId, kind: better.kind, from: state.loaded.label, to: better.name });
-    state.afterLoad = { run: runResponse, note: `Switched to ${better.name}, which does ${better.kind} best on this device.` };
-    startLoad(better.entry, { keepChat: true });
+  state.retried = false;
+  // "That didn't work" moves the conversation up a level, as a failed turn does.
+  if (complaint(text)) climb();
+  const route = routeFor(text);
+  if (route) {
+    trace({ type: 'switch', chat: state.chatId, level: route.level, from: state.loaded.label, to: route.model.name, thinking: route.rung.thinking });
+    state.afterLoad = { run: runResponse, note: route.note };
+    startLoad(catalogEntry(route.model), { keepChat: true });
     return;
   }
   runResponse();
 }
 
-/** The saved model that does this kind of request best (BEST_FOR in models.js), when it is not the
- *  one loaded and switching is on. Only models already saved on this device: no downloads. */
-function betterModelFor(question) {
-  if (state.settings.autoSwitch === false || !state.loaded?.tools || localComputer.connected) return null;
-  const kind = kindOf(question);
-  for (const id of BEST_FOR[kind] || []) {
-    const m = ALL.find((x) => x.id === id);
-    if (!m) continue;
-    const key = cacheKey(m.repo, m.file);
-    if (state.loaded.key === key) return null;
-    if (cachedEntry(key)?.complete) return { kind, name: m.name, entry: catalogEntry(m) };
-  }
-  return null;
+// ---- Scaling along the frontier (model-manager.mjs) ----
+// Each request runs on the rung of this device's frontier that its difficulty calls for: everyday
+// requests on the fastest model, harder ones higher up. A turn that fails, or a person saying it
+// did not work, moves the conversation up a rung (a failed turn is tried again there once). A new
+// conversation starts again from each request's own level. Rungs not yet saved download in the
+// background; until then the best saved rung below does the work.
+
+// state.level: the level the conversation's last request ran at; state.floor: the lowest level its
+// next request may run at, raised by failures and complaints, back to 0 in a new conversation.
+const climb = () => { state.floor = Math.min(LEVELS - 1, Math.max(state.floor || 0, (state.level ?? 0) + 1)); };
+
+/** Sets state.rung for this request; returns the switch to make, or null to answer as is. */
+function routeFor(question) {
+  if (!managed() || !state.loaded?.tools || localComputer.connected || chosen()) { state.rung = null; return null; }
+  const level = Math.max(levelOf(question), state.floor || 0);
+  state.level = level;
+  const l = ladder();
+  const want = rungFor(l, level);
+  if (!want) { state.rung = null; return null; }
+  const saved = (r) => cachedEntry(keyOf(r.model))?.complete;
+  if (!saved(want)) { state.wanted = want.model; scheduleUpkeep(5000); }
+  let use = saved(want) ? want : l.filter((r) => r.time <= want.time && saved(r)).at(-1);
+  // Mid-conversation, a lighter rung waits for the next conversation: no switching back and forth.
+  const current = l.filter((r) => r.id === state.loaded.id);
+  if (current.length && state.messages.length > 1 && (!use || use.time < current[0].time)) use = current.find((r) => r.thinking === want.thinking) || current[0];
+  if (!use) { state.rung = null; return null; }
+  state.rung = use;
+  if (use.id === state.loaded.id) return null;
+  const why = ['an everyday request', 'real work', 'a hard request', 'the hardest kind of request'][level];
+  return { model: use.model, rung: use, level, note: `Switched to ${use.model.name}${use.thinking ? ', thinking first,' : ''} for ${why}.` };
 }
+
+/** After a turn that failed: climb a level and, once per request, try it again there. */
+function onFailedTurn(question) {
+  climb();
+  if (state.retried || !managed()) return;
+  const route = routeFor(question);
+  if (!route) return;
+  state.retried = true;
+  trace({ type: 'switch', chat: state.chatId, level: route.level, from: state.loaded.label, to: route.model.name, thinking: route.rung.thinking, retry: true });
+  state.afterLoad = { run: regenerate, note: `That did not work, so ${route.model.name} is trying again.` };
+  startLoad(catalogEntry(route.model), { keepChat: true });
+}
+
+/** Thinking follows the rung when the app chooses models; the setting decides otherwise. */
+const thinkingNow = () => (state.rung ? Boolean(state.rung.thinking) : Boolean(state.settings.thinking));
 
 function regenerate() {
   if (state.phase !== 'ready') return;
@@ -1039,7 +1079,7 @@ async function getAssistant(){
       turn:async(messages,tools,opts)=>{
         const t0=performance.now();
         try{
-          const r=await agentTurn(messages,tools,{...opts,options:{enable_thinking:Boolean(state.settings.thinking)}});
+          const r=await agentTurn(messages,tools,{...opts,options:{enable_thinking:thinkingNow()}});
           trace({type:'turn',chat:state.chatId,ms:Math.round(performance.now()-t0),messages:messages.length,promptTokens:r.promptTokens,computed:r.computed,prefillMs:Math.round(r.prefillMs||0),decodeMs:Math.round(r.ms||0),tokens:r.n,reason:r.reason,text:r.text});
           return r;
         }catch(error){trace({type:'turn-error',chat:state.chatId,ms:Math.round(performance.now()-t0),error:String(error.message||error)});throw error;}
@@ -1063,7 +1103,7 @@ async function runAssistant(question){
   // A short follow-up to a website task ("I logged in") keeps the browser.
   const browsing=wantsBrowser(question)||(state.lastTaskBrowsing&&question.length<240&&!/\b(make|build|create|write|code|game|app)\b/i.test(question));state.lastTaskBrowsing=browsing;
   const s=state.settings,t0=performance.now();
-  trace({type:'run',chat:state.chatId,question,model:state.loaded?.label,ctx:Number(s.ctx),thinking:Boolean(s.thinking),web:Boolean(s.internet),autonomy:Number(s.autonomy??1),history:history.length,browser:Boolean(browsing)});
+  trace({type:'run',chat:state.chatId,question,model:state.loaded?.label,ctx:Number(s.ctx),thinking:thinkingNow(),web:Boolean(s.internet),autonomy:Number(s.autonomy??1),history:history.length,browser:Boolean(browsing)});
   let calls=0,error=null;
   try{
     const a=await getAssistant();
@@ -1089,6 +1129,7 @@ async function runAssistant(question){
     m.workView.finish();state.live=null;setPhase(state.loaded?'ready':'idle');renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;
     trace({type:'done',chat:state.chatId,ms:Math.round(performance.now()-t0),calls,error,stopped:Boolean(m.cancelRequested),answer:m.content});
     saveCurrentChat();
+    if(error&&!m.cancelRequested)onFailedTurn(question);
   }
 }
 
@@ -1106,7 +1147,7 @@ async function openChat(id){
   for(const m of state.messages)m.workView?.dispose();
   const openFile=async path=>(await getAssistant()).read(path);
   state.messages=chat.messages.map(m=>({...m,steps:undefined,preview:undefined,...(m.role==='assistant'&&(m.steps?.length||m.preview)&&{workView:createWorkView({restore:{steps:m.steps,preview:m.preview},openFile})})}));
-  state.chatId=chat.id;assistant?.reset();
+  state.chatId=chat.id;assistant?.reset();state.floor=0;state.level=null;state.rung=null;
   setPhase(state.phase);renderMessages();$('scroll').scrollTop=$('scroll').scrollHeight;
 }
 async function showChats(){
@@ -1135,7 +1176,7 @@ function runGeneration() {
     type: 'generate',
     messages: history,
     // A model read from Hugging Face takes minutes per token: keep its thinking short.
-    options: { date: [now.getFullYear(), now.getMonth() + 1, now.getDate()], enable_thinking: Boolean(s.thinking), ...(state.loaded?.stream && { thinking_effort: 'low' }) },
+    options: { date: [now.getFullYear(), now.getMonth() + 1, now.getDate()], enable_thinking: thinkingNow(), ...(state.loaded?.stream && { thinking_effort: 'low' }) },
     sampler: { temperature: Number(s.temperature), top_p: Number(s.top_p), top_k: Number(s.top_k), min_p: Number(s.min_p), repeat_penalty: Number(s.repeat_penalty), repeat_last_n: 64, seed: (Math.random() * 2 ** 32) >>> 0 },
     maxTokens: Number(s.maxTokens),
     internet: { enabled: Boolean(s.internet), jinaKey: s.jinaKey || '' },
@@ -1317,8 +1358,8 @@ $('new-chat').addEventListener('click', () => {
   setPhase('ready');
   $('status-line').textContent = 'Started a new conversation.';
   prompt.focus();
-  const better = pickToSwitchTo();
-  if (better) { state.afterLoad = { note: `Started a new conversation with ${better.name}, the best model for this device.` }; startLoad(catalogEntry(better)); }
+  // The first request picks its own rung, lighter or heavier than the last conversation's.
+  state.floor = 0; state.level = null; state.rung = null;
 });
 $('start-recommended').addEventListener('click', () => {
   const m = startingModel();
@@ -1344,7 +1385,6 @@ $('hf-form').addEventListener('submit', async (e) => {
     help.textContent = HF_HELP;
     if (ref.file) {
       const source = hfSource(ref, ref.file);
-      pin(source.key);
       startLoad(source);
       return;
     }
@@ -1352,7 +1392,7 @@ $('hf-form').addEventListener('submit', async (e) => {
     const groups = await listRepo(ref.repo, ref.revision);
     if (!groups.length) throw new Error('That repository has no GGUF files.');
     help.textContent = `${groups.length} GGUF ${groups.length === 1 ? 'model' : 'models'} in ${ref.repo}. Choose one:`;
-    results.replaceChildren(...groups.map((g) => el('li', {}, el('button', { type: 'button', onclick: () => { const source = hfSource(ref, g.file); pin(source.key); startLoad(source); } },
+    results.replaceChildren(...groups.map((g) => el('li', {}, el('button', { type: 'button', onclick: () => { startLoad(hfSource(ref, g.file)); } },
       el('span', { class: 'name', text: g.file.split('/').pop().replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '') }),
       el('span', { class: 'size', text: `${formatBytes(g.bytes)}${g.parts.length > 1 ? ` · ${g.parts.length} files` : ''}` })))));
     results.hidden = false;
@@ -1398,7 +1438,6 @@ function fillSettings() {
   form.elements.shareUpload.value = String(s.shareUpload ?? 2);
   form.elements.thinking.checked = Boolean(s.thinking);
   form.elements.poolGpus.checked = s.poolGpus !== false;
-  form.elements.autoSwitch.checked = s.autoSwitch !== false;
   form.elements.manageModels.checked = s.manageModels !== false;
   form.elements.mirrors.checked = s.mirrors !== false;
   form.elements.internet.checked = Boolean(s.internet);

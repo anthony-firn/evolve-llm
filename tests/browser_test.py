@@ -220,19 +220,28 @@ def main():
                     host = r.url.split("/")[2]
                     pieces[host] = pieces.get(host, 0) + 1
             page.on("response", piece)
-            page.locator(".model", has_text="SmolLM2 135M").click()
-            # Which sources the pieces come from (Hugging Face, and ModelScope when hashes check them).
+            # The catalog holds only frontier models, which the app picks itself; SmolLM2 135M (145 MB)
+            # comes through the developers' Hugging Face link instead, the same download path.
+            if page.locator("#open-models").is_visible():
+                page.click("#open-models")
+            page.locator("#other-sources summary").click()
+            page.fill("#hf-input", "bartowski/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct-Q8_0.gguf")
+            page.locator("#hf-form button[type=submit]").click()
             page.wait_for_selector("#ready:not([hidden])", timeout=600000)
             print("pieces by host:", dict(pieces))
-            saved = page.locator(".model", has_text="SmolLM2 135M").inner_text()
+            if page.locator("#open-models").is_visible():
+                page.click("#open-models")
+            saved = page.locator(".model", has_text="SmolLM2-135M").inner_text()
             print("downloaded and loaded:", page.inner_text("#ready-meta"))
             assert "Running" in saved
             page.reload()
             page.wait_for_selector("#gpu-chip[data-state=ok]", timeout=30000)
-            page.wait_for_selector(".model:has-text('SmolLM2 135M') .tag.ok", timeout=30000)
+            if page.locator("#open-models").is_visible():
+                page.click("#open-models")
+            page.wait_for_selector(".model:has-text('SmolLM2-135M') .tag.ok", timeout=30000)
             t0 = time.time()
             # With models managed for you, the app loads the model it last ran on its own.
-            button = page.locator(".model", has_text="SmolLM2 135M")
+            button = page.locator(".model", has_text="SmolLM2-135M")
             if button.is_enabled():
                 button.click()
             page.wait_for_selector("#ready:not([hidden])", timeout=120000)

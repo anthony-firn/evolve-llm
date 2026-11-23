@@ -7,10 +7,13 @@ steps left. Checks:
 1. First visit, a 6 GB GPU: "Start" names Qwen3.5 4B and loads it.
 2. Next visit: the saved model loads by itself.
 3. A 2 GB GPU: the 4B (saved, last used) loads; when idle, Qwen3.5 2B downloads in the
-   background, and a new conversation switches to it.
+   background, and the next request runs on it (the 4B does not fit this GPU's frontier).
 4. A model unused for 100 days is removed when idle; the running one and the pick are kept.
-5. A model chosen from the list is not replaced by the pick.
-6. With "Manage models for me" off, nothing loads by itself.
+5. Each request runs on the rung of the frontier its difficulty needs: an everyday request on
+   Qwen3 4B Instruct 2507, a coding request on Qwen3.5 4B; "that did not work" climbs a level,
+   whose model (Qwen3 Coder 30B-A3B) downloads in the background and then answers; a new
+   conversation starts again from the request's own level. The model list is not a picker.
+6. With "Choose models for me" off, nothing loads by itself.
 
     python3 tests/self_managed_models_browser_test.py [--runtime web]
 """
@@ -29,6 +32,8 @@ GB = 10**9
 KEY = {
     "qwen3.5-4b": ("unsloth__Qwen3.5-4B-GGUF__main__Qwen3.5-4B-Q4_K_M.gguf", "unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-Q4_K_M.gguf", 2740937888, "Qwen3.5 4B"),
     "qwen3.5-2b": ("unsloth__Qwen3.5-2B-GGUF__main__Qwen3.5-2B-Q4_K_M.gguf", "unsloth/Qwen3.5-2B-GGUF", "Qwen3.5-2B-Q4_K_M.gguf", 1280835840, "Qwen3.5 2B"),
+    "qwen3-4b-2507": ("unsloth__Qwen3-4B-Instruct-2507-GGUF__main__Qwen3-4B-Instruct-2507-Q4_K_M.gguf", "unsloth/Qwen3-4B-Instruct-2507-GGUF",
+                      "Qwen3-4B-Instruct-2507-Q4_K_M.gguf", 2497281120, "Qwen3 4B Instruct 2507"),
 }
 
 WORKER = """
@@ -101,6 +106,11 @@ def main():
             def log(kind):
                 return [e for e in page.evaluate("window.__log") if e["type"] == kind]
 
+            def ask(text, replies):
+                page.locator("#prompt").fill(text)
+                page.locator("#send").click()
+                page.wait_for_function(f"() => document.querySelector('#app').dataset.phase === 'ready' && document.querySelectorAll('.msg.assistant').length === {replies}", timeout=20000)
+
             def wait_log(kind, seconds):
                 end = time.time() + seconds
                 while time.time() < end and not log(kind):
@@ -137,12 +147,10 @@ def main():
             page.wait_for_function("() => document.querySelector('#app').dataset.phase === 'ready' && document.querySelectorAll('.msg.assistant').length === 1", timeout=15000)
             fetched = wait_log("fetch", 45)
             check([e["id"] for e in fetched] == ["qwen3.5-2b"], f"when idle, the device's pick downloads in the background ({fetched})")
-            page.wait_for_function("() => /takes over at your next new conversation/.test(document.querySelector('#status-line').textContent)", timeout=5000)
-            page.locator("#new-chat").click()
-            page.wait_for_function("() => document.querySelector('#app').dataset.phase === 'ready'", timeout=10000)
-            check([e["id"] for e in log("load")] == ["qwen3.5-4b", "qwen3.5-2b"], f"a new conversation switches to it ({log('load')})")
-            page.wait_for_function("() => /with Qwen3\\.5 2B/.test(document.querySelector('#status-line').textContent)", timeout=5000)
-            check(True, f"the status line says so ({page.locator('#status-line').inner_text()!r})")
+            page.wait_for_function("() => /answers the requests it suits/.test(document.querySelector('#status-line').textContent)", timeout=5000)
+            ask("Hello again", 2)
+            check([e["id"] for e in log("load")] == ["qwen3.5-4b", "qwen3.5-2b"], f"the next request runs on it ({log('load')})")
+            check("Switched to Qwen3.5 2B" in page.locator("#status-line").inner_text(), f"the status line says so ({page.locator('#status-line').inner_text()!r})")
 
             # 3b. The last model is gone, another is saved: that one starts, the pick downloads,
             # and with no conversation under way it takes over at once.
@@ -163,20 +171,35 @@ def main():
             check([e["key"] for e in removed] == [KEY["qwen3.5-4b"][0]], f"the model unused for 100 days is removed ({removed})")
             check("Removed Qwen3.5 4B" in page.locator("#status-line").inner_text(), f"the status line says what was removed ({page.locator('#status-line').inner_text()!r})")
 
-            # 5. A model chosen from the list stays: no switch at a new conversation.
-            state["saved"] = saved("qwen3.5-4b", "qwen3.5-2b")
+            # 5. Each request on its rung, a 6 GB GPU with both 4B models saved.
+            page.evaluate("() => { for (const k of Object.keys(localStorage)) if (k.startsWith('evolve-llm-gpu-')) localStorage.removeItem(k); }")
+            state["gpuBytes"] = 6 * GB
+            state["saved"] = saved("qwen3-4b-2507", "qwen3.5-4b")
             visit()
             page.wait_for_selector("#ready:not([hidden])", timeout=15000)
+            check([e["id"] for e in log("load")] == ["qwen3.5-4b"], f"the model kept ready for real work loads first ({log('load')})")
             if page.locator("#open-models").is_visible():
                 page.locator("#open-models").click()
-            page.locator("#model-list button.model", has_text="Qwen3.5 4B").first.click()
-            page.wait_for_function("() => document.querySelector('#app').dataset.phase === 'ready'", timeout=10000)
-            page.locator("#prompt").fill("Hello")
-            page.locator("#send").click()
-            page.wait_for_function("() => document.querySelector('#app').dataset.phase === 'ready' && document.querySelectorAll('.msg.assistant').length === 1", timeout=15000)
+            check(page.locator("#model-list button.model").count() == 0, "the model list is not a picker")
+            uses = page.locator("#model-list .model .tag.rec").all_inner_texts()
+            check(uses == ["Everyday requests", "Real work", "Hard requests", "The hardest requests, thinking", "Pictures and screenshots"], f"it says what each model is for ({uses})")
+            if page.locator("#scrim").is_visible():
+                page.locator("#scrim").click()
+            ask("Hello there", 1)
+            check([e["id"] for e in log("load")][-1] == "qwen3-4b-2507", f"an everyday request runs on the fastest rung ({log('load')})")
+            check("for an everyday request" in page.locator("#status-line").inner_text(), f"and says why ({page.locator('#status-line').inner_text()!r})")
+            ask("Fix the bug in calc.py so the test passes", 2)
+            check([e["id"] for e in log("load")][-1] == "qwen3.5-4b", f"a coding request climbs to Qwen3.5 4B ({log('load')})")
+            ask("That did not work", 3)
+            fetched = wait_log("fetch", 45)
+            check([e["id"] for e in fetched] == ["qwen3-coder-30b-a3b"], f"a complaint asks for the next rung, which downloads in the background ({fetched})")
+            check([e["id"] for e in log("load")][-1] == "qwen3.5-4b", "until it is saved, the best saved rung below it answers")
+            ask("Look at calc.py again", 4)
+            check([e["id"] for e in log("load")][-1] == "qwen3-coder-30b-a3b", f"once saved, it answers the conversation's next request ({log('load')})")
             page.locator("#new-chat").click()
-            time.sleep(1)
-            check([e["id"] for e in log("load")] == ["qwen3.5-2b", "qwen3.5-4b"], f"a model chosen from the list is not replaced ({log('load')})")
+            page.wait_for_function("() => document.querySelector('#app').dataset.phase === 'ready'", timeout=10000)
+            ask("Hello", 1)
+            check([e["id"] for e in log("load")][-1] == "qwen3-4b-2507", f"a new conversation starts again from the request's own level ({log('load')})")
 
             # 6. Off: nothing loads by itself.
             page.evaluate("() => { const s = JSON.parse(localStorage.getItem('evolve-llm-settings') || '{}'); s.manageModels = false; localStorage.setItem('evolve-llm-settings', JSON.stringify(s)); }")
