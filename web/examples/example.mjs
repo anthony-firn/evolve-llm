@@ -10,7 +10,8 @@ async function run(fixture) {
   try {
     $('status').textContent = fixture ? 'Protocol fixture running; no inference or download.' : 'Checking WebGPU…';
     await engine.initialize({ signal: controller.signal });
-    const model = MODELS.find(m => m.id.includes('smollm2'));
+    // The smallest catalog model that chats (the catalog holds only frontier models).
+    const model = MODELS.filter(m => !m.vision).sort((a, b) => a.bytes - b.bytes)[0];
     await engine.load(model.id, { contextSize: 512, signal: controller.signal,
       onProgress: event => { $('status').textContent = `Real model: ${event.phase || event.type}`; } });
     $('status').textContent = fixture ? 'Scripted fixture output' : 'Real GPU inference';
