@@ -59,7 +59,7 @@ test('edits require a prior read and an exact nonempty string; a failed edit sho
  n++;const call=n===1?{name:'edit',arguments:{path:'/workspace/game.html',oldText:'',newText:'blue'}}:n===2?{name:'read',arguments:{path:'/workspace/game.html'}}:n===3?{name:'edit',arguments:{path:'/workspace/game.html',oldText:'background:red;',newText:'background:blue;'}}:null;
  if(n===2)assert(messages.some(m=>m.role==='tool'&&m.content.includes('oldText is empty')&&m.content.includes('background:red;')));
  return {text:call?'<tool_call>'+JSON.stringify(call)+'</tool_call>':'Changed.',reason:'end'};
- }});const result=await task.run('Make the file blue');assert.deepEqual(operations,['read','read','edit']);assert.equal(result.changes,1);assert.equal(result.errors,1);assert.equal(result.lastToolFailed,false);
+ }});const result=await task.run('Make the file blue');assert.deepEqual(operations,['read','read','edit','read']); // the last read: the edit-time checkassert.equal(result.changes,1);assert.equal(result.errors,1);assert.equal(result.lastToolFailed,false);
 });
 
 test('a failed tool followed by a confident answer still reports zero changes and a tool error',async()=>{
@@ -92,7 +92,7 @@ test('a JSON-only batch reads, edits, and checks the actual file sequentially',a
   {name:'browser_test',arguments:{path:'/workspace/game.html'}},
  ].map(call=>'```json\n'+JSON.stringify(call)+'\n```').join('\n'):'Checked.',reason:'end'})});
  const result=await task.run('Make the background blue');
- assert.deepEqual(operations,['read','edit','browser_test']);assert.equal(result.changes,1);assert.equal(result.errors,0);
+ assert.deepEqual(operations,['read','edit','read','browser_test']); // the second read: the edit-time checkassert.equal(result.changes,1);assert.equal(result.errors,0);
 });
 
 test('a successful final preview stops inference and calls after preview are not executed',async()=>{
@@ -622,4 +622,64 @@ test('a line left under a return at the same indent is named as unreachable', ()
   assert.equal(unreachable('1: def add(a, b):\n2:     return a + b\n3: \n4: def sub(a, b):'), null);
   assert.equal(unreachable('1:   if (x) {\n2:     return 1;\n3:   }\n4:   return 2;'), null);
   assert.equal(unreachable('1:     if x:\n2:         return 1\n3:     else:'), null);
+});
+
+test('the first commit of a task waits for a look at its diff; the same commit sent again runs', async () => {
+  const commands = []; const results = []; let n = 0;
+  const diff = 'diff --git a/calc.py b/calc.py\n@@ -1,2 +1,3 @@\n def add(a, b):\n+    return a + b\n     return a - b';
+  const workspace = { cwd: '/home/user/app', vm: { read: async () => ({ ok: false }) }, path: (p) => p, request: async (name, args) => {
+    if (name !== 'exec') return {};
+    commands.push(args.command);
+    if (/git diff$/.test(args.command)) return { code: 0, stdout: diff, stderr: '', cwd: '/home/user/app' };
+    return { code: 0, stdout: '[fix-add 1a2b3c] Fix add', stderr: '', cwd: '/home/user/app' };
+  } };
+  const commit = "cd app && git add calc.py && git commit -m 'Fix add'";
+  const task = createPiTask({ linux: { cwd: '/home/user/app' }, workspace, network: { options: () => ({ enabled: false }) }, onEvent: (e) => { if (e.type === 'tool-result') results.push(e.result.content[0].text); }, turn: async () => {
+    n++;
+    if (n <= 2) return { text: '<tool_call>' + JSON.stringify({ name: 'bash', arguments: { command: commit } }) + '</tool_call>', reason: 'end' };
+    if (n === 3) return { text: '<tool_call>' + JSON.stringify({ name: 'bash', arguments: { command: "git commit -m 'Second'" } }) + '</tool_call>', reason: 'end' };
+    return { text: 'Done.', reason: 'end' };
+  } });
+  await task.run('Fix add in calc.py and commit it');
+  assert.match(results[0], /^Not committed yet\. Before the first commit, check that this diff is exactly what the request asks for/);
+  assert.match(results[0], /\+    return a \+ b\n     return a - b/);
+  assert.deepEqual(commands.filter((c) => /git commit/.test(c)).length, 2);
+  assert.ok(commands.some((c) => /^cd app && +git diff$/.test(c)), commands.join(' | '));
+});
+
+test('a commit chained after an edit is not held (the edit would run twice when sent again)', async () => {
+  const commands = []; let n = 0;
+  const workspace = { cwd: '/home/user/app', vm: { read: async () => ({ ok: false }) }, path: (p) => p, request: async (name, args) => {
+    if (name === 'exec') { commands.push(args.command); return { code: 0, stdout: /git diff$/.test(args.command) ? 'diff' : '', stderr: '', cwd: '/home/user/app' }; }
+    return {};
+  } };
+  const task = createPiTask({ linux: { cwd: '/home/user/app' }, workspace, network: { options: () => ({ enabled: false }) }, turn: async () => {
+    n++;
+    return n === 1 ? { text: '<tool_call>' + JSON.stringify({ name: 'bash', arguments: { command: "echo x >> notes.txt && git commit -m 'Notes'" } }) + '</tool_call>', reason: 'end' } : { text: 'Done.', reason: 'end' };
+  } });
+  await task.run('Add a note and commit it');
+  assert.deepEqual(commands.filter((c) => /git (diff|commit)/.test(c)).map((c) => c.replace(/^export GH_REPO=\S+; /, '')), ["echo x >> notes.txt && git commit -m 'Notes'"]);
+});
+
+test('a written or edited file is checked at once: JSON in the harness, Python through the VM', async () => {
+  const results = []; let n = 0; const commands = [];
+  let py = 'def add(a, b):\n    return a - b\n';
+  const workspace = { cwd: '/home/user/app', vm: { read: async () => ({ ok: false }) }, path: (p) => `/home/user/app/${p}`, request: async (name, args) => {
+    if (name === 'read') return args.path.endsWith('.py') ? { text: py } : { ok: false };
+    if (name === 'edit') { py = py.replace(args.oldText, args.newText); return { path: args.path, replaced: 1 }; }
+    if (name === 'write') return { path: args.path, bytes: args.text.length };
+    if (name === 'exec') { commands.push(args.command); return /compile/.test(args.command) && /def add\(a, b\)\n/.test(py) ? { code: 1, stdout: '', stderr: 'File "calc.py", line 1\nSyntaxError: expected \':\'' } : { code: 0, stdout: '', stderr: '' }; }
+    return {};
+  } };
+  const task = createPiTask({ linux: { cwd: '/home/user/app' }, workspace, network: { options: () => ({ enabled: false }) }, onEvent: (e) => { if (e.type === 'tool-result') results.push(e.result.content[0].text); }, turn: async () => {
+    n++;
+    if (n === 1) return { text: '<tool_call>' + JSON.stringify({ name: 'write', arguments: { path: 'config.json', text: '{"a": 1,}' } }) + '</tool_call>', reason: 'end' };
+    if (n === 2) return { text: '<tool_call>' + JSON.stringify({ name: 'read', arguments: { path: 'calc.py' } }) + '</tool_call>', reason: 'end' };
+    if (n === 3) return { text: '<tool_call>' + JSON.stringify({ name: 'edit', arguments: { path: 'calc.py', oldText: 'def add(a, b):', newText: 'def add(a, b)' } }) + '</tool_call>', reason: 'end' };
+    return { text: 'Done.', reason: 'end' };
+  } });
+  await task.run('Make the config and fix calc.py');
+  assert.match(results[0], /Check: config\.json is not valid JSON/);
+  assert.match(results[2], /Check: calc\.py has a syntax error at line 1: SyntaxError: expected ':'\. Fix it before going on\./);
+  assert.ok(commands.some((c) => /^python3 -c ".*compile.*" 'calc\.py'$/.test(c)), commands.join(' | '));
 });
