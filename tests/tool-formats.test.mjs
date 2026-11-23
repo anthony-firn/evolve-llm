@@ -90,3 +90,17 @@ test('a shell command written as the tool name, with unescaped quotes, becomes a
   assert.deepEqual(parseToolCalls('<tool_call>\n{"name": "make "it" so"}\n</tool_call>', names), []);
   assert.deepEqual(parseToolCalls(text, new Set(['read', 'write'])), []);
 });
+
+test('GUI models\' actions become browser tools', async () => {
+  const { parseToolCalls } = await import('../web/tools.js');
+  const names = new Set(['browser_open', 'browser_click_at', 'browser_type', 'browser_key', 'browser_scroll']);
+  const one = (j) => parseToolCalls('<tool_call>\n' + JSON.stringify(j) + '\n</tool_call>', names);
+  assert.deepEqual(one({ name: 'web', arguments: { url: 'http://x/look', browser_open: true } }), [{ name: 'browser_open', args: { url: 'http://x/look' } }]);
+  assert.deepEqual(one({ name: 'computer_use', arguments: { action: 'left_click', coordinate: [512.4, 300] } }), [{ name: 'browser_click_at', args: { x: 512, y: 300 } }]);
+  assert.deepEqual(one({ name: 'computer_use', arguments: { action: 'type', text: 'kettle' } }), [{ name: 'browser_type', args: { text: 'kettle', submit: false } }]);
+  assert.deepEqual(one({ name: 'computer_use', arguments: { action: 'key', keys: ['enter'] } }), [{ name: 'browser_key', args: { key: 'Enter' } }]);
+  assert.deepEqual(one({ name: 'computer_use', arguments: { action: 'scroll', pixels: -300 } }), [{ name: 'browser_scroll', args: { direction: 'down' } }]);
+  assert.deepEqual(one({ name: 'computer_use', arguments: { action: 'key', keys: ['ctrl+alt+del'] } }), []);
+  // Without browser tools nothing is mapped.
+  assert.deepEqual(parseToolCalls('<tool_call>\n{"name": "web", "arguments": {"url": "http://x/"}}\n</tool_call>', new Set(['bash'])), []);
+});

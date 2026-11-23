@@ -527,3 +527,20 @@ test('vision models can click a point of the screenshot: it becomes the element 
   assert.match(seen[2], /needs the person's approval/);
   assert.match(seen[3], /x and y go from 0 to 1000/);
 });
+
+test('typing without an element number goes to the element clicked last on the same page', async () => {
+  const pages = { 'https://shop.example/': '# Shop\n[1] textbox "Search"  [2] button "Go"' };
+  const browser = fakeBrowser(pages); let n = 0; const seen = [];
+  const task = createPiTask({ browser, workspace: { request: async () => ({}) }, network, turn: async (messages) => {
+    if (n) seen.push(JSON.stringify(messages.at(-1).content));
+    n++;
+    if (n === 1) return call('browser_type', { text: 'too early' });
+    if (n === 2) return call('browser_open', { url: 'https://shop.example/' });
+    if (n === 3) return call('browser_click', { ref: 1 });
+    if (n === 4) return call('browser_type', { text: 'kettle' });
+    return { text: 'Done.', reason: 'end' };
+  } });
+  await task.run('Search for kettles');
+  assert.deepEqual(browser.log.filter((l) => l[0] === 'type').map((l) => [l[1], l[2]]), [[1, 'kettle']]);
+  assert.match(seen[0], /ref must be an element number/);
+});
