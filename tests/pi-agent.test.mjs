@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement, sedWithoutInPlace, wantsMore } from '../web/pi-agent.mjs';
+import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement, sedWithoutInPlace, wantsMore, sedInPlaceFile, changedLines } from '../web/pi-agent.mjs';
 
 test('real Pi agent loop invokes sandbox tools and feeds their results back to the local transport',async()=>{
  const files=new Map(),events=[];let round=0;
@@ -597,4 +597,22 @@ test('a button clicked again stays held when the request asks for it once', asyn
   await task.run('Go to https://shop.example/ and add the Blue Kettle to the cart.');
   assert.deepEqual(browser.log.filter(l => l[0] === 'click').map(l => l[1]), [2]);
   assert.match(seen[3], /was not done again: the request asks for it once/);
+});
+
+test('a file changed in place by sed is shown as it now reads', async () => {
+  assert.equal(sedInPlaceFile("cd app && sed -i 's/a/b/' calc.py && git add calc.py"), 'calc.py');
+  assert.equal(sedInPlaceFile("sed -n '1p' calc.py"), null);
+  assert.equal(changedLines('a\nb\nc', 'a\nb\nc'), null);
+  let file = 'def add(a, b):\n    return a - b\n\n\ndef sub(a, b):\n    return a - b\n';
+  const results = []; let n = 0;
+  const workspace = { cwd: '/home/user/app', path: (p) => '/home/user/app/' + p, vm: { read: async () => ({ ok: false }) }, request: async (name, args) => {
+    if (name === 'read') return { text: file };
+    if (name === 'exec') { if (/sed -i/.test(args.command)) file = file.replace('def add(a, b):', 'def add(a, b):\n    return a + b'); return { code: 0, stdout: '[fix-add af6d630] Fix add', stderr: '', cwd: '/home/user/app' }; }
+    return {};
+  } };
+  const task = createPiTask({ linux: { cwd: '/home/user/app' }, workspace, network: { options: () => ({ enabled: false }) }, onEvent: (e) => { if (e.type === 'tool-result') results.push(e.result.content[0].text); }, turn: async () => {
+    n++; return { text: n === 1 ? '<tool_call>' + JSON.stringify({ name: 'bash', arguments: { command: "sed -i 's/def add(a, b):/def add(a, b):\\n    return a + b/' calc.py && git commit -m 'Fix add'" } }) + '</tool_call>' : 'Done.', reason: 'end' };
+  } });
+  await task.run('Fix add');
+  assert.match(results[0], /calc\.py now reads:\n1: def add\(a, b\):\n2:     return a \+ b\n3:     return a - b\n4: /);
 });

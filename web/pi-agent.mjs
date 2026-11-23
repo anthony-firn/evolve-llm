@@ -70,6 +70,31 @@ const shellText = r => [`exit code ${r.code}${r.timedOut?' (timed out)':''}, in 
 /** What a request in the Linux workspace starts with: the working directory and, for a GitHub
  *  repository the request names, where it is cloned or the exact command to clone it. Small
  *  models otherwise skip the clone or copy a placeholder like OWNER/REPO. */
+/** The file a command changes in place with sed -i, if it has one. */
+export function sedInPlaceFile(command) {
+  for (const part of String(command).split(/&&|\|\||;|\|/)) {
+    const m = /^\s*sed\s+([\s\S]*)$/.exec(part);
+    if (!m || !/(^|\s)-[a-zA-Z]*i|--in-place/.test(m[1])) continue;
+    const file = /\s([\w./-]+)\s*$/.exec(m[1]);
+    if (file) return file[1];
+  }
+  return null;
+}
+
+/** The lines of `after` that differ from `before`, numbered, with a line before and two after
+ *  (null when nothing changed or the change is long). */
+export function changedLines(before, after) {
+  if (before === after) return null;
+  const a = before.split('\n'), b = after.split('\n');
+  let s = 0;
+  while (s < a.length && s < b.length && a[s] === b[s]) s++;
+  let e = 0;
+  while (e < a.length - s && e < b.length - s && a[a.length - 1 - e] === b[b.length - 1 - e]) e++;
+  const from = Math.max(0, s - 1), to = Math.min(b.length, b.length - e + 2);
+  if (to - from > 14) return null;
+  return b.slice(from, to).map((l, i) => `${from + i + 1}: ${l}`).join('\n');
+}
+
 /** The file a sed substitution reads without -i (so it changes nothing), if a command has one. */
 export function sedWithoutInPlace(command) {
   for (const part of String(command).split(/&&|\|\||;|\|/)) {
@@ -401,6 +426,11 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       return {content:[{type:'text',text:browserTools.format(outcome,limits.result)}],details:{browser:true,...(outcome.image&&{image:outcome.image})},isError:outcome.ok===false};
     }
     if(name==='bash'){
+      // A file changed in place by sed: read before and after, to show what it now says.
+      const target=linux?sedInPlaceFile(String(args.command||'')):null;
+      const where=target&&typeof workspace.path==='function'?workspace.path(target):target;
+      const readText=()=>where?workspace.request('read',{path:where},{signal}).then(r=>r?.text??null).catch(()=>null):null;
+      const before=await readText();
       const [command,moved]=linux?await fromStart(String(args.command||''),workspace,linux.cwd,noted):[args.command,null];
       result=await workspace.request('exec',{command:ghRepo?`export GH_REPO=${ghRepo}; ${command}`:command,...(native?{asRoot:args.asRoot===true}:{}),network:network.options()},{signal});
       if(linux&&result.code)try{result.notes=await shellNotes(String(args.command||''),result,workspace,failedCommands,signal)}catch(error){stuck=String(error.message||error);agent.abort();throw error}
@@ -410,6 +440,8 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       const appended=linux&&!result.code&&wantsPlacement(currentPrompt)?/>>\s*['"]?([\w./-]+)/.exec(String(args.command||'')):null;
       // sed with a substitution on a file but no -i prints the result and leaves the file as it was.
       const printed=linux&&!result.code?sedWithoutInPlace(String(args.command||'')):null;
+      const changed=before!=null&&!result.code?changedLines(before,await readText()??before):null;
+      if(changed)result.notes=[...(result.notes||[]),`${target} now reads:\n${changed}`];
       if(printed)result.notes=[...(result.notes||[]),`sed without -i only printed the result; ${printed} is unchanged. To change the file: sed -i 's/old/new/' ${printed} (or edit ${printed} 'old text' 'new text')`];
       if(appended)result.notes=[...(result.notes||[]),`>> added the text at the end of ${appended[1]}, but the request asks for it next to a particular line. Undo it with: git restore ${appended[1]}, then: edit ${appended[1]} 'that line' 'that line\nnew line'`];
       if(/^To github\.com\/|^Everything up-to-date/m.test(result.stdout||''))pushed=true;
