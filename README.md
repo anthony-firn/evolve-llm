@@ -15,20 +15,23 @@ reads (DeepSeek V3.1, Kimi K2, Kimi K3.1 Pro) have not been run end to end yet; 
 
 ## One chat that can also do things
 
-Ask the main chat anything, or ask it to make or change something: an app or game (it plays in the
+The page is a chat and a list of conversations, nothing more: the app chooses and downloads the
+model each request needs (your first message starts it), and everything else is in Settings.
+Ask anything, or ask it to make or change something: an app or game (it plays in the
 conversation), files, or work on your GitHub repositories. The model decides when to use tools, and
 its work shows as one collapsed line of plain steps under the reply. Behind it is Pi's agent core
 with the loaded model, working in the Evolve VM: a Rust kernel in WebAssembly with a POSIX-style
 shell, utilities, and `git` and `gh` that work on GitHub through its API (clone, commit, push,
 pull requests, CI results and merging). Pushing follows the autonomy you choose in Settings, and
-merging always asks you. **Terminal** opens the same files in a Linux terminal, where `pi <task>`
+merging always asks you. **Terminal** (Settings, for developers) opens the same files in a Linux terminal, where `pi <task>`
 runs the same agent. Browsers without WebAssembly JSPI (Firefox, Safari) use the older browser
 sandbox instead, without `git`. Web access is explicit; there is no host shell or server
 inference. See [commands, limits, permissions and self-hosting](docs/workbench.md).
 
 ## Web browser
 
-**Browser** opens a web browser engine compiled to WebAssembly: Blitz with Stylo CSS and Taffy
+**Browser** (Settings, for developers; the chat opens it by itself when a request needs the web)
+opens a web browser engine compiled to WebAssembly: Blitz with Stylo CSS and Taffy
 layout, Boa JavaScript, and rustls TLS, all in a worker. It loads real sites, keeps cookies and
 logins on this device, and you and Pi can use the same live page at once; Pi never types
 passwords. Nothing is installed or hosted for it: the engine contains a Tor client (Arti's
@@ -318,7 +321,7 @@ to print every value at full precision (the fixture records the prompts and toke
 ## License
 
 Apache 2.0. The IQ code books and block decoders derive from ggml (MIT); see NOTICE. Models are
-not part of this repository; each one keeps its own license, shown in the model list.
+not part of this repository; each one keeps its own license, shown in the model list in Settings.
 
 ## Browser embedding API
 

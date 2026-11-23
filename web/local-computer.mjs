@@ -9,7 +9,7 @@ export function mountLocalComputer({ready, turn, lease, modelName, onConnectionC
     history.replaceState(null, '', location.pathname + location.search);
   }
   const button = element('button', 'Computer'); button.type = 'button'; button.className = 'ghost'; button.id = 'open-local-computer';
-  document.getElementById('open-settings').before(button);
+  document.getElementById('dev-tools').append(button);
   const panel = element('section'); panel.className = 'workbench'; panel.id = 'local-computer'; panel.hidden = true;
   panel.setAttribute('aria-label', 'Local computer connection');
   const header = element('header'); header.append(element('strong', 'Local computer'));

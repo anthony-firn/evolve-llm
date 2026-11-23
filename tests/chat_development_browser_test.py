@@ -79,7 +79,7 @@ def check(runtime):
     message.locator('.work-steps summary').first.click()
     assert 'Deleted calculator.html.' in message.inner_text() and 'Ran rm calculator.html' in message.locator('.work-steps').inner_text(),message.inner_text()
     # The Terminal shows the assistant's files.
-    page.locator('#open-terminal').click()
+    page.locator('#open-terminal').dispatch_event("click")
     if linux:
      page.wait_for_selector('.vm-console .vt-term:not([hidden])')
      listing=page.evaluate("async()=>(await (await import('./vm/client.mjs')).sharedVm().exec('ls')).stdout")
@@ -90,9 +90,9 @@ def check(runtime):
     page.locator('#workbench').get_by_role('button',name='Close',exact=True).click()
     page.locator('#new-chat').click();assert page.locator('.chat-preview-host iframe').count()==0
     # Saved chats: the conversation comes back with its steps, and its app reopens from the files.
-    page.locator('#open-chats').click()
+    # The conversation list sits beside the chat.
     saved=page.locator('#chat-list li');saved.first.wait_for()
-    assert saved.count()==1 and 'What is WebGPU?' in saved.first.inner_text(),page.locator('#chats').inner_text()
+    assert saved.count()==1 and 'What is WebGPU?' in saved.first.inner_text(),page.locator('#sidebar').inner_text()
     saved.first.locator('.chat-open').click()
     page.get_by_text('You sent 4 messages.').wait_for()
     assert page.locator('.msg.user').count()==7,page.locator('.msg.user').count()
@@ -101,9 +101,9 @@ def check(runtime):
     blue.get_by_role('button',name='Open snake.html',exact=True).click()
     assert blue.frame_locator('iframe').locator('body').evaluate('(e)=>getComputedStyle(e).backgroundColor')=='rgb(0, 0, 255)'
     assert 'You sent 5 messages.' in send('How many messages have I sent?').inner_text()
-    page.locator('#open-chats').click();page.locator('#chat-list li').first.wait_for();assert page.locator('#chat-list li').count()==1
+    page.locator('#chat-list li').first.wait_for();assert page.locator('#chat-list li').count()==1
     page.locator('#chat-list li').first.get_by_role('button',name='Delete “What is WebGPU?”').click()
-    page.locator('#chats-empty').wait_for();page.locator('#chats').get_by_role('button',name='Close').click()
+    page.locator('#chats-empty').wait_for()
     page.locator('#new-chat').click()
     # The local trace saw every run, model turn, tool call and result.
     events=[json.loads(l) for l in trace.read_text().splitlines()]

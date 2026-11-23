@@ -29,7 +29,7 @@ def check(runtime, timeout, screens, url, base_url=None):
                 page.on("pageerror", lambda e: page_errors.append(str(e)))
                 base = base_url or f"http://127.0.0.1:{server.server_address[1]}/play/evolve-llm/"
                 page.goto(base)
-                page.locator("#open-browser").click()
+                page.locator("#open-browser").dispatch_event("click")
                 page.wait_for_selector("#browser-panel:not([hidden]) .browser-toolbar")
                 client_call(page, "b.ready")
                 client_call(page, "b.setRelay('tor:')")

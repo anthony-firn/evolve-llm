@@ -90,7 +90,7 @@ def check(runtime, output, google=True, only=None, tls_only_profile=None):
                         context.add_init_script(f"localStorage.setItem('evolve-browser-identity', {json.dumps(identity)});localStorage.setItem('evolve-browser-tls', {json.dumps(tls)});localStorage.setItem('evolve-browser-relay','tor:')")
                         page = context.new_page()
                         page.goto(base)
-                        page.locator("#open-browser").click()
+                        page.locator("#open-browser").dispatch_event("click")
                         page.wait_for_selector("#browser-panel:not([hidden]) .browser-toolbar")
                         client_call(page, "b.ready")
                         client_call(page, f"b.navigate({json.dumps(TLS_URL)})")

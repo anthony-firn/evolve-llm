@@ -51,7 +51,7 @@ def main():
         page.set_input_files("#file-input", str(a.model))
         page.wait_for_selector("#ready:not([hidden])", timeout=600000)
         print(f"{a.model.name} loaded in {time.time() - t0:.0f}s", flush=True)
-        page.click("#open-terminal")
+        page.dispatch_event("#open-terminal", "click")
         page.wait_for_selector(".vm-console .vt-term:not([hidden])", timeout=30000)
         vm = "(await import('./vm/client.mjs')).sharedVm()"
         page.evaluate(f"async (o) => {{ ({vm}).configure({{ github: {{ api: o + '/mockgh/api', raw: o + '/mockgh/raw', token: 't' }} }}); }}", origin)

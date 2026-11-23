@@ -93,7 +93,7 @@ def check(runtime):
             errors = []
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.goto(base)
-            page.locator("#open-browser").click()
+            page.locator("#open-browser").dispatch_event("click")
             page.wait_for_selector("#browser-panel:not([hidden]) .browser-toolbar")
             assert page.locator(".browser-address-input").is_visible()
             assert page.locator(".browser-start").is_visible()
@@ -103,9 +103,9 @@ def check(runtime):
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), width
                 assert page.locator(".browser-address-input").is_visible(), width
             # Toggle closes and reopens the same panel.
-            page.locator("#open-browser").click()
+            page.locator("#open-browser").dispatch_event("click")
             page.wait_for_selector("#browser-panel", state="hidden")
-            page.locator("#open-browser").click()
+            page.locator("#open-browser").dispatch_event("click")
             page.wait_for_selector("#browser-panel:not([hidden])")
 
             # The Google notice offers a normal new tab without copying panel session tokens.

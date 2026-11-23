@@ -33,7 +33,7 @@ CALC = "def add(a, b):\n    return a - b\n\n\ndef sub(a, b):\n    return a - b\n
 TEST = "import unittest\nfrom calc import add, sub\n\n\nclass T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_sub(self):\n        self.assertEqual(sub(5, 3), 2)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
 FILES = {"README.md": "# Calculator\n", "calc.py": CALC, "test_calc.py": TEST}
 
-PAGE = """<!doctype html><button id="open-settings">Settings</button><script type="module">
+PAGE = """<!doctype html><button id="open-settings">Settings</button><div id="dev-tools"></div><script type="module">
 import {mountLocalComputer} from './local-computer.mjs';
 import {sharedVm, provideConfig} from './vm/client.mjs';
 mountLocalComputer({ready: () => false, lease: () => () => {}, modelName: () => 'none', turn: async () => ({text: '', reason: 'stop'}),

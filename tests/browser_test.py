@@ -85,7 +85,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 def open_sandbox(page):
     """Open Terminal and switch it to the browser sandbox: Terminal opens the Linux terminal where
     the VM runs, and the sandbox by itself where it cannot (no JSPI, or a build without the VM)."""
-    page.locator("#open-terminal").click()
+    page.locator("#open-terminal").dispatch_event("click")
     page.wait_for_function("() => { const t = document.querySelector('#linux-terminal-toggle'); return t && (t.hidden || document.querySelector('.vm-console .vt-term')); }", timeout=30000)
     if page.locator("#linux-terminal-toggle").is_visible():
         page.locator("#linux-terminal-toggle").click()
@@ -201,11 +201,18 @@ def main():
             page.set_viewport_size({"width": 390, "height": 844})
             time.sleep(0.6)
             page.screenshot(path=str(a.screens / "phone.png"))
-            page.click("#open-models")
+            page.click("#open-chats")
             time.sleep(0.6)
-            page.screenshot(path=str(a.screens / "phone-models.png"))
-            page.click("#scrim")
+            page.screenshot(path=str(a.screens / "phone-chats.png"))
+            # The drawer covers the left of the screen: close it from the dimmed strip beside it.
+            page.locator("#scrim").click(position={"x": 370, "y": 400})
             page.set_viewport_size({"width": 1360, "height": 900})
+
+        def developer_models():
+            # Models, links and files live in Settings, for developers only.
+            page.click("#open-settings")
+            if page.locator("#dev-models").get_attribute("open") is None:
+                page.locator("#dev-models > summary").click()
 
         if a.download:
             page.click("#new-chat")
@@ -219,28 +226,24 @@ def main():
             page.on("response", piece)
             # The catalog holds only frontier models, which the app picks itself; SmolLM2 135M (145 MB)
             # comes through the developers' Hugging Face link instead, the same download path.
-            if page.locator("#open-models").is_visible():
-                page.click("#open-models")
+            developer_models()
             page.locator("#other-sources summary").click()
             page.fill("#hf-input", "bartowski/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct-Q8_0.gguf")
             page.locator("#hf-form button[type=submit]").click()
             page.wait_for_selector("#ready:not([hidden])", timeout=600000)
             print("pieces by host:", dict(pieces))
-            if page.locator("#open-models").is_visible():
-                page.click("#open-models")
-            saved = page.locator(".model", has_text="SmolLM2-135M").inner_text()
             print("downloaded and loaded:", page.inner_text("#ready-meta"))
+            developer_models()
+            saved = page.locator(".model", has_text="SmolLM2-135M").inner_text()
+            page.keyboard.press("Escape")
             assert "Running" in saved
             page.reload()
             page.wait_for_selector("#gpu-chip[data-state=ok]", timeout=30000)
-            if page.locator("#open-models").is_visible():
-                page.click("#open-models")
+            developer_models()
             page.wait_for_selector(".model:has-text('SmolLM2-135M') .tag.ok", timeout=30000)
             t0 = time.time()
-            # With models managed for you, the app loads the model it last ran on its own.
             button = page.locator(".model", has_text="SmolLM2-135M")
-            if button.is_enabled():
-                button.click()
+            button.click()
             page.wait_for_selector("#ready:not([hidden])", timeout=120000)
             print(f"reloaded from browser storage in {time.time() - t0:.1f}s")
             steps = page.eval_on_selector_all("#loading-steps li", "els => els.map(e => e.dataset.step + ':' + e.dataset.state)")
