@@ -58,6 +58,9 @@ pub struct Moe {
     pub n_group_used: usize,
     /// Leading layers that use a dense feed-forward block instead.
     pub dense_lead: usize,
+    /// The shared expert's output is scaled per token by sigmoid(ffn_gate_inp_shexp · x)
+    /// (Qwen3.5 and Qwen3-Next mixtures of experts).
+    pub shared_gate: bool,
 }
 
 /// Multi-head latent attention: keys and values are cached as one compressed vector per token.
@@ -256,7 +259,8 @@ pub fn arch_of(g: &Gguf) -> Result<Arch, String> {
         "olmoe" => Arch::Olmoe,
         // Kimi K3 is the same model without the sparse-attention indexer.
         "kimi-k31" | "kimi-k3" => Arch::KimiK31,
-        "qwen35" => Arch::Qwen35,
+        // Qwen3.5 and 3.6 with experts: the same layers with a mixture of experts for the MLP.
+        "qwen35" | "qwen35moe" => Arch::Qwen35,
         other => {
             return Err(format!(
                 "the {other} architecture is not supported yet (supported: llama, mistral, qwen2, qwen3, qwen3moe, deepseek2, olmoe, kimi-k3, kimi-k31)"
@@ -344,6 +348,7 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
                 n_group: opt("expert_group_count").unwrap_or(1).max(1),
                 n_group_used: opt("expert_group_used_count").unwrap_or(1).max(1),
                 dense_lead: lead,
+                shared_gate: g.tensor(&format!("blk.{lead}.ffn_gate_inp_shexp.weight")).is_some(),
             })
         }
         _ => None,
@@ -552,7 +557,9 @@ fn validate(g: &Gguf, c: &Config) -> Result<(), String> {
         } else {
             vec![cols as u64, rows as u64]
         };
-        if t.dims != want {
+        // A one-row matrix may be stored as a vector ([n] for [n, 1]).
+        let trim = |d: &[u64]| d.iter().rposition(|&x| x != 1).map_or(0, |i| i + 1);
+        if t.dims[..trim(&t.dims)] != want[..trim(&want)] {
             return Err(format!(
                 "tensor {name} has shape {:?}, expected {want:?}",
                 t.dims
@@ -663,6 +670,9 @@ pub fn matrices(c: &Config) -> Vec<(String, usize, usize, usize)> {
                     m.push((b("ffn_routed_up"), c.n_embd, w, 1));
                 }
                 if e.n_ff_shared > 0 {
+                    if e.shared_gate {
+                        m.push((b("ffn_gate_inp_shexp"), 1, c.n_embd, 1));
+                    }
                     m.push((b("ffn_gate_shexp"), e.n_ff_shared, c.n_embd, 1));
                     m.push((b("ffn_up_shexp"), e.n_ff_shared, c.n_embd, 1));
                     m.push((b("ffn_down_shexp"), c.n_embd, e.n_ff_shared, 1));

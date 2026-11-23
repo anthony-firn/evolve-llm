@@ -129,6 +129,14 @@ fn qwen35_matches_transformers() {
     run("qwen35", "-split", 5e-3);
 }
 
+/// Qwen3.5/3.6 with experts (Qwen3.6-35B-A3B's layout): Gated DeltaNet and gated attention as
+/// Qwen3.5, the MLP a softmax-routed mixture of experts plus a shared expert scaled by its own
+/// sigmoid gate.
+#[test]
+fn qwen35moe_matches_transformers() {
+    check("qwen35moe");
+}
+
 #[test]
 fn olmoe_matches_transformers() {
     check("olmoe");

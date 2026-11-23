@@ -61,6 +61,15 @@ SPECS = {
         linear_value_head_dim=128, linear_conv_kernel_dim=4, tie_word_embeddings=True,
         rope_parameters={"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25,
                          "mrope_section": [3, 3, 2], "mrope_interleaved": True})),
+    # Qwen3.5/3.6 with experts (Qwen3.6-35B-A3B's layout, small): the same layers, the MLP a
+    # mixture of 8 experts (2 per token) and a shared expert with its own sigmoid gate.
+    "qwen35moe": ("Qwen3_5MoeTextConfig", "Qwen3_5MoeForCausalLM", dict(
+        hidden_size=128, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=64, linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=128,
+        linear_value_head_dim=128, linear_conv_kernel_dim=4, tie_word_embeddings=True,
+        num_experts=8, num_experts_per_tok=2, moe_intermediate_size=64, shared_expert_intermediate_size=96,
+        rope_parameters={"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25,
+                         "mrope_section": [3, 3, 2], "mrope_interleaved": True})),
     # DeepSeek V2 Lite layout: no query compression, softmax routing, two shared experts.
     "deepseek2lite": ("DeepseekV2Config", "DeepseekV2ForCausalLM", dict(
         hidden_size=128, intermediate_size=256, moe_intermediate_size=64, num_hidden_layers=3,
@@ -73,7 +82,7 @@ SPECS = {
 
 
 # Converter options for a model: Qwen3.5 checkpoints normally carry next-token-prediction layers.
-CONVERT_ARGS = {"qwen35": ["--no-mtp"]}
+CONVERT_ARGS = {"qwen35": ["--no-mtp"], "qwen35moe": ["--no-mtp"]}
 
 
 def build(name, tokenizer, out_dir):
@@ -96,6 +105,15 @@ def build(name, tokenizer, out_dir):
     model.save_pretrained(out_dir, safe_serialization=True)
     for f in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(tokenizer / f, out_dir / f)
+    # Transformers loads Qwen3.5 MoE checkpoints with Qwen's own tokenizer whatever the files say,
+    # and llama.cpp then does not recognize the stand-in tokenizer. The converter picks its model
+    # from `architectures`, so the copy it reads gets the dense text model type (whose tokenizer
+    # class is taken from the files); the logits come from the model in memory.
+    if name == "qwen35moe":
+        cfg_path = out_dir / "config.json"
+        c = json.loads(cfg_path.read_text())
+        c["model_type"] = "qwen3_5_text"
+        cfg_path.write_text(json.dumps(c, indent=2))
     with torch.no_grad():
         logits = model(torch.tensor([TOKENS])).logits[0].float().numpy()
     return logits
