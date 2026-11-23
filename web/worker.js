@@ -556,9 +556,13 @@ async function turn(messages, opts, maxTokens, ctx, emit = post, preserveTask = 
   const pre = JSON.parse(images.length ? await prefillImages(tokens, images) : await chat.prefill(tokens));
   emit('prefill', { ...pre, ms: performance.now() - t0, dropped, promptTokens: tokens.length });
   const t1 = performance.now();
-  const limit = Math.min(maxTokens, ctx - tokens.length - 1);
+  let limit = Math.min(maxTokens, ctx - tokens.length - 1);
   let n = 0;
   let reason = 'length';
+  const ids = [];
+  // Whether the prompt itself opens the reply's thinking (Qwen3 Thinking 2507, Nanbeige 4.1).
+  let opensThinking = false;
+  try { opensThinking = /<think>\s*$/.test(chat.render(JSON.stringify(withImages(msgs)), JSON.stringify(opts))); } catch { /* no template */ }
   // The raw reply keeps the control tokens that carry markup (Kimi K3 channels, DeepSeek and
   // Kimi tool calls), so calls can be read from it; the person sees `displayText` of it.
   let raw = '';
@@ -572,19 +576,41 @@ async function turn(messages, opts, maxTokens, ctx, emit = post, preserveTask = 
   };
   // A model that streams its weights may read several tokens per pass (a draft from earlier
   // text, verified at once).
-  outer: while (n < limit) {
-    if (stopRequested) { reason = 'stopped'; break; }
-    for (const id of await chat.next_many()) {
-      n++;
-      if (chat.is_end(id)) { reason = 'end'; break outer; }
-      const piece = rawPiece(chat.control_text(id), chat.piece(id));
-      if (piece) raw += piece;
-      if (n >= limit) break;
+  const run = async () => {
+    reason = 'length';
+    outer: while (n < limit) {
+      if (stopRequested) { reason = 'stopped'; break; }
+      // All of a pass's tokens are in the cache, even past the limit: the thinking budget's
+      // continuation must extend exactly what the cache holds.
+      const batch = await chat.next_many();
+      ids.push(...batch);
+      for (const id of batch) {
+        n++;
+        if (chat.is_end(id)) { reason = 'end'; break outer; }
+        const piece = rawPiece(chat.control_text(id), chat.piece(id));
+        if (piece) raw += piece;
+        if (n >= limit) break;
+      }
+      show();
     }
+    raw += chat.flush();
     show();
+  };
+  await run();
+  // A thinking budget (as llama.cpp's reasoning budget): a reply that used all of it thinking
+  // gets its thinking closed for it and room to act, instead of being cut off with nothing done.
+  const open = raw.includes('<think>') ? !raw.includes('</think>') : opensThinking && !raw.includes('</think>');
+  if (reason === 'length' && open && !/<tool_call>|<function=/.test(raw)) {
+    const close = Array.from(chat.tokenize('\n</think>\n\n'));
+    const room = ctx - tokens.length - ids.length - close.length - 1;
+    if (room > 64) {
+      await chat.prefill(Uint32Array.from([...tokens, ...ids, ...close]));
+      raw += '\n</think>\n\n';
+      emit('budget', { thought: n });
+      limit = n + Math.min(1024, room);
+      await run();
+    }
   }
-  raw += chat.flush();
-  show();
   return { text: raw, display: displayText(raw), n, reason, ms: performance.now() - t1, promptTokens: tokens.length, computed: pre.computed, prefillMs: t1 - t0 };
 }
 
