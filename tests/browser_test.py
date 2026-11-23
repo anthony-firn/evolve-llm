@@ -135,7 +135,10 @@ def main():
         page = ctx.new_page()
         # Fonts come from the evolvetech.dev site and are absent from a standalone build.
         page.on("console", lambda m: m.type in ("error", "warning") and "Failed to load resource" not in m.text and problems.append(f"console {m.type}: {m.text}"))
-        page.on("response", lambda r: r.status >= 400 and "/assets/fonts/" not in r.url and problems.append(f"HTTP {r.status} {r.url}"))
+        # Fonts are the site's, and …/__trace answers only on the local trace server (a 404 elsewhere
+        # is how the page learns to send nothing).
+        page.on("response", lambda r: r.status >= 400 and "/assets/fonts/" not in r.url and not r.url.split("?")[0].endswith("/__trace")
+                and problems.append(f"HTTP {r.status} {r.url}"))
         page.on("pageerror", lambda e: problems.append(f"page error: {e}"))
         page.goto(url)
         page.wait_for_selector("#gpu-chip[data-state=ok]", timeout=30000)
