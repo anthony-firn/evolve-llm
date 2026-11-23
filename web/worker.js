@@ -374,7 +374,8 @@ async function freeGpuBytes(lowPower, need) {
   return buffers.length * step;
 }
 
-async function loadModel(source, wantCtx, lowPower, budgetPref, { stage = null, split = null, pool = false } = {}) {
+// `reserve`: GPU bytes to leave free on this device for an image encoder loaded after the model.
+async function loadModel(source, wantCtx, lowPower, budgetPref, { stage = null, split = null, pool = false, reserve = 0 } = {}) {
   readers = source.remote ? source.remote.readers() : await openModelReaders(source, modelsDir);
   remote = source.remote || null;
   // Headers come over the network together; later reads of a longer header fall back to
@@ -414,7 +415,7 @@ async function loadModel(source, wantCtx, lowPower, budgetPref, { stage = null, 
     const fileBytes = lb.layers.reduce((a, b) => a + b, 0) + lb.embed + (lb.tied ? 0 : lb.head);
     const scale = Math.max(1, (model.fast_bytes || fileBytes) / fileBytes);
     const need = (model.fast_bytes || fileBytes) + (lb.kv_per_token || 0) * ctx * lb.n_layer;
-    const free = await freeGpuBytes(lowPower, need * 1.15);
+    const free = Math.max(0, (await freeGpuBytes(lowPower, need * 1.15 + reserve)) - reserve);
     const [, rest] = planFill(lb, free, ctx, scale);
     const helpers = rest.end > rest.first ? [{ helper: 0, stage: { first: rest.first, end: rest.end, embed: false, head: false } }] : [];
     if (helpers.length) stage = { first: 0, end: rest.first, embed: true, head: true };
@@ -678,7 +679,10 @@ const handlers = {
       files = { names: await download(source) };
       post('cache', await listCached().catch(() => ({ models: [], supported: false })));
     }
-    const result = await loadModel(files, ctx, gpu === 'low-power', gpuMemory, { stage, split, pool });
+    // An image encoder takes its file's size on the GPU, and some room for its work.
+    const visionBytes = source.kind === 'file' ? source.visionFile?.size : source.vision?.bytes;
+    const reserve = visionBytes ? visionBytes + 256 * 2 ** 20 : 0;
+    const result = await loadModel(files, ctx, gpu === 'low-power', gpuMemory, { stage, split, pool, reserve });
     if (result.stageLoaded) {
       post('stage-loaded', { stage: result.stage, placement: result.placement });
       return;
