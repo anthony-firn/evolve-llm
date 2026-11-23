@@ -1,4 +1,5 @@
 import { BEST_FOR, LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from './models.js';
+import { GPU_OVERHEAD, LADDER, isMetered, pickModel, shouldFetch, toRemove } from './model-manager.mjs';
 import { renderMarkdown, splitThinking } from './markdown.js';
 import { stripToolCalls } from './tools.js';
 import { wantsSnakeStarter, wantsBrowser, createWorkView, kindOf } from './chat-development.mjs';
@@ -81,6 +82,7 @@ function el(tag, attrs = {}, ...children) {
 function setPhase(phase) {
   state.phase = phase;
   app.dataset.phase = phase;
+  if (phase === 'ready' || phase === 'idle') scheduleUpkeep();
   // A phone using its computer keeps its screen on while the computer works for it: a locked
   // phone drops the connection.
   if (REMOTE_CODE) keepAwake(['loading', 'generating', 'agent', 'preparing'].includes(phase));
@@ -184,7 +186,7 @@ function renderModels() {
     ];
     const button = el('button', {
       class: 'model', type: 'button', disabled: busy || running, 'aria-current': running ? 'true' : null,
-      onclick: () => startLoad(catalogEntry(m)),
+      onclick: () => { pin(key); startLoad(catalogEntry(m)); },
     },
     el('span', { class: 'row' }, el('span', { class: 'name', text: m.name }), el('span', { class: 'size', text: formatBytes(m.bytes) })),
     el('span', { class: 'note', text: m.note }),
@@ -208,7 +210,7 @@ function renderModels() {
     const running = state.loaded?.key === c.key;
     const entry = { kind: 'hf', id: c.key, key: c.key, repo: c.repo, file: c.file, revision: c.revision || 'main', url: c.url, bytes: c.bytes, name: c.file, parts: c.parts?.length > 1 ? c.parts.map((p) => ({ ...p, url: hfUrl(c.repo, p.file, c.revision || 'main') })) : null };
     items.push(el('li', {},
-      el('button', { class: 'model', type: 'button', disabled: busy || running, 'aria-current': running ? 'true' : null, onclick: () => startLoad(entry) },
+      el('button', { class: 'model', type: 'button', disabled: busy || running, 'aria-current': running ? 'true' : null, onclick: () => { pin(c.key); startLoad(entry); } },
         el('span', { class: 'row' }, el('span', { class: 'name', text: c.file.split('/').pop().replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '') }), el('span', { class: 'size', text: formatBytes(c.bytes) })),
         el('span', { class: 'note', text: c.repo }),
         el('span', { class: 'meta' }, running ? el('span', { class: 'tag run', text: 'Running' }) : el('span', { class: 'tag ok', text: c.complete ? 'Saved' : 'Partial' }))),
@@ -233,11 +235,130 @@ function renderStorage() {
   box.hidden = false;
   const meter = el('div', { class: 'meter' }, el('span'));
   meter.firstChild.style.setProperty('width', `${Math.min(100, (usage / quota) * 100).toFixed(1)}%`);
+  const f = state.fetching;
   box.replaceChildren(
     el('div', { text: `Saved models: ${formatBytes(stored)}` }),
     meter,
     el('div', { text: `${formatBytes(quota - usage)} of browser storage free` }),
+    f ? el('div', { text: `Getting ${f.name} for this device in the background: ${f.total ? Math.floor((f.loaded / f.total) * 100) : 0}%` }) : null,
   );
+}
+
+// ---- Models that manage themselves (model-manager.mjs) ----
+// The app picks the best model for this device, loads it on later visits, downloads a better
+// one in the background when idle, and removes models nobody uses. A model the person chose
+// themselves is kept and not replaced. "Manage models for me" in Settings turns it off.
+
+const managed = () => state.settings.manageModels !== false && !REMOTE_CODE;
+function readJson(key, fallback) { try { return JSON.parse(recall(key)) ?? fallback; } catch { return fallback; } }
+function markUsed(key) { const used = readJson('evolve-llm-used', {}); used[key] = Date.now(); remember('evolve-llm-used', JSON.stringify(used)); }
+function pin(key) { remember('evolve-llm-pinned', JSON.stringify([...new Set([...readJson('evolve-llm-pinned', []), key])])); }
+const pinned = () => new Set(readJson('evolve-llm-pinned', []));
+const keyOf = (m) => cacheKey(m.repo, m.file);
+const savedIds = () => new Set(MODELS.filter((m) => cachedEntry(keyOf(m))?.complete).map((m) => m.id));
+// Whether the person chose the running model themselves (a file, a pasted link, the model list).
+const chosen = () => Boolean(state.loaded && (state.loaded.kind === 'file' || pinned().has(state.loaded.key)));
+
+// GPU memory free for a model, measured once per GPU (and both GPUs when they are pooled).
+let gpuBytes = null;
+async function probeGpu(adapter) {
+  if (!adapter?.ok || !managed() || state.loaded) return;
+  const id = `evolve-llm-gpu-${describeGpu(adapter)}`;
+  const known = readJson(id, null);
+  if (known && Date.now() - known.at < 30 * 864e5) { gpuBytes = known.bytes; updatePick(); return; }
+  const need = Math.max(...LADDER.map((i) => MODELS.find((m) => m.id === i)?.bytes || 0)) * GPU_OVERHEAD;
+  // Set before waiting, so loading a saved model waits for the measurement (both use the GPU).
+  probing = { id, need, gpus: [], bytes: 0 };
+  probing.gpus = (await poolingGpus()) ? ['high-performance', 'low-power'] : [state.settings.gpu];
+  worker.postMessage({ type: 'probe', gpu: probing.gpus[0], need });
+}
+let probing = null;
+function onProbed(msg) {
+  if (!probing) return;
+  probing.bytes += msg.bytes;
+  probing.gpus.shift();
+  if (probing.gpus.length) { worker.postMessage({ type: 'probe', gpu: probing.gpus[0], need: probing.need }); return; }
+  gpuBytes = probing.bytes;
+  remember(probing.id, JSON.stringify({ bytes: gpuBytes, at: Date.now() }));
+  probing = null;
+  onCache();
+}
+
+function updatePick() {
+  const { usage, quota } = state.cache;
+  state.pick = pickModel(MODELS, { gpuBytes: gpuBytes ?? undefined, storageFree: quota ? quota - usage : undefined, mobile: IS_MOBILE, saved: savedIds() });
+  const start = $('start-recommended');
+  const m = startingModel();
+  if (m) start.textContent = `Start with ${m.name} (${formatBytes(m.bytes)})`;
+}
+
+/** The model "Start" loads: a model the person chose that is saved, else the device's pick. */
+function startingModel() {
+  const last = ALL.find((m) => m.id === recall('evolve-llm-last'));
+  if (!managed()) return last || MODELS.find((m) => m.recommended);
+  const lastSaved = last && cachedEntry(keyOf(last))?.complete;
+  if (lastSaved && pinned().has(keyOf(last))) return last;
+  if (state.pick && cachedEntry(keyOf(state.pick))?.complete) return state.pick;
+  if (lastSaved) return last;
+  // Something saved starts now (the pick downloads in the background): the best saved one.
+  const anySaved = [...LADDER.map((id) => MODELS.find((m) => m.id === id)), ...MODELS].find((m) => m && cachedEntry(keyOf(m))?.complete);
+  return anySaved || state.pick || MODELS.find((m) => m.recommended);
+}
+
+/** The device's pick, once saved, when the running model was not the person's own choice. */
+function pickToSwitchTo() {
+  const p = state.pick;
+  if (!managed() || !p || chosen() || !state.loaded || state.loaded.id === p.id) return null;
+  return cachedEntry(keyOf(p))?.complete ? p : null;
+}
+
+// A downloaded pick takes over at once when no conversation is under way, else at the next one.
+function onFetched() {
+  const name = state.pick?.name || 'The model';
+  if (state.phase === 'ready' && !state.messages.length) {
+    const better = pickToSwitchTo();
+    if (better) { state.afterLoad = { note: `Switched to ${better.name}, the best model for this device.` }; startLoad(catalogEntry(better), { keepChat: true }); return; }
+  }
+  $('status-line').textContent = `${name} is saved on this device. It takes over at your next new conversation.`;
+}
+
+// On a later visit, the saved model loads by itself.
+let autoStarted = false;
+function onCache() {
+  updatePick();
+  if (probing || autoStarted || !managed() || !state.adapter?.ok || state.loaded || state.phase !== 'idle') return;
+  const m = startingModel();
+  if (!m || !cachedEntry(keyOf(m))?.complete) return;
+  autoStarted = true;
+  startLoad(catalogEntry(m));
+}
+
+// After half a minute idle: remove what is not used, and fetch the device's pick.
+let upkeepTimer = 0;
+function scheduleUpkeep() {
+  clearTimeout(upkeepTimer);
+  if (managed()) upkeepTimer = setTimeout(upkeep, 30000);
+}
+function upkeep() {
+  if (!managed() || !state.cache.supported || !['ready', 'idle'].includes(state.phase)) return;
+  const used = readJson('evolve-llm-used', {});
+  // Models saved before this existed count as used today.
+  for (const c of state.cache.models) used[c.key] ??= Date.now();
+  remember('evolve-llm-used', JSON.stringify(used));
+  const p = state.pick;
+  const pickKey = p ? keyOf(p) : null;
+  const fetchNow = !state.fetching && !chosen() && shouldFetch({ pick: p, saved: savedIds(), running: state.loaded?.id, metered: isMetered(navigator.connection), idle: true });
+  const keep = new Set([state.loaded?.key, pickKey, ...pinned()].filter(Boolean));
+  const { usage = 0, quota = 0 } = state.cache;
+  const need = fetchNow ? p.bytes - (cachedEntry(pickKey)?.stored || 0) + (p.vision?.bytes || 0) : 0;
+  const gone = toRemove(state.cache.models, { need, free: quota ? quota - usage : Infinity, keep, lastUsed: used });
+  for (const m of gone) worker.postMessage({ type: 'removeCache', key: m.key });
+  if (gone.length) $('status-line').textContent = `Removed ${gone.map((m) => m.name || m.file).join(', ')}, which ${gone.length > 1 ? 'were' : 'was'} not being used, to keep storage free.`;
+  if (fetchNow) {
+    state.fetching = { key: pickKey, name: p.name, loaded: cachedEntry(pickKey)?.stored || 0, total: p.bytes };
+    worker.postMessage({ type: 'fetch', source: catalogEntry(p) });
+    renderStorage();
+  }
 }
 
 // ---- Loading ----
@@ -270,7 +391,7 @@ async function startLoad(source, { keepChat = false } = {}) {
   $('loading-step').textContent = saved ? 'Saved on this device' : source.kind === 'file' ? 'From this device' : source.stream ? 'Connecting to Hugging Face' : 'Downloading';
   loadStarted = performance.now();
   setPhase('loading');
-  if (source.kind === 'hf') remember('evolve-llm-last', source.id);
+  if (source.kind === 'hf') { remember('evolve-llm-last', source.id); markUsed(source.key); }
   // With paired devices, each reads only its share of a model from Hugging Face.
   state.helpers?.unloadAll();localGpuPromise?.then((l)=>l.hub.unloadAll(),()=>{});
   const helpers = source.kind === 'hf' ? state.helpers?.ready() ?? [] : [];
@@ -705,7 +826,7 @@ function onLoaded(msg) {
   // A switch for a kind of request: answer the request that asked for it.
   const after = state.afterLoad;
   state.afterLoad = null;
-  if (after) { $('status-line').textContent = after.note; after.run(); }
+  if (after) { $('status-line').textContent = after.note; after.run?.(); }
 }
 
 function formatParams(n) {
@@ -1102,8 +1223,12 @@ function onWorkerMessage(event) {
     return;
   }
   switch (msg.type) {
-    case 'adapter': showGpu(msg.adapter); break;
-    case 'cache': state.cache = msg; renderModels(); break;
+    case 'adapter': showGpu(msg.adapter); probeGpu(msg.adapter); break;
+    case 'cache': state.cache = msg; renderModels(); onCache(); break;
+    case 'probed': onProbed(msg); break;
+    case 'fetch-progress': if (state.fetching) { state.fetching.loaded = msg.loaded; state.fetching.total = msg.total; renderStorage(); } break;
+    case 'fetched': state.fetching = null; onFetched(); break;
+    case 'fetch-error': state.fetching = null; renderStorage(); if (msg.message !== 'stopped') $('status-line').textContent = `Could not download ${state.pick?.name || 'the model'} in the background: ${msg.message}`; break;
     case 'progress': onProgress(msg); break;
     case 'stream-progress': onStreamProgress(msg); break;
     case 'inspected': break;
@@ -1190,10 +1315,12 @@ $('new-chat').addEventListener('click', () => {
   setPhase('ready');
   $('status-line').textContent = 'Started a new conversation.';
   prompt.focus();
+  const better = pickToSwitchTo();
+  if (better) { state.afterLoad = { note: `Started a new conversation with ${better.name}, the best model for this device.` }; startLoad(catalogEntry(better)); }
 });
 $('start-recommended').addEventListener('click', () => {
-  const last = ALL.find((m) => m.id === recall('evolve-llm-last'));
-  startLoad(catalogEntry(last || MODELS.find((m) => m.recommended)));
+  const m = startingModel();
+  if (m) startLoad(catalogEntry(m));
 });
 const HF_HELP = $('hf-help').textContent;
 
@@ -1214,14 +1341,16 @@ $('hf-form').addEventListener('submit', async (e) => {
     help.classList.remove('error');
     help.textContent = HF_HELP;
     if (ref.file) {
-      startLoad(hfSource(ref, ref.file));
+      const source = hfSource(ref, ref.file);
+      pin(source.key);
+      startLoad(source);
       return;
     }
     help.textContent = `Looking up ${ref.repo}…`;
     const groups = await listRepo(ref.repo, ref.revision);
     if (!groups.length) throw new Error('That repository has no GGUF files.');
     help.textContent = `${groups.length} GGUF ${groups.length === 1 ? 'model' : 'models'} in ${ref.repo}. Choose one:`;
-    results.replaceChildren(...groups.map((g) => el('li', {}, el('button', { type: 'button', onclick: () => startLoad(hfSource(ref, g.file)) },
+    results.replaceChildren(...groups.map((g) => el('li', {}, el('button', { type: 'button', onclick: () => { const source = hfSource(ref, g.file); pin(source.key); startLoad(source); } },
       el('span', { class: 'name', text: g.file.split('/').pop().replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '') }),
       el('span', { class: 'size', text: `${formatBytes(g.bytes)}${g.parts.length > 1 ? ` · ${g.parts.length} files` : ''}` })))));
     results.hidden = false;
@@ -1268,6 +1397,7 @@ function fillSettings() {
   form.elements.thinking.checked = Boolean(s.thinking);
   form.elements.poolGpus.checked = s.poolGpus !== false;
   form.elements.autoSwitch.checked = s.autoSwitch !== false;
+  form.elements.manageModels.checked = s.manageModels !== false;
   form.elements.internet.checked = Boolean(s.internet);
   form.elements.jinaKey.value = s.jinaKey || '';
   form.elements.githubToken.value = s.githubToken || '';

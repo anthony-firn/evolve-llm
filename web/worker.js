@@ -149,7 +149,13 @@ function httpError(status) {
 // Download every part of a model into storage, resuming partial parts. Returns the part names.
 const FULL = 'This browser ran out of storage for the model. Remove a downloaded model in the list, or allow this site more storage, then choose the model again.';
 
-async function download(entry) {
+// A model downloading in the background (the device's pick), while the app is idle.
+let fetching = null;
+// A measurement of free GPU memory in progress.
+let probingNow = null;
+
+// `quiet`: progress goes to 'fetch-progress', not the loading screen; `controller` stops it.
+async function download(entry, { quiet = false, controller = null } = {}) {
   if (!navigator.storage?.getDirectory) throw new Error('This browser cannot store downloaded models. Open a GGUF file from your device instead.');
   const dir = await modelsDir();
   const { key } = entry;
@@ -183,10 +189,10 @@ async function download(entry) {
     let pos = same ? (await handle.getFile()).size : 0;
     if (part.bytes && pos === part.bytes) continue;
     if (part.bytes && pos > part.bytes) pos = 0;
-    downloadAbort = new AbortController();
+    const abort = controller || (downloadAbort = new AbortController());
     let res;
     try {
-      res = await fetch(part.url, { headers: pos > 0 ? { Range: `bytes=${pos}-` } : {}, signal: downloadAbort.signal });
+      res = await fetch(part.url, { headers: pos > 0 ? { Range: `bytes=${pos}-` } : {}, signal: abort.signal });
     } catch (e) {
       if (e?.name === 'AbortError') throw new Error('Download paused. Choose the model again to resume.');
       throw new Error('Could not reach Hugging Face. Check your connection and try again.');
@@ -220,7 +226,7 @@ async function download(entry) {
         const now = performance.now();
         if (now - last > 150) {
           last = now;
-          post('progress', { phase: 'download', loaded: done, total, part: i + 1, parts: count,
+          post(quiet ? 'fetch-progress' : 'progress', { phase: 'download', key, loaded: done, total, part: i + 1, parts: count,
             rate: (done - have) / Math.max(0.001, (now - t0) / 1000) });
         }
       }
@@ -228,7 +234,7 @@ async function download(entry) {
       if (access.getSize() !== pos) throw new Error(FULL);
     } finally {
       access.close();
-      downloadAbort = null;
+      if (!controller) downloadAbort = null;
     }
     if (part.bytes && pos !== part.bytes) throw new Error('The download ended early. Choose the model again to resume it.');
   }
@@ -691,8 +697,41 @@ const handlers = {
   async adapter({ gpu }) {
     post('adapter', { adapter: await describeAdapter(gpu) });
   },
+  // GPU memory free for a model, up to `need` bytes (allocated and released at once).
+  async probe({ gpu, need }) {
+    probingNow = freeGpuBytes(gpu === 'low-power', Number(need) || 8 * 2 ** 30).catch(() => 0);
+    const bytes = await probingNow;
+    probingNow = null;
+    post('probed', { gpu, bytes });
+  },
+  // Download a model (and its image encoder) without loading it; a load stops it.
+  async fetch({ source }) {
+    if (fetching) return;
+    const controller = new AbortController();
+    fetching = { key: source.key, controller, done: null };
+    fetching.done = (async () => {
+      const listed = async () => post('cache', await listCached().catch(() => ({ models: [], supported: false })));
+      try {
+        await download(source, { quiet: true, controller });
+        if (source.vision) await download({ ...source.vision, parts: null }, { quiet: true, controller });
+        fetching = null;
+        // The page sees the model saved before it hears the download is done.
+        await listed();
+        post('fetched', { key: source.key });
+      } catch (e) {
+        fetching = null;
+        await listed();
+        post('fetch-error', { key: source.key, message: controller.signal.aborted ? 'stopped' : storageError(e) });
+      }
+    })();
+    await fetching.done;
+  },
   async load({ source, ctx, gpu, gpuMemory, cacheGb, share, stage, split, pool }) {
     cancelLoad = false;
+    // A background download gives way (what it saved is kept, and resumes from there), and a
+    // measurement of free GPU memory finishes first (it holds GPU memory while it runs).
+    if (fetching) { const f = fetching; f.controller.abort(); await f.done; }
+    if (probingNow) await probingNow;
     swarmOn = Boolean(share);
     unload();
     await ensureWasm();
