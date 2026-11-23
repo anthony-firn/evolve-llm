@@ -120,6 +120,15 @@ fn mixtral_matches_transformers() {
     check("mixtral");
 }
 
+/// Qwen3.5: Gated DeltaNet layers (one decay per head, shared query/key heads, merged input
+/// projections) and a gated attention layer with partial interleaved multimodal rotary positions.
+#[test]
+fn qwen35_matches_transformers() {
+    check("qwen35");
+    // The same model with the projections unmerged, as most published Qwen3.5 files are.
+    run("qwen35", "-split", 5e-3);
+}
+
 #[test]
 fn olmoe_matches_transformers() {
     check("olmoe");

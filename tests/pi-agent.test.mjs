@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiTask, askedSteps, namedRepos } from '../web/pi-agent.mjs';
+import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement, sedWithoutInPlace } from '../web/pi-agent.mjs';
 
 test('real Pi agent loop invokes sandbox tools and feeds their results back to the local transport',async()=>{
  const files=new Map(),events=[];let round=0;
@@ -395,4 +395,135 @@ test('a request about the repository the paired computer builds says to build an
  assert.match(seen[0],/Your computer is paired for building demo\/app: in its clone, cargo, npm, npx and node run on the computer/);
  building=null;await task.run('Fix the tests of the GitHub repository demo/app.');
  assert.doesNotMatch(seen.at(-1),/paired for building/);
+});
+
+test('a request for sources answered from memory is asked to search first, once, only with web access',async()=>{
+ assert.ok(wantsSources('Cite the code section and link to it.'));assert.ok(wantsSources('Look up when it was first lit'));assert.ok(!wantsSources('Fix calc.py'));
+ for(const enabled of [true,false]){
+  const seen=[];let n=0;
+  const task=createPiTask({workspace:{request:async()=>({})},network:{options:()=>({enabled}),run:async()=>({text:'[1] Sunvale City Code 12-4',sources:[{url:'https://x'}]})},turn:async messages=>{
+   n++;seen.push(messages.at(-1).content);
+   return{text:n===2&&enabled?'<tool_call>'+JSON.stringify({name:'web_search',arguments:{query:'Sunvale deposit'}})+'</tool_call>':'Landlords have 30 days.',reason:'end'};
+  }});
+  await task.run('How many days does a Sunvale landlord have to return a deposit? Cite the section.');
+  if(enabled){assert.match(seen[1],/Not finished yet: This question asks for sources, and you have not searched yet\. Make that tool call now: web_search/);assert.equal(n,3);}
+  else assert.equal(n,1);
+ }
+});
+
+test('a line asked for after another line but appended with >> gets a note on how to place it',async()=>{
+ assert.ok(wantsPlacement('In README.md, right after the line "npm test", add the line "x".'));assert.ok(!wantsPlacement('Add a line to README.md'));
+ const results=[];let n=0;
+ const workspace={cwd:'/home/user/app',vm:{read:async()=>({ok:false})},path:p=>p,request:async(name)=>name==='exec'?{code:0,stdout:'',stderr:'',cwd:'/home/user/app'}:{}};
+ const task=createPiTask({linux:{cwd:'/home/user/app'},workspace,network:{options:()=>({enabled:false})},onEvent:e=>{if(e.type==='tool-result')results.push(e.result.content[0].text)},turn:async()=>{
+  n++;return{text:n===1?'<tool_call>'+JSON.stringify({name:'bash',arguments:{command:"echo 'npm run lint' >> README.md"}})+'</tool_call>':'Done.',reason:'end'};
+ }});
+ await task.run('In README.md of demo/app, right after the line "npm test", add the line "npm run lint".');
+ assert.match(results[0],/>> added the text at the end of README\.md, but the request asks for it next to a particular line\. Undo it with: git restore README\.md/);
+});
+
+test('sedWithoutInPlace finds a substitution that leaves its file unchanged',()=>{
+ assert.equal(sedWithoutInPlace("cd app && sed -n '1s/def add(a, b):/x/' calc.py"),'calc.py');
+ assert.equal(sedWithoutInPlace("sed 's/a - b/a + b/' calc.py"),'calc.py');
+ assert.equal(sedWithoutInPlace("sed -i 's/a - b/a + b/' calc.py"),null);
+ assert.equal(sedWithoutInPlace("sed 's/a/b/' calc.py > new.py"),null);
+ assert.equal(sedWithoutInPlace("sed -n '1,20p' calc.py"),null);
+ assert.equal(sedWithoutInPlace("cat calc.py | sed 's/a/b/'"),null);
+});
+
+test('grep finding nothing is said plainly, with the file that has the text',async()=>{
+ const results=[];let n=0;
+ const workspace={cwd:'/home/user/app',vm:{read:async()=>({ok:false})},path:p=>p,request:async(name,args)=>{
+  if(name!=='exec')return{};
+  if(args.command.startsWith('grep -rlF'))return{code:0,stdout:'calc.py\n',stderr:''};
+  return{code:1,stdout:'',stderr:'',cwd:'/home/user/app'};
+ }};
+ const task=createPiTask({linux:{cwd:'/home/user/app'},workspace,network:{options:()=>({enabled:false})},onEvent:e=>{if(e.type==='tool-result')results.push(e.result.content[0].text)},turn:async()=>{
+  n++;return{text:n===1?'<tool_call>'+JSON.stringify({name:'bash',arguments:{command:"cd app && grep -n 'def add' test_calc.py"}})+'</tool_call>':'Done.',reason:'end'};
+ }});
+ await task.run('Find add');
+ assert.match(results[0],/grep found no "def add" in test_calc\.py\. It is in calc\.py\./);
+ assert.doesNotMatch(results[0],/stopped at the first error/);
+});
+
+test('an answer without a link, when sources were asked for, is sent back with the pages opened',async()=>{
+ const prompts=[];let n=0;
+ const network={options:()=>({enabled:true}),run:async(name)=>name==='open_url'?{text:'Lit in 1887.',sources:[{title:'Lighthouse',url:'https://en.wikipedia.org/wiki/Lighthouse'}]}:{text:'',sources:[]}};
+ const task=createPiTask({workspace:{request:async()=>({})},network,turn:async(messages)=>{
+  n++;prompts.push(JSON.stringify(messages.at(-1)));
+  if(n===1)return{text:'<tool_call>'+JSON.stringify({name:'open_url',arguments:{url:'https://en.wikipedia.org/wiki/Lighthouse'}})+'</tool_call>',reason:'end'};
+  if(n===2)return{text:'It was first lit in 1887. Source: Lighthouse (Wikipedia)',reason:'end'};
+  return{text:'It was first lit in 1887. Source: https://en.wikipedia.org/wiki/Lighthouse',reason:'end'};
+ }});
+ await task.run('When was the lighthouse first lit? Cite a link.');
+ assert.equal(n,3);
+ assert.match(prompts[2],/your answer has no link\. Give your answer again with the link of the page it came from\. Pages you opened: https:\/\/en\.wikipedia\.org\/wiki\/Lighthouse/);
+});
+
+test('a button clicked again on the same page is held once and explained, then allowed', async () => {
+  const pages = { 'https://shop.example/': '# Shop\nCart: 1 item(s)\n[1] button "Add Red Kettle to cart"  [2] button "Add Blue Kettle to cart"' };
+  const browser = fakeBrowser(pages); let n = 0; const seen = [];
+  const task = createPiTask({ browser, workspace: { request: async () => ({}) }, network, turn: async (messages) => {
+    if (n) seen.push(messages.at(-1).content);
+    n++;
+    if (n === 1) return call('browser_open', { url: 'https://shop.example/' });
+    if (n <= 4) return call('browser_click', { ref: 2 });
+    if (n === 5) return call('browser_click', { ref: 1 });
+    return { text: 'Done.', reason: 'end' };
+  } });
+  await task.run('Add the blue kettle to the cart');
+  assert.deepEqual(browser.log.filter(l => l[0] === 'click').map(l => l[1]), [2, 2, 1]);
+  assert.match(JSON.stringify(seen[2]), /was not done: you already clicked button \\"Add Blue Kettle to cart\\" on this page, and the page then said: \\"Cart: 1 item\(s\)\\"/);
+});
+
+test('a model that reads images gets the newest page screenshot with the browser result', async () => {
+  const browser = fakeBrowser({ 'https://shop.example/': '# Shop\n[1] button "Buy"' });
+  let shots = 0;
+  browser.screenshot = async ({ unit, maxSide }) => { shots++; return { rgb: new Uint8Array(unit * unit * 3), width: unit, height: unit, maxSide, shot: shots }; };
+  let n = 0, seen = null, system = '';
+  const task = createPiTask({ browser, vision: { unit: 32 }, workspace: { request: async () => ({}) }, network, turn: async (messages) => {
+    n++;
+    system = messages[0].content;
+    if (n === 1) return call('browser_open', { url: 'https://shop.example/' });
+    if (n === 2) return call('browser_snapshot', {});
+    seen = messages; return { text: 'A shop.', reason: 'end' };
+  } });
+  await task.run('What is on the page?');
+  const tools = seen.filter((m) => m.role === 'tool');
+  assert.equal(tools.length, 2);
+  assert.equal(tools[0].images, undefined);
+  assert.deepEqual([tools[1].images.length, tools[1].images[0].width, tools[1].images[0].shot], [1, 32, 2]);
+  assert.match(system, /screenshot of the page/);
+  // Without vision: no screenshots, no prompt about them.
+  const plain = fakeBrowser({ 'https://shop.example/': '# Shop' });
+  plain.screenshot = async () => { throw new Error('not asked for'); };
+  let m = 0, prompt = '';
+  await createPiTask({ browser: plain, workspace: { request: async () => ({}) }, network, turn: async (messages) => { m++; prompt = messages[0].content; return m === 1 ? call('browser_open', { url: 'https://shop.example/' }) : { text: 'ok', reason: 'end' }; } }).run('Look');
+  assert.doesNotMatch(prompt, /screenshot of the page/);
+});
+
+test('vision models can click a point of the screenshot: it becomes the element there, with the same checks', async () => {
+  const pages = { 'https://shop.example/': '# Shop\n[1] button "Add Kettle to cart"  [2] button "Place order"' };
+  const browser = fakeBrowser(pages);
+  browser.screenshot = async ({ unit }) => ({ rgb: new Uint8Array(unit * unit * 3), width: unit, height: unit });
+  const asked = [];
+  browser.refAt = async (x, y) => { asked.push([x, y]); return y < 400 ? { ok: true, ref: 1 } : { ok: true, ref: 2 }; };
+  const snapshot = browser.snapshot;
+  browser.snapshot = async (max) => ({ ...(await snapshot(max)), viewportWidth: 1000, viewportHeight: 800 });
+  let n = 0; const seen = []; let tools = [];
+  const task = createPiTask({ browser, vision: { unit: 32 }, workspace: { request: async () => ({}) }, network, turn: async (messages, schemas) => {
+    if (n) seen.push(JSON.stringify(messages.at(-1).content)); else tools = schemas.map((t) => t.function?.name || t.name);
+    n++;
+    if (n === 1) return call('browser_open', { url: 'https://shop.example/' });
+    if (n === 2) return call('browser_click_at', { x: 500, y: 250 });
+    if (n === 3) return call('browser_click_at', { x: 500, y: 900 });
+    if (n === 4) return call('browser_click_at', { x: 1500, y: 10 });
+    return { text: 'Done.', reason: 'end' };
+  } });
+  await task.run('Add the kettle');
+  assert(tools.includes('browser_click_at'));
+  assert.deepEqual(asked, [[500, 200], [500, 720]]);
+  assert.deepEqual(browser.log.filter((l) => l[0] === 'click').map((l) => l[1]), [1]);
+  assert.match(seen[2], /needs the person's approval/);
+  assert.match(seen[3], /x and y go from 0 to 1000/);
 });

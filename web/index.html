@@ -148,6 +148,7 @@
         <small>On laptops with two GPUs, power saving usually picks the integrated one. Used when a model loads.</small>
       </label>
       <label class="check"><input type="checkbox" name="poolGpus"> Use both GPUs when a model does not fit on the faster one</label>
+      <label class="check"><input type="checkbox" name="autoSwitch"> Switch to the saved model that does each kind of request best (coding, research, law, browsing)</label>
       <small>With Highest performance on a computer with two GPUs: the faster runs as many layers as its free memory holds, and the other GPU the rest, instead of reading them from storage.</small>
       <label class="block">GPU memory for the model
         <select name="gpuMemory">

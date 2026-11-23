@@ -7,6 +7,18 @@ const MIT = { license: 'MIT', licenseUrl: 'https://opensource.org/license/mit' }
 const KIMI = { license: 'Modified MIT', licenseUrl: 'https://huggingface.co/moonshotai/Kimi-K2-Instruct-0905/blob/main/LICENSE' };
 const KIMI_K31 = { license: 'Kimi K3.1 Pro License', licenseUrl: 'https://huggingface.co/moonshotai/Kimi-K3.1-Pro/blob/main/LICENSE' };
 
+/** For each kind of request (web/chat-development.mjs kindOf), the catalog models that did that
+ *  work best in tests/agent_bench.py, best first. With "Switch models by kind of request" on, the
+ *  chat loads the first one saved on this device before answering. Measured on a laptop with an
+ *  RTX 3050 and an Intel GPU (2026-11-22); update from new benchmark runs. */
+export const BEST_FOR = {
+  coding: ['qwen3-4b', 'qwen3-4b-2507'],
+  research: ['qwen3-4b-2507', 'qwen3-4b'],
+  law: ['qwen3-4b-2507', 'qwen3-4b'],
+  browser: ['qwen3-4b-2507', 'qwen3-4b'],
+  chat: ['qwen3-4b-2507', 'qwen3-4b'],
+};
+
 export const MODELS = [
   { id: 'smollm2-135m', name: 'SmolLM2 135M', maker: 'Hugging Face', repo: 'bartowski/SmolLM2-135M-Instruct-GGUF',
     file: 'SmolLM2-135M-Instruct-Q8_0.gguf', bytes: 144811360, quant: 'Q8_0', note: 'Tiny. A quick first test.', ...APACHE },
@@ -32,6 +44,18 @@ export const MODELS = [
     file: 'Qwen3-4B-Q4_K_M.gguf', bytes: 2497280256, quant: 'Q4_K_M', note: 'Largest here. Needs about 3.5 GB of GPU memory.', thinking: true, ...APACHE },
   { id: 'qwen3-4b-2507', name: 'Qwen3 4B Instruct 2507', maker: 'Qwen', repo: 'unsloth/Qwen3-4B-Instruct-2507-GGUF',
     file: 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf', bytes: 2497281120, quant: 'Q4_K_M', note: 'The July 2025 update of Qwen3 4B: better at using tools. A good coding assistant for most computers.', ...APACHE },
+  { id: 'qwen3-4b-thinking-2507', name: 'Qwen3 4B Thinking 2507', maker: 'Qwen', repo: 'unsloth/Qwen3-4B-Thinking-2507-GGUF',
+    file: 'Qwen3-4B-Thinking-2507-Q4_K_M.gguf', bytes: 2497281152, quant: 'Q4_K_M', note: 'Thinks before it answers: stronger with tools, slower to reply.', thinking: true, ...APACHE },
+  { id: 'qwen3-vl-2b', name: 'Qwen3-VL 2B', maker: 'Qwen', repo: 'Qwen/Qwen3-VL-2B-Instruct-GGUF',
+    file: 'Qwen3VL-2B-Instruct-Q4_K_M.gguf', bytes: 1107409952, quant: 'Q4_K_M', note: 'Sees images: reads screenshots and pictures you give it. Downloads its image encoder too.',
+    vision: { file: 'mmproj-Qwen3VL-2B-Instruct-F16.gguf', bytes: 819394848 }, ...APACHE },
+  { id: 'gui-owl-1.5-4b', name: 'GUI-Owl 1.5 4B', maker: 'mPLUG (Alibaba)', repo: 'mradermacher/GUI-Owl-1.5-4B-Instruct-GGUF',
+    file: 'GUI-Owl-1.5-4B-Instruct.Q4_K_M.gguf', bytes: 2497282208, quant: 'Q4_K_M', note: 'Trained to use computers: reads screenshots and points at what to click. Downloads its image encoder too.',
+    vision: { file: 'GUI-Owl-1.5-4B-Instruct.mmproj-f16.gguf', bytes: 836180288 }, ...MIT },
+  { id: 'qwen3.5-4b', name: 'Qwen3.5 4B', maker: 'Qwen', repo: 'unsloth/Qwen3.5-4B-GGUF',
+    file: 'Qwen3.5-4B-Q4_K_M.gguf', bytes: 2740937888, quant: 'Q4_K_M', note: 'The February 2026 generation: a linear-attention hybrid, much stronger than Qwen3 4B, with a far smaller cache for long chats.', thinking: true, ...APACHE },
+  { id: 'nanbeige4.1-3b', name: 'Nanbeige4.1 3B', maker: 'Nanbeige', repo: 'mradermacher/Nanbeige4.1-3B-GGUF',
+    file: 'Nanbeige4.1-3B.Q4_K_M.gguf', bytes: 2443113024, quant: 'Q4_K_M', note: 'A 3B model that leads small models at calling tools. Thinks before it answers.', thinking: true, ...APACHE },
 ];
 
 // Mixture-of-experts models. The ones larger than GPU memory keep their attention weights on the

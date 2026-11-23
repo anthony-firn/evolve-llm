@@ -19,6 +19,9 @@ pub enum Arch {
     Deepseek2,
     /// OLMoE: experts, with RMSNorm over the whole query and key projections.
     Olmoe,
+    /// Qwen3.5: Gated DeltaNet (a linear-attention recurrence with one decay per head) in three
+    /// of every four layers, attention with a sigmoid output gate in the fourth.
+    Qwen35,
     /// Kimi K3.1: Kimi delta attention (a linear-attention recurrence) in most layers, latent
     /// attention without rotation in the rest, residuals that attend across earlier blocks,
     /// and experts that work in a smaller latent space.
@@ -83,13 +86,31 @@ pub struct Kda {
     pub conv: usize,
     /// Decay gates are `lower_bound * sigmoid(...)`, so each step keeps at least exp(lower_bound).
     pub gate_lower_bound: f32,
-    /// Which layers use it; the others use latent attention.
+    /// Which layers use it; the others use attention.
     pub layers: Vec<bool>,
+    /// Query and key heads; value head h reads query and key head h % n_k_head (Gated DeltaNet
+    /// may have fewer than value heads).
+    pub n_k_head: usize,
+    /// Gated DeltaNet (Qwen3.5): one decay per head, exp(ssm_a * softplus(alpha + dt)); query, key
+    /// and value from one projection and one convolution; a SiLU output gate.
+    pub gdn: bool,
+    /// Gated DeltaNet files from newer converters merge attn_qkv with attn_gate (attn_qkv_gate:
+    /// the channels, then the gate) and ssm_beta with ssm_alpha (ssm_beta_alpha).
+    pub merged: bool,
 }
 
 impl Kda {
+    /// Width of the values (and the output).
     pub fn width(&self) -> usize {
         self.n_head * self.head_dim
+    }
+    /// Width of the queries (and the keys).
+    pub fn k_width(&self) -> usize {
+        self.n_k_head * self.head_dim
+    }
+    /// Channels of the convolution: queries, keys and values.
+    pub fn channels(&self) -> usize {
+        2 * self.k_width() + self.width()
     }
 }
 
@@ -132,6 +153,17 @@ pub struct Config {
     pub rope_dim: usize,
     /// NeoX-style rotation pairs (i, i + d/2) instead of adjacent pairs.
     pub rope_neox: bool,
+    /// Multimodal rotary positions (qwen2vl): rotary pairs per section (time, height, width),
+    /// each section rotated by its own position. None for text-only models.
+    pub rope_sections: Option<[usize; 3]>,
+    /// Sections interleaved pair by pair (Qwen3-VL, Qwen3.5) instead of contiguous (Qwen2-VL).
+    pub rope_interleaved: bool,
+    /// The query projection also gives each head an output gate (Qwen3.5): per head, head_dim
+    /// query values then head_dim gate values; attention output is multiplied by sigmoid(gate).
+    pub q_gate: bool,
+    /// Layers after which image features from the vision encoder's deepstack are added to the
+    /// image tokens (Qwen3-VL: the first 3).
+    pub deepstack: usize,
     /// Linear position scaling factor (1 = none).
     pub rope_linear_scale: f32,
     pub has_rope_freqs: bool,
@@ -162,6 +194,10 @@ pub struct Config {
 impl Config {
     pub fn q_dim(&self) -> usize {
         self.n_head * self.head_dim
+    }
+    /// The norm before each layer's feed-forward block.
+    pub fn ffn_norm(&self) -> &'static str {
+        if self.arch == Arch::Qwen35 { "post_attention_norm.weight" } else { "ffn_norm.weight" }
     }
     pub fn kv_dim(&self) -> usize {
         self.n_head_kv * self.head_dim
@@ -207,19 +243,33 @@ pub fn arch_of(g: &Gguf) -> Result<Arch, String> {
         .ok_or("missing general.architecture")?;
     Ok(match arch {
         "llama" | "mistral" => Arch::Llama,
-        "qwen2" => Arch::Qwen2,
+        // Qwen2-VL and Qwen2.5-VL (and their fine-tunes such as UI-TARS and Holo): Qwen2 with
+        // multimodal rotary positions, which equal plain ones for text.
+        "qwen2" | "qwen2vl" => Arch::Qwen2,
+        // Qwen3-VL and its fine-tunes (GUI-Owl, Holo2, MAI-UI): Qwen3 with interleaved
+        // multimodal rotary positions.
+        "qwen3vl" => Arch::Qwen3,
+        "qwen3vlmoe" => Arch::Qwen3Moe,
         "qwen3" => Arch::Qwen3,
         "qwen3moe" => Arch::Qwen3Moe,
         "deepseek2" => Arch::Deepseek2,
         "olmoe" => Arch::Olmoe,
         // Kimi K3 is the same model without the sparse-attention indexer.
         "kimi-k31" | "kimi-k3" => Arch::KimiK31,
+        "qwen35" => Arch::Qwen35,
         other => {
             return Err(format!(
                 "the {other} architecture is not supported yet (supported: llama, mistral, qwen2, qwen3, qwen3moe, deepseek2, olmoe, kimi-k3, kimi-k31)"
             ))
         }
     })
+}
+
+/// Rotary pairs per multimodal section (time, height, width), from `ARCH.rope.dimension_sections`.
+pub fn rope_sections(g: &Gguf, prefix: &str) -> Option<[usize; 3]> {
+    let a = g.get(&format!("{prefix}.rope.dimension_sections"))?.as_array()?;
+    let n: Vec<usize> = a.iter().filter_map(|x| x.as_u64()).map(|x| x as usize).collect();
+    (n.len() >= 3 && n[..3].iter().any(|&x| x > 0)).then(|| [n[0], n[1], n[2]])
 }
 
 pub fn config(g: &Gguf) -> Result<Config, String> {
@@ -342,13 +392,14 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
         (None, _) => (1.0, 1.0 / (head_dim as f32).sqrt()),
     };
     let first_attn = if arch == Arch::Deepseek2 { "blk.0.attn_kv_a_mqa.weight" } else { "blk.0.attn_q.weight" };
-    if arch != Arch::KimiK31 && g.tensor(first_attn).is_none() && g.tensor("blk.0.attn_qkv.weight").is_some() {
+    if !matches!(arch, Arch::KimiK31 | Arch::Qwen35) && g.tensor(first_attn).is_none() && g.tensor("blk.0.attn_qkv.weight").is_some() {
         return Err("fused attn_qkv tensors are not supported yet".into());
     }
     if g.tensor(&format!("blk.{}.ffn_gate_up_exps.weight", moe.as_ref().map_or(0, |m| m.dense_lead))).is_some() {
         return Err("fused ffn_gate_up_exps tensors are not supported yet".into());
     }
-    let n_layer = need("block_count")?;
+    // Next-token-prediction (MTP) layers are counted in block_count but not run for a reply.
+    let n_layer = need("block_count")? - opt("nextn_predict_layers").unwrap_or(0);
     let kda = match (arch, &kv_per_layer) {
         (Arch::KimiK31, Some(per)) => {
             if per.len() != n_layer {
@@ -360,6 +411,33 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
                 conv: need("ssm.conv_kernel")?,
                 gate_lower_bound: g.f64(&key("kda.gate_lower_bound")).unwrap_or(f64::NEG_INFINITY) as f32,
                 layers: per.iter().map(|&v| v == 0).collect(),
+                n_k_head: n_head,
+                gdn: false,
+                merged: false,
+            })
+        }
+        (Arch::Qwen35, _) => {
+            let interval = need("full_attention_interval")?;
+            let (hk, hv, dk, inner) = (need("ssm.group_count")?, need("ssm.time_step_rank")?, need("ssm.state_size")?, need("ssm.inner_size")?);
+            if dk != 128 || inner != hv * dk || hk == 0 || hv % hk != 0 {
+                return Err(format!("Gated DeltaNet with {hk} key heads, {hv} value heads, key size {dk} and width {inner} is not supported yet (heads of 128)"));
+            }
+            // Which layers are recurrent: listed in newer files, else every layer but each
+            // interval-th.
+            let layers: Vec<bool> = match g.get(&key("attention.recurrent_layers")).and_then(|v| v.as_array()) {
+                Some(a) => a.iter().take(n_layer).map(|v| v.as_bool().unwrap_or(false)).collect(),
+                None => (0..n_layer).map(|l| (l + 1) % interval.max(1) != 0).collect(),
+            };
+            let first = layers.iter().position(|&x| x).unwrap_or(0);
+            Some(Kda {
+                n_head: hv,
+                head_dim: dk,
+                conv: need("ssm.conv_kernel")?,
+                gate_lower_bound: 0.0,
+                merged: g.tensor(&format!("blk.{first}.attn_qkv_gate.weight")).is_some(),
+                layers,
+                n_k_head: hk,
+                gdn: true,
             })
         }
         (Arch::KimiK31, None) => return Err("Kimi K3 files list attention.head_count_kv per layer".into()),
@@ -408,11 +486,15 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
             .map(|v| v as usize)
             .unwrap_or(head_dim),
         rope_neox: !matches!(arch, Arch::Llama | Arch::Deepseek2),
+        rope_sections: rope_sections(g, &prefix),
+        rope_interleaved: prefix.starts_with("qwen3vl") || prefix.starts_with("qwen35"),
+        q_gate: arch == Arch::Qwen35,
+        deepstack: g.u64(&key("n_deepstack_layers")).unwrap_or(0) as usize,
         rope_linear_scale,
         has_rope_freqs: g.tensor("rope_freqs.weight").is_some(),
         tied_embeddings: g.tensor("output.weight").is_none(),
         qkv_bias: g.tensor("blk.0.attn_q.bias").is_some(),
-        qk_norm: g.tensor("blk.0.attn_q_norm.weight").is_some(),
+        qk_norm: g.tensor(&format!("blk.{first_mla}.attn_q_norm.weight")).is_some(),
         qk_norm_full: arch == Arch::Olmoe,
         moe,
         mla,
@@ -517,6 +599,19 @@ pub fn matrices(c: &Config) -> Vec<(String, usize, usize, usize)> {
     for i in 0..c.n_layer {
         let b = |s: &str| format!("blk.{i}.{s}.weight");
         match &c.mla {
+            _ if c.kda.as_ref().is_some_and(|k| k.gdn) && c.is_kda(i) => {
+                let k = c.kda.as_ref().unwrap();
+                if k.merged {
+                    m.push((b("attn_qkv_gate"), k.channels() + k.width(), c.n_embd, 1));
+                    m.push((b("ssm_beta_alpha"), 2 * k.n_head, c.n_embd, 1));
+                } else {
+                    m.push((b("attn_qkv"), k.channels(), c.n_embd, 1));
+                    m.push((b("attn_gate"), k.width(), c.n_embd, 1));
+                    m.push((b("ssm_alpha"), k.n_head, c.n_embd, 1));
+                    m.push((b("ssm_beta"), k.n_head, c.n_embd, 1));
+                }
+                m.push((b("ssm_out"), c.n_embd, k.width(), 1));
+            }
             _ if c.is_kda(i) => {
                 let k = c.kda.as_ref().unwrap();
                 let d = k.width();
@@ -550,7 +645,7 @@ pub fn matrices(c: &Config) -> Vec<(String, usize, usize, usize)> {
                 m.push((b("attn_output"), c.n_embd, c.n_head * a.v_dim, 1));
             }
             None => {
-                m.push((b("attn_q"), c.q_dim(), c.n_embd, 1));
+                m.push((b("attn_q"), if c.q_gate { 2 * c.q_dim() } else { c.q_dim() }, c.n_embd, 1));
                 m.push((b("attn_k"), c.kv_dim(), c.n_embd, 1));
                 m.push((b("attn_v"), c.kv_dim(), c.n_embd, 1));
                 m.push((b("attn_output"), c.n_embd, c.q_dim(), 1));
@@ -594,16 +689,21 @@ pub fn vectors(c: &Config) -> Vec<(String, usize)> {
     }
     for i in 0..c.n_layer {
         v.push((format!("blk.{i}.attn_norm.weight"), c.n_embd));
-        v.push((format!("blk.{i}.ffn_norm.weight"), c.n_embd));
+        v.push((format!("blk.{i}.{}", c.ffn_norm()), c.n_embd));
         if c.attn_res_block > 0 {
             v.push((format!("blk.{i}.attn_res_score.weight"), c.n_embd));
             v.push((format!("blk.{i}.ffn_res_score.weight"), c.n_embd));
         }
         if let Some(k) = c.kda.as_ref().filter(|_| c.is_kda(i)) {
-            for x in ["q", "k", "v"] {
-                v.push((format!("blk.{i}.ssm_conv1d_{x}.weight"), k.width() * k.conv));
+            if k.gdn {
+                v.push((format!("blk.{i}.ssm_conv1d.weight"), k.channels() * k.conv));
+                v.push((format!("blk.{i}.ssm_dt.bias"), k.n_head));
+            } else {
+                for x in ["q", "k", "v"] {
+                    v.push((format!("blk.{i}.ssm_conv1d_{x}.weight"), k.width() * k.conv));
+                }
+                v.push((format!("blk.{i}.ssm_dt.bias"), k.width()));
             }
-            v.push((format!("blk.{i}.ssm_dt.bias"), k.width()));
             v.push((format!("blk.{i}.ssm_a"), k.n_head));
             v.push((format!("blk.{i}.ssm_norm.weight"), k.head_dim));
             if let Some(e) = c.moe.as_ref().filter(|e| e.probs_bias && c.is_moe(i)) {
@@ -663,4 +763,67 @@ pub fn rope_inv_freq(c: &Config, i: usize, factors: Option<&[f32]>) -> f32 {
         return (base / y.factor * (1.0 - mix) + base * mix) / f;
     }
     base / f / c.rope_linear_scale
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A GGUF header with string, u32 and u32-array keys and F32 tensor infos (no data needed).
+    fn header(keys: &[(&str, &dyn Fn(&mut Vec<u8>))], tensors: &[(&str, &[u64])]) -> Vec<u8> {
+        let s = |b: &mut Vec<u8>, t: &str| {
+            b.extend((t.len() as u64).to_le_bytes());
+            b.extend(t.as_bytes());
+        };
+        let mut b = Vec::new();
+        b.extend(b"GGUF");
+        b.extend(3u32.to_le_bytes());
+        b.extend((tensors.len() as u64).to_le_bytes());
+        b.extend((keys.len() as u64).to_le_bytes());
+        for (k, v) in keys {
+            s(&mut b, k);
+            v(&mut b);
+        }
+        for (name, dims) in tensors {
+            s(&mut b, name);
+            b.extend((dims.len() as u32).to_le_bytes());
+            for d in *dims {
+                b.extend(d.to_le_bytes());
+            }
+            b.extend(0u32.to_le_bytes());
+            b.extend(0u64.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn qwen2vl_loads_as_qwen2_with_rotary_sections() {
+        let text = |v: &'static str| move |b: &mut Vec<u8>| {
+            b.extend(8u32.to_le_bytes());
+            b.extend((v.len() as u64).to_le_bytes());
+            b.extend(v.as_bytes());
+        };
+        let int = |v: u32| move |b: &mut Vec<u8>| {
+            b.extend(4u32.to_le_bytes());
+            b.extend(v.to_le_bytes());
+        };
+        let sections = |b: &mut Vec<u8>| {
+            b.extend(9u32.to_le_bytes());
+            b.extend(5u32.to_le_bytes());
+            b.extend(4u64.to_le_bytes());
+            for x in [16i32, 24, 24, 0] {
+                b.extend(x.to_le_bytes());
+            }
+        };
+        let (arch, n_embd, blocks, heads, kv, ff) = (text("qwen2vl"), int(256), int(2), int(4), int(2), int(512));
+        let bytes = header(
+            &[("general.architecture", &arch), ("qwen2vl.embedding_length", &n_embd), ("qwen2vl.block_count", &blocks), ("qwen2vl.attention.head_count", &heads),
+              ("qwen2vl.attention.head_count_kv", &kv), ("qwen2vl.feed_forward_length", &ff), ("qwen2vl.rope.dimension_sections", &sections)],
+            &[("token_embd.weight", &[256, 1000]), ("blk.0.attn_q.weight", &[256, 256]), ("blk.0.attn_k.weight", &[256, 128]), ("blk.0.attn_q.bias", &[256])],
+        );
+        let g = crate::gguf::parse(&bytes).unwrap();
+        assert_eq!(arch_of(&g).unwrap(), Arch::Qwen2);
+        assert_eq!(rope_sections(&g, "qwen2vl"), Some([16, 24, 24]));
+        assert_eq!(rope_sections(&g, "qwen2"), None);
+    }
 }

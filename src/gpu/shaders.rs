@@ -55,7 +55,8 @@ fn gate(g: f32, v: f32) -> f32 {
     return g / (1.0 + exp(-g)) * v;
 }
 
-// Modes: 0 store, 1 add, 2 SiLU gate, 4 situ gate, 5 multiply by sigmoid (an output gate).
+// Modes: 0 store, 1 add, 2 SiLU gate, 4 situ gate, 5 multiply by sigmoid (an output gate),
+// 6 multiply by SiLU (Gated DeltaNet's output gate).
 fn finish(t: u32, r: u32, acc: f32) {
     var v = acc;
     if (p.has_bias == 1u) { v += bias[p.out_offset + r]; }
@@ -66,6 +67,8 @@ fn finish(t: u32, r: u32, acc: f32) {
         y[i] = y[i] + v;
     } else if (p.mode == 5u) {
         y[i] = y[i] / (1.0 + exp(-v));
+    } else if (p.mode == 6u) {
+        y[i] = y[i] * v / (1.0 + exp(-v));
     } else {
         y[i] = gate(y[i], v);
     }
@@ -463,7 +466,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /// Rotary position embedding on queries (in place) and keys, then store keys
 /// and values in the f16 cache at their positions.
 pub const ROPE: &str = r#"
-struct P { n_head: u32, n_kv: u32, head_dim: u32, half_rot: u32, neox: u32, kv_dim: u32, q_dim: u32, rot_offset: u32 }
+// s0, s1, s2: rotary pairs in the time, height and width sections of multimodal positions.
+// Contiguous sections (Qwen2-VL), or interleaved (Qwen3-VL: pair i is height when i % 3 == 1 and
+// i < 3 * s1, width when i % 3 == 2 and i < 3 * s2, else time). Text-only models: all in s0.
+struct P { n_head: u32, n_kv: u32, head_dim: u32, half_rot: u32, neox: u32, kv_dim: u32, q_dim: u32, rot_offset: u32, s0: u32, s1: u32, s2: u32, interleaved: u32 }
 @group(0) @binding(1) var<uniform> p: P;
 @group(0) @binding(2) var<storage, read_write> q: array<f32>;
 @group(0) @binding(3) var<storage, read> k: array<f32>;
@@ -471,20 +477,34 @@ struct P { n_head: u32, n_kv: u32, head_dim: u32, half_rot: u32, neox: u32, kv_d
 @group(0) @binding(5) var<storage, read_write> kc: array<u32>;
 @group(0) @binding(6) var<storage, read_write> vc: array<u32>;
 @group(0) @binding(7) var<storage, read> table: array<vec2<f32>>;
+@group(0) @binding(8) var<storage, read> mpos: array<u32>;
 
-fn rot_k(base: u32, d: u32, cs_base: u32) -> f32 {
+// The rotary position of chunk token t for pair i: its cache slot plus an offset (step.pad1)
+// normally; with step.pad0 == 1, the (time, height, width) positions given per token, the pair's
+// section choosing one (multimodal positions: image tokens, and text after an image).
+fn rpos(t: u32, i: u32) -> u32 {
+    if (step.pad0 == 0u) { return u32(i32(step.pos0 + t) + bitcast<i32>(step.pad1)); }
+    var sec = 0u;
+    if (p.interleaved == 1u) {
+        if (i % 3u == 1u && i < 3u * p.s1) { sec = 1u; } else if (i % 3u == 2u && i < 3u * p.s2) { sec = 2u; }
+    } else if (i >= p.s0 + p.s1) { sec = 2u; } else if (i >= p.s0) { sec = 1u; }
+    return mpos[t * 3u + sec];
+}
+fn cs_at(t: u32, i: u32) -> vec2<f32> { return table[rpos(t, i) * p.half_rot + i]; }
+
+fn rot_k(base: u32, d: u32, t: u32) -> f32 {
     let x = k[base + d];
     if (d >= 2u * p.half_rot) { return x; }
     if (p.neox == 1u) {
         let h = p.half_rot;
         if (d < h) {
-            let cs = table[cs_base + d];
+            let cs = cs_at(t, d);
             return x * cs.x - k[base + d + h] * cs.y;
         }
-        let cs = table[cs_base + d - h];
+        let cs = cs_at(t, d - h);
         return k[base + d - h] * cs.y + x * cs.x;
     }
-    let cs = table[cs_base + d / 2u];
+    let cs = cs_at(t, d / 2u);
     if ((d & 1u) == 0u) { return x * cs.x - k[base + d + 1u] * cs.y; }
     return k[base + d - 1u] * cs.y + x * cs.x;
 }
@@ -493,12 +513,11 @@ fn rot_k(base: u32, d: u32, cs_base: u32) -> f32 {
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let t = wg.y;
     let pos = step.pos0 + t;
-    let cs_base = pos * p.half_rot;
     let hd = p.head_dim;
     if (wg.x < p.n_head) {
         let base = t * p.q_dim + wg.x * hd + p.rot_offset;
         for (var i = li; i < p.half_rot; i += 64u) {
-            let cs = table[cs_base + i];
+            let cs = cs_at(t, i);
             var a = base + 2u * i;
             var b = a + 1u;
             if (p.neox == 1u) { a = base + i; b = base + i + p.half_rot; }
@@ -514,7 +533,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let cache = (pos * p.kv_dim + kvh * hd) >> 1u;
     for (var e = li; e < hd / 2u; e += 64u) {
         let d = 2u * e;
-        kc[cache + e] = pack2x16float(vec2<f32>(rot_k(base, d, cs_base), rot_k(base, d + 1u, cs_base)));
+        kc[cache + e] = pack2x16float(vec2<f32>(rot_k(base, d, t), rot_k(base, d + 1u, t)));
         vc[cache + e] = pack2x16float(vec2<f32>(v[base + d], v[base + d + 1u]));
     }
 }
@@ -1308,11 +1327,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 ///   S_ij    = S_ij decay_i + k_i d_j
 ///   o_j     = scale * sum_i S_ij q_i
 pub const KDA: &str = r#"
-struct P { n_head: u32, d: u32, tstride: u32, scale: f32, lb: f32, pad0: u32, pad1: u32, pad2: u32 }
+// mode 0: Kimi delta attention (a decay per key channel: exp(lb * sigmoid(-a * (gate + dt))));
+// mode 1: Gated DeltaNet (one decay per head: exp(a * softplus(gate + dt)), with a = -exp(A_log)).
+// dk: width of the queries and keys; nk: their heads (value head h reads head h % nk).
+// bstride, boff: where a token's beta logits are (merged with the decay gates in some files);
+// gstride, goff: likewise for the per-head decay gates (mode 1).
+struct P { n_head: u32, d: u32, tstride: u32, scale: f32, lb: f32, mode: u32, dk: u32, nk: u32, bstride: u32, boff: u32, gstride: u32, goff: u32 }
 @group(0) @binding(1) var<uniform> p: P;
-// Per token: q (d), k (d), v (d), after the convolution, q and k L2-normalised.
+// Per token: q (dk), k (dk), v (d), after the convolution, q and k L2-normalised.
 @group(0) @binding(2) var<storage, read> qkv: array<f32>;
-// Per token: the decay gate before its bias and activation (d), and beta logits (n_head).
+// Per token: the decay gate before its bias and activation (d, or n_head in mode 1), and beta
+// logits (n_head).
 @group(0) @binding(3) var<storage, read> gk: array<f32>;
 @group(0) @binding(4) var<storage, read> beta: array<f32>;
 @group(0) @binding(5) var<storage, read> dt: array<f32>;
@@ -1328,20 +1353,32 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let h = wg.x / 2u;
     let j = (wg.x % 2u) * 64u + li;
     let hb = h * 128u;
+    let kb = (h % p.nk) * 128u;
     let sb = h * 16384u;
     let ah = -a[h];
     var fresh = step.pos0 == 0u;
     for (var t = 0u; t < step.n_tokens; t++) {
         let tb = t * p.tstride;
+        var head_decay = 0.0;
+        if (p.mode == 1u) {
+            let x = gk[t * p.gstride + p.goff + h] + dt[h];
+            var sp = x;
+            if (x < 20.0) { sp = log(1.0 + exp(x)); }
+            head_decay = exp(a[h] * sp);
+        }
         for (var i = li; i < 128u; i += 64u) {
-            qs[i] = qkv[tb + hb + i];
-            ks[i] = qkv[tb + p.d + hb + i];
-            let g = gk[t * p.d + hb + i] + dt[hb + i];
-            es[i] = exp(p.lb / (1.0 + exp(-ah * g)));
+            qs[i] = qkv[tb + kb + i];
+            ks[i] = qkv[tb + p.dk + kb + i];
+            if (p.mode == 1u) {
+                es[i] = head_decay;
+            } else {
+                let g = gk[t * p.d + hb + i] + dt[hb + i];
+                es[i] = exp(p.lb / (1.0 + exp(-ah * g)));
+            }
         }
         workgroupBarrier();
-        let v = qkv[tb + 2u * p.d + hb + j];
-        let b = 1.0 / (1.0 + exp(-beta[t * p.n_head + h]));
+        let v = qkv[tb + 2u * p.dk + hb + j];
+        let b = 1.0 / (1.0 + exp(-beta[t * p.bstride + p.boff + h]));
         var sk = 0.0;
         if (!fresh) {
             for (var i = 0u; i < 128u; i++) { sk += state[sb + i * 128u + j] * es[i] * ks[i]; }
@@ -1361,8 +1398,62 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// Qwen3.5's gates: mode 0 splits the query projection (per head: head_dim query values, then
+/// head_dim gate values) into the query and the gate; mode 1 multiplies the attention output by
+/// sigmoid(gate); mode 2 multiplies by SiLU of a gate read from `qg` at (token stride, offset)
+/// (Gated DeltaNet's output gate, merged into its input projection).
+pub const QGATE: &str = r#"
+struct P { q_dim: u32, hd: u32, mode: u32, stride: u32, off: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read> qg: array<f32>;
+@group(0) @binding(3) var<storage, read_write> a: array<f32>;
+@group(0) @binding(4) var<storage, read_write> g: array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wg.y;
+    let j = wg.x * 256u + li;
+    if (j >= p.q_dim) { return; }
+    let i = t * p.q_dim + j;
+    if (p.mode == 0u) {
+        let src = t * 2u * p.q_dim + (j / p.hd) * 2u * p.hd + j % p.hd;
+        a[i] = qg[src];
+        g[i] = qg[src + p.hd];
+    } else if (p.mode == 1u) {
+        a[i] = a[i] / (1.0 + exp(-g[i]));
+    } else {
+        let z = qg[t * p.stride + p.off + j];
+        a[i] = a[i] * z / (1.0 + exp(-z));
+    }
+}
+"#;
+
+pub fn qgate() -> String {
+    format!("{COMMON}{QGATE}")
+}
+
 pub fn res_mix() -> String {
     format!("{COMMON}{RES_MIX}")
+}
+
+/// Deepstack: after an early layer, add that layer's image features (zero for text tokens) to the
+/// hidden states, when the pass carries them (step.pad2).
+pub const DEEP_ADD: &str = r#"
+struct P { n_embd: u32, layer: u32, cap: u32, pad: u32 }
+@group(0) @binding(1) var<uniform> p: P;
+@group(0) @binding(2) var<storage, read_write> x: array<f32>;
+@group(0) @binding(3) var<storage, read> deep: array<f32>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    if (step.pad2 == 0u) { return; }
+    let t = wg.y;
+    let j = wg.x * 256u + li;
+    if (j >= p.n_embd) { return; }
+    x[t * p.n_embd + j] += deep[(p.layer * p.cap + t) * p.n_embd + j];
+}
+"#;
+
+pub fn deep_add() -> String {
+    format!("{COMMON}{DEEP_ADD}")
 }
 
 pub fn fill() -> String {

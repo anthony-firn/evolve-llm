@@ -80,3 +80,13 @@ test('a command called as if it were a tool runs as that command line with bash'
   assert.deepEqual(parseToolCalls('<tool_call>{"name": "git", "arguments": {"command": "status"}}</tool_call>', new Set(['read'])), []);
   assert.deepEqual(parseToolCalls('<tool_call>{"name": "git", "arguments": {"command": "status", "cwd": "x"}}</tool_call>', names), []);
 });
+
+test('a shell command written as the tool name, with unescaped quotes, becomes a bash call', async () => {
+  const { parseToolCalls } = await import('../web/tools.js');
+  const names = new Set(['bash', 'read', 'write']);
+  const text = '<think>\nNow the pull request.\n</think>\n\n<tool_call>\n{"name": "gh pr create --title "Add a line" --body "Added `x` to README."}\n</tool_call>';
+  assert.deepEqual(parseToolCalls(text, names), [{ name: 'bash', args: { command: 'gh pr create --title "Add a line" --body "Added `x` to README."' } }]);
+  // Not for names that are not commands, nor without a bash tool.
+  assert.deepEqual(parseToolCalls('<tool_call>\n{"name": "make "it" so"}\n</tool_call>', names), []);
+  assert.deepEqual(parseToolCalls(text, new Set(['read', 'write'])), []);
+});

@@ -216,6 +216,11 @@ impl Browser {
     pub fn snapshot(&mut self, max_chars: u32) -> String {
         self.engine.snapshot(max_chars as usize).to_string()
     }
+    #[wasm_bindgen(js_name = agentRefAt)]
+    pub fn agent_ref_at(&mut self, x: f64, y: f64) -> String {
+        self.engine.agent_ref_at(x as f32, y as f32).to_string()
+    }
+
     #[wasm_bindgen(js_name = agentClick)]
     pub fn agent_click(&mut self, r: u32) -> String {
         self.engine.agent_click(r as usize).to_string()

@@ -12,6 +12,8 @@ use wgpu::util::DeviceExt;
 
 /// Tokens processed per submission while reading a prompt.
 pub const MAX_BATCH: usize = 128;
+/// Tokens per chunk that the deepstack buffer holds.
+const DEEP_CAP: usize = SUPER_BATCH;
 /// The smallest prompt chunk, the first chunk of a pass (it grows while chunks finish fast), and
 /// the time past which the next chunk is halved. Starting small matters: on a slow GPU a first
 /// full chunk can already outlast the driver's limit, and cancelled work leaves wrong numbers,
@@ -293,6 +295,8 @@ enum Kernel {
     MoeSum,
     ResMix,
     Fill,
+    DeepAdd,
+    QGate,
     KdaConv,
     L2Norm,
     Kda,
@@ -321,6 +325,8 @@ struct Layouts {
     mla: wgpu::BindGroupLayout,
     res_mix: wgpu::BindGroupLayout,
     fill: wgpu::BindGroupLayout,
+    deep_add: wgpu::BindGroupLayout,
+    qgate: wgpu::BindGroupLayout,
     kda_conv: wgpu::BindGroupLayout,
     l2norm: wgpu::BindGroupLayout,
     kda: wgpu::BindGroupLayout,
@@ -341,6 +347,8 @@ struct LayerOps {
 struct State {
     ctx: usize,
     step: wgpu::Buffer,
+    mpos: wgpu::Buffer,
+    deep: wgpu::Buffer,
     tokens: wgpu::Buffer,
     logits: wgpu::Buffer,
     staging: wgpu::Buffer,
@@ -407,6 +415,9 @@ pub struct Engine {
     /// GPU with a long context, a full chunk can outlast the driver's limit on one piece of GPU
     /// work (Linux i915 cancels after about 10 s). Learned from each chunk, kept between passes.
     batch: Cell<usize>,
+    rope_delta: Cell<i32>,
+    rope_positions: std::cell::RefCell<Option<(usize, Vec<u32>)>>,
+    deepstack: std::cell::RefCell<Option<(usize, Vec<Vec<f32>>)>>,
     /// A second copy of the recurrent state, taken before verifying a draft (made on first use).
     spec_state: RefCell<Vec<(wgpu::Buffer, wgpu::Buffer)>>,
     spec_pos: Cell<usize>,
@@ -859,12 +870,14 @@ impl Engine {
             moe_sum: layout(device, "uurrrw"),
             norm: layout(device, "uurrw"),
             norm_inplace: layout(device, "uuwr"),
-            rope: layout(device, "uuwrrwwr"),
+            rope: layout(device, "uuwrrwwrr"),
             attention: layout(device, "uurrrw"),
             topk: layout(device, "uurrw"),
             mla: layout(device, "uurrrw"),
             res_mix: layout(device, "uurrww"),
             fill: layout(device, "uuw"),
+            deep_add: layout(device, "uuwr"),
+            qgate: layout(device, "uurww"),
             kda_conv: layout(device, "uurww"),
             l2norm: layout(device, "uuw"),
             kda: layout(device, "uurrrrrww"),
@@ -913,6 +926,9 @@ impl Engine {
             snapshot_pos: Cell::new(None),
             all_logits: Cell::new(false),
             batch: Cell::new(FIRST_BATCH),
+            rope_delta: Cell::new(0),
+            rope_positions: std::cell::RefCell::new(None),
+            deepstack: std::cell::RefCell::new(None),
             spec_state: RefCell::new(Vec::new()),
             spec_pos: Cell::new(0),
             stage,
@@ -1030,6 +1046,14 @@ impl Engine {
         if self.cfg.expert_latent > 0 {
             self.pipeline("fill".into(), shaders::fill(), &fl);
         }
+        if self.cfg.deepstack > 0 {
+            let da = self.layouts.deep_add.clone();
+            self.pipeline("deep-add".into(), shaders::deep_add(), &da);
+        }
+        if self.cfg.q_gate {
+            let qg = self.layouts.qgate.clone();
+            self.pipeline("qgate".into(), shaders::qgate(), &qg);
+        }
         if self.cfg.kda.is_some() {
             self.pipeline("kda-conv".into(), shaders::kda_conv(), &kc);
             self.pipeline("l2norm".into(), shaders::l2norm(), &l2);
@@ -1116,10 +1140,13 @@ impl Engine {
         let mut extra = 0u64;
         if let Some(k) = &cfg.kda {
             let d = k.width();
-            acts += 5 * d + k.head_dim + k.n_head;
+            acts += 2 * d + k.channels() + k.head_dim + k.n_head;
             let layers = k.layers.iter().filter(|&&x| x).count() as u64;
             // State and convolution inputs, twice (the snapshot).
-            extra += layers * (k.n_head * k.head_dim * k.head_dim + 3 * d * 3) as u64 * 4 * 2;
+            extra += layers * (k.n_head * k.head_dim * k.head_dim + (k.conv - 1) * k.channels()) as u64 * 4 * 2;
+        }
+        if cfg.q_gate {
+            acts += 3 * cfg.q_dim();
         }
         if cfg.attn_res_block > 0 {
             acts += cfg.n_embd * (1 + cfg.n_layer.div_ceil(cfg.attn_res_block));
@@ -1176,7 +1203,9 @@ impl Engine {
         // of it keeps its own checkpoints.
         let ck = buf("checkpoints", ck_tokens * n_ckpt.max(1) * c.n_embd);
         // Linear attention: q, k, v per token, the decay gate and its low-rank input, beta.
-        let kqv = buf("kda-qkv", t * 3 * kd);
+        let kqv = buf("kda-qkv", t * kda.as_ref().map_or(0, |k| k.channels() + if k.merged { k.width() } else { 0 }));
+        // Qwen3.5's query projection with its gate, and the gate.
+        let (qg_in, qg) = if c.q_gate { (buf("q-and-gate", t * 2 * c.q_dim()), buf("q-gate", t * c.q_dim())) } else { (buf("unused", 4), buf("unused", 4)) };
         let gk = buf("kda-gate", t * kd);
         let fa = buf("kda-gate-a", t * kda.as_ref().map_or(1, |k| k.head_dim));
         let betab = buf("kda-beta", t * kda.as_ref().map_or(1, |k| k.n_head));
@@ -1275,6 +1304,20 @@ impl Engine {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // Deepstack image features for a chunk's tokens, per early layer (Qwen3-VL).
+        let deep = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deepstack"),
+            size: (c.deepstack.max(1) * if c.deepstack > 0 { DEEP_CAP * c.n_embd } else { 1 } * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Per-token (time, height, width) rotary positions of a chunk, when given (images).
+        let mpos = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("multimodal positions"),
+            size: (SUPER_BATCH.max(MAX_BATCH) * 3 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging"),
             size: (c.n_vocab * 4) as u64,
@@ -1314,7 +1357,7 @@ impl Engine {
                 // Layers another device runs keep their state there.
                 let here = self.stage.has_layer(l);
                 let pair = || match here {
-                    true => (buf("kda-state", kk.n_head * kk.head_dim * kk.head_dim), buf("kda-conv", 3 * kd * 3)),
+                    true => (buf("kda-state", kk.n_head * kk.head_dim * kk.head_dim), buf("kda-conv", (kk.conv - 1) * kk.channels())),
                     false => (buf("unused", 4), buf("unused", 4)),
                 };
                 kda_state.push(pair());
@@ -1534,6 +1577,10 @@ impl Engine {
             c.kv_dim() as u32,
             c.q_dim() as u32,
             mla.as_ref().map_or(0, |m| m.nope) as u32,
+            c.rope_sections.map_or(half, |s| s[0]) as u32,
+            c.rope_sections.map_or(0, |s| s[1]) as u32,
+            c.rope_sections.map_or(0, |s| s[2]) as u32,
+            c.rope_interleaved as u32,
         ]));
         let mut attn_data = words(&[
             c.n_head as u32,
@@ -1632,7 +1679,67 @@ impl Engine {
             } else {
                 norm(&mut ops, &x, &self.vecs[&n("attn_norm.weight")], &xn, c.n_embd, false);
             }
-            if c.is_kda(l) {
+            if c.is_kda(l) && kda.as_ref().is_some_and(|k| k.gdn) {
+                // Gated DeltaNet (Qwen3.5): one projection and one convolution for queries, keys
+                // and values; L2-normalised queries and keys; one decay per head; per-head
+                // RMSNorm times SiLU of the output gate.
+                let kk = kda.as_ref().unwrap();
+                let input = Input::rows(c.n_embd);
+                let ch = kk.channels();
+                // A token's queries, keys and values, then (merged files) its output gate.
+                let ts = ch + if kk.merged { kk.width() } else { 0 };
+                let hv = kk.n_head as u32;
+                if kk.merged {
+                    matmul(&mut ops, &n("attn_qkv_gate.weight"), &xn, &kqv, 0, None, false, input);
+                    matmul(&mut ops, &n("ssm_beta_alpha.weight"), &xn, &gk, 0, None, false, input);
+                } else {
+                    matmul(&mut ops, &n("attn_qkv.weight"), &xn, &kqv, 0, None, false, input);
+                    matmul(&mut ops, &n("ssm_alpha.weight"), &xn, &gk, 0, None, false, input);
+                    matmul(&mut ops, &n("ssm_beta.weight"), &xn, &betab, 0, None, false, input);
+                }
+                let (state, conv) = &kda_state[kda_index];
+                kda_index += 1;
+                ops.push(Op {
+                    when: When::Always,
+                    kernel: Kernel::KdaConv,
+                    grid: Grid::Groups(ch.div_ceil(256) as u32),
+                    bind: bind(&self.layouts.kda_conv, "kda-conv", &[&step, &params(&words(&[ch as u32, ts as u32, 0, 0])), &self.vecs[&n("ssm_conv1d.weight")], &kqv, conv]),
+                });
+                let mut d = words(&[kk.head_dim as u32, (2 * kk.n_k_head) as u32, ts as u32]);
+                d.extend(c.rms_eps.to_le_bytes());
+                ops.push(Op {
+                    when: When::Always,
+                    kernel: Kernel::L2Norm,
+                    grid: Grid::Heads((2 * kk.n_k_head) as u32),
+                    bind: bind(&self.layouts.l2norm, "l2norm", &[&step, &params(&d), &kqv]),
+                });
+                let mut d = words(&[hv, kk.width() as u32, ts as u32]);
+                d.extend((1.0 / (kk.head_dim as f32).sqrt()).to_le_bytes());
+                d.extend(0f32.to_le_bytes());
+                d.extend(words(&[1, kk.k_width() as u32, kk.n_k_head as u32]));
+                // Beta and the decay gates: [beta | alpha] per token when merged.
+                let (beta_buf, ba) = if kk.merged { (&gk, [2 * hv, 0, 2 * hv, hv]) } else { (&betab, [hv, 0, hv, 0]) };
+                d.extend(words(&ba));
+                ops.push(Op {
+                    when: When::Always,
+                    kernel: Kernel::Kda,
+                    grid: Grid::Groups((2 * kk.n_head) as u32),
+                    bind: bind(&self.layouts.kda, "kda", &[&step, &params(&d), &kqv, &gk, beta_buf, &self.vecs[&n("ssm_dt.bias")], &self.vecs[&n("ssm_a")], state, &att]),
+                });
+                norm_inplace(&mut ops, &att, &self.vecs[&n("ssm_norm.weight")], kk.head_dim, kk.n_head);
+                if kk.merged {
+                    let w = kk.width() as u32;
+                    ops.push(Op {
+                        when: When::Always,
+                        kernel: Kernel::QGate,
+                        grid: Grid::Width(w),
+                        bind: bind(&self.layouts.qgate, "qgate", &[&step, &params(&words(&[w, kk.head_dim as u32, 2, ts as u32, ch as u32, 0, 0, 0])), &kqv, &att, &qg]),
+                    });
+                } else {
+                    matmul(&mut ops, &n("attn_gate.weight"), &xn, &att, 6, None, false, input);
+                }
+                matmul(&mut ops, &n("ssm_out.weight"), &att, &x, out_mode, None, false, Input::rows(kk.width()));
+            } else if c.is_kda(l) {
                 let kk = kda.as_ref().unwrap();
                 let input = Input::rows(c.n_embd);
                 for (j, w) in ["attn_q", "attn_k", "attn_v"].iter().enumerate() {
@@ -1663,7 +1770,7 @@ impl Engine {
                 let mut d = words(&[kk.n_head as u32, kd as u32, (3 * kd) as u32]);
                 d.extend((1.0 / (kk.head_dim as f32).sqrt()).to_le_bytes());
                 d.extend(kk.gate_lower_bound.to_le_bytes());
-                d.extend(words(&[0, 0, 0]));
+                d.extend(words(&[0, kd as u32, kk.n_head as u32, kk.n_head as u32, 0, 0, 0]));
                 ops.push(Op {
                     when: When::Always,
                     kernel: Kernel::Kda,
@@ -1724,7 +1831,7 @@ impl Engine {
                         when: When::Always,
                         kernel: Kernel::Rope,
                         grid: Grid::Heads(c.n_head as u32),
-                        bind: bind(&self.layouts.rope, "rope-q", &[&step, &rope_p, &q, dummy, dummy, &spare_a, &spare_b, &rope_table]),
+                        bind: bind(&self.layouts.rope, "rope-q", &[&step, &rope_p, &q, dummy, dummy, &spare_a, &spare_b, &rope_table, &mpos]),
                     });
                 }
                 ops.push(Op {
@@ -1781,7 +1888,18 @@ impl Engine {
                     }
                 };
                 let input = Input::rows(c.n_embd);
-                matmul(&mut ops, &n("attn_q.weight"), &xn, &q, 0, bias("attn_q.bias"), false, input);
+                let qgate = |mode: u32, a: &wgpu::Buffer| Op {
+                    when: When::Always,
+                    kernel: Kernel::QGate,
+                    grid: Grid::Width(c.q_dim() as u32),
+                    bind: bind(&self.layouts.qgate, "qgate", &[&step, &params(&words(&[c.q_dim() as u32, c.head_dim as u32, mode, 0, 0, 0, 0, 0])), &qg_in, a, &qg]),
+                };
+                if c.q_gate {
+                    matmul(&mut ops, &n("attn_q.weight"), &xn, &qg_in, 0, None, false, input);
+                    ops.push(qgate(0, &q));
+                } else {
+                    matmul(&mut ops, &n("attn_q.weight"), &xn, &q, 0, bias("attn_q.bias"), false, input);
+                }
                 matmul(&mut ops, &n("attn_k.weight"), &xn, &k, 0, bias("attn_k.bias"), false, input);
                 matmul(&mut ops, &n("attn_v.weight"), &xn, &v, 0, bias("attn_v.bias"), false, input);
                 if c.qk_norm_full {
@@ -1795,7 +1913,7 @@ impl Engine {
                     when: When::Always,
                     kernel: Kernel::Rope,
                     grid: Grid::Heads((c.n_head + c.n_head_kv) as u32),
-                    bind: bind(&self.layouts.rope, "rope", &[&step, &rope_p, &q, &k, &v, &kc[l], &vc[l], &rope_table]),
+                    bind: bind(&self.layouts.rope, "rope", &[&step, &rope_p, &q, &k, &v, &kc[l], &vc[l], &rope_table, &mpos]),
                 });
                 ops.push(Op {
                     when: When::Always,
@@ -1803,13 +1921,16 @@ impl Engine {
                     grid: Grid::Heads(c.n_head as u32),
                     bind: bind(&self.layouts.attention, "attention", &[&step, &attn_p, &q, &kc[l], &vc[l], &att]),
                 });
+                if c.q_gate {
+                    ops.push(qgate(1, &att));
+                }
                 matmul(&mut ops, &n("attn_output.weight"), &att, &x, out_mode, None, false, Input::rows(c.q_dim()));
             }
             if bs > 0 {
                 res_mix(&mut ops, &self.vecs[&n("ffn_res_score.weight")], l / bs + 1, false, &xm);
-                norm(&mut ops, &xm, &self.vecs[&n("ffn_norm.weight")], &xn, c.n_embd, false);
+                norm(&mut ops, &xm, &self.vecs[&n(c.ffn_norm())], &xn, c.n_embd, false);
             } else {
-                norm(&mut ops, &x, &self.vecs[&n("ffn_norm.weight")], &xn, c.n_embd, false);
+                norm(&mut ops, &x, &self.vecs[&n(c.ffn_norm())], &xn, c.n_embd, false);
             }
             let input = Input::rows(c.n_embd);
             match moe.as_ref().filter(|_| c.is_moe(l)) {
@@ -1869,6 +1990,14 @@ impl Engine {
                     matmul(&mut ops, &n("ffn_up.weight"), &xn, &gate, act_mode, None, false, input);
                     matmul(&mut ops, &n("ffn_down.weight"), &gate, &x, 1, None, false, Input::rows(c.n_ff));
                 }
+            }
+            if l < c.deepstack {
+                ops.push(Op {
+                    when: When::Always,
+                    kernel: Kernel::DeepAdd,
+                    grid: Grid::Width(c.n_embd as u32),
+                    bind: bind(&self.layouts.deep_add, "deep-add", &[&step, &params(&words(&[c.n_embd as u32, l as u32, DEEP_CAP as u32, 0])), &x, &deep]),
+                });
             }
             let end = ops.len();
             if route_end == 0 {
@@ -1983,6 +2112,8 @@ impl Engine {
             ck,
             ck_tokens,
             hidden_staging,
+            mpos,
+            deep,
         });
         match self.gpu.take_error() {
             Some(e) => Err(format!("could not prepare the model on the GPU: {e}")),
@@ -2052,6 +2183,8 @@ impl Engine {
             (Kernel::MoeSum, Grid::Width(w)) => ("moe-sum".into(), (w.div_ceil(256), t)),
             (Kernel::ResMix, Grid::Tokens) => ("res-mix".into(), (t, 1)),
             (Kernel::Fill, Grid::Width(w)) => ("fill".into(), (w.div_ceil(256), t)),
+            (Kernel::DeepAdd, Grid::Width(w)) => ("deep-add".into(), (w.div_ceil(256), t)),
+            (Kernel::QGate, Grid::Width(w)) => ("qgate".into(), (w.div_ceil(256), t)),
             (Kernel::KdaConv, Grid::Groups(n)) => ("kda-conv".into(), (n, 1)),
             (Kernel::L2Norm, Grid::Heads(h)) => ("l2norm".into(), (h, t)),
             (Kernel::Kda, Grid::Groups(n)) => ("kda".into(), (n, 1)),
@@ -2062,13 +2195,14 @@ impl Engine {
         }
     }
 
-    fn encode_chunk(&self, n_tokens: usize, with_head: bool) -> wgpu::CommandBuffer {
+    /// A chunk's ops from `from` (after the embedding when the hidden states are given).
+    fn encode_chunk(&self, from: usize, n_tokens: usize, with_head: bool) -> wgpu::CommandBuffer {
         let st = self.state.as_ref().unwrap();
         if !with_head {
-            return self.encode_range(0..st.head_start, n_tokens, false);
+            return self.encode_range(from..st.head_start, n_tokens, false);
         }
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
-        self.record(&mut enc, 0..st.head_start, n_tokens);
+        self.record(&mut enc, from..st.head_start, n_tokens);
         self.record_head(&mut enc, n_tokens);
         enc.finish()
     }
@@ -2148,9 +2282,52 @@ impl Engine {
     /// token within a prompt read layer by layer.
     fn write_step(&self, n: usize, pos: usize, chunk0: usize) {
         let st = self.state.as_ref().unwrap();
+        // Multimodal rotary positions for these tokens, when this pass was given them.
+        let mut mode = 0u32;
+        if let Some((p0, ref list)) = *self.rope_positions.borrow() {
+            if pos >= p0 && (pos - p0 + n) * 3 <= list.len() {
+                let i = (pos - p0) * 3;
+                self.gpu.queue.write_buffer(&st.mpos, 0, &words(&list[i..i + n * 3]));
+                mode = 1;
+            }
+        }
+        // Deepstack features for these tokens, when this pass was given them.
+        let mut deep = 0u32;
+        if let Some((p0, ref layers)) = *self.deepstack.borrow() {
+            let d = self.cfg.n_embd;
+            if pos >= p0 && n <= DEEP_CAP && layers.iter().all(|f| (pos - p0 + n) * d <= f.len()) {
+                for (i, f) in layers.iter().enumerate().take(self.cfg.deepstack) {
+                    self.gpu.queue.write_buffer(&st.deep, (i * DEEP_CAP * d * 4) as u64, &floats(&f[(pos - p0) * d..(pos - p0 + n) * d]));
+                }
+                deep = 1;
+            }
+        }
         let n = n as u32;
         let pos = pos as u32;
-        self.gpu.queue.write_buffer(&st.step, 0, &words(&[n, pos, pos + n, n - 1, chunk0 as u32, 0, 0, 0]));
+        self.gpu.queue.write_buffer(&st.step, 0, &words(&[n, pos, pos + n, n - 1, chunk0 as u32, mode, self.rope_delta.get() as u32, deep]));
+    }
+
+    /// Rotary positions minus cache slots for the tokens that follow (Qwen2-VL: an image of n
+    /// tokens fills n slots but moves positions on by its larger side only).
+    pub fn set_rope_delta(&self, delta: i32) {
+        self.rope_delta.set(delta);
+    }
+
+    /// Like `forward_hidden`, with each token's (time, height, width) rotary positions and, for
+    /// models with deepstack, each early layer's image features (`n x n_embd`, zero for text).
+    pub async fn forward_hidden_positioned(&self, hidden: &[f32], n: usize, pos0: usize, positions: &[[u32; 3]], deepstack: &[Vec<f32>]) -> Result<Vec<f32>, String> {
+        if positions.len() != n {
+            return Err(format!("{} positions for {n} tokens", positions.len()));
+        }
+        if deepstack.iter().any(|f| f.len() != n * self.cfg.n_embd) {
+            return Err("deepstack features must cover every token".into());
+        }
+        *self.rope_positions.borrow_mut() = Some((pos0, positions.iter().flatten().copied().collect()));
+        *self.deepstack.borrow_mut() = (!deepstack.is_empty()).then(|| (pos0, deepstack.to_vec()));
+        let out = self.forward_hidden(hidden, n, pos0).await;
+        *self.rope_positions.borrow_mut() = None;
+        *self.deepstack.borrow_mut() = None;
+        out
     }
 
     /// Record ops into an encoder (with copies around them, for the layer-by-layer prompt).
@@ -2275,8 +2452,9 @@ impl Engine {
     /// For a stage that runs layers after another device's: read the hidden state that device
     /// handed on (`n` tokens from `pos0`) and return the one after this stage's last layer.
     pub async fn forward_hidden(&self, hidden: &[f32], n: usize, pos0: usize) -> Result<Vec<f32>, String> {
-        if self.stage.embed {
-            return Err("this device reads tokens, not hidden states".into());
+        // A whole model takes them too (a prompt with images), unless it streams its weights.
+        if self.stage.embed && self.placement.streaming {
+            return Err("a model read from storage as it runs takes tokens, not hidden states".into());
         }
         if n == 0 || hidden.len() != n * self.hidden_width(self.stage.first) {
             return Err(format!("expected the hidden state of {n} tokens before layer {}", self.stage.first));
@@ -2462,16 +2640,22 @@ impl Engine {
                 Feed::Tokens(t) => self.gpu.queue.write_buffer(&st.tokens, 0, &words(t)),
                 Feed::Hidden(h, _) => self.write_hidden(h, n, k_in, &st.x, 0, 0),
             }
-            let cmd = self.encode_chunk(n, last && !hand_on);
+            // Given hidden states (an image's embeddings among the text's) replace the embedding.
+            let from = if self.stage.embed && matches!(input, Feed::Hidden(..)) { st.embed_end } else { 0 };
+            let cmd = self.encode_chunk(from, n, last && !hand_on);
             self.gpu.queue.submit([cmd]);
             if hand_on {
                 let h = self.read_hidden(n, k_out, &st.x, 0, 0).await?;
                 match &remote {
                     Some(r) if self.stage.head => {
                         let mut call = r.forward(h, n, pos0 + s);
-                        // Started now (a call begins when first polled), awaited after the loop.
-                        let _ = call.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
-                        sent.push(call);
+                        // Started now (a call begins when first polled), awaited after the loop. A call
+                        // that finishes on that first poll (a remote in this page) keeps its result: a
+                        // finished future must not be polled again.
+                        match call.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+                            std::task::Poll::Ready(v) => sent.push(Box::pin(std::future::ready(v))),
+                            std::task::Poll::Pending => sent.push(call),
+                        }
                     }
                     _ => hidden.extend(h),
                 }
@@ -2654,6 +2838,11 @@ impl Engine {
     }
 
     /// Embedding rows of `tokens`, dequantized on the CPU.
+    /// Token embeddings, read on the CPU (to put text next to image embeddings in a prompt).
+    pub fn embed_tokens(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        self.embed_cpu(tokens)
+    }
+
     fn embed_cpu(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
         let tp = self.tensor("token_embd.weight").clone();
         let k = self.cfg.n_embd;

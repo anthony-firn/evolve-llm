@@ -4,6 +4,7 @@
 pub mod blocks;
 pub mod engine;
 pub mod shaders;
+pub mod vision;
 
 use serde::Serialize;
 use std::future::Future;
@@ -22,6 +23,7 @@ pub struct DeviceInfo {
     pub max_storage_binding: u64,
 }
 
+#[derive(Clone)]
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,

@@ -47,8 +47,20 @@ impl Speculation {
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 
+/// An image in a prompt: the vision encoder's embeddings (`rows x cols` tokens of the language
+/// model's width, raster order) and its deepstack features (one set per early layer, if any).
+pub struct ImageInput {
+    pub embeddings: Vec<f32>,
+    pub rows: usize,
+    pub cols: usize,
+    pub deepstack: Vec<Vec<f32>>,
+}
+
 pub struct Session {
     pub engine: Engine,
+    /// The cache slot of the first image token in the cache, if any: rotary positions of later
+    /// tokens are offset from their slots (Qwen-VL), until the cache drops it.
+    image_from: Option<usize>,
     pub tok: Tokenizer,
     pub template: ChatTemplate,
     pub sampler: Sampler,
@@ -84,6 +96,7 @@ impl Session {
             snapshot: None,
             pending: None,
             spec: Speculation::default(),
+            image_from: None,
         };
         s.spec.on = s.engine.streaming();
         #[cfg(not(target_arch = "wasm32"))]
@@ -124,6 +137,7 @@ impl Session {
     }
 
     pub fn reset(&mut self) {
+        self.forget_images(0);
         self.cached.clear();
         self.logits.clear();
         self.snapshot = None;
@@ -167,6 +181,7 @@ impl Session {
             };
         }
         self.cached.truncate(common);
+        self.forget_images(common);
         let rest = &tokens[common..];
         self.logits = self.engine.forward(rest, common).await?;
         self.cached.extend_from_slice(rest);
@@ -178,6 +193,126 @@ impl Session {
             reused: common,
             computed: rest.len(),
         })
+    }
+
+    /// Positions return to the cache slots once the cache no longer holds an image.
+    fn forget_images(&mut self, kept: usize) {
+        if self.image_from.is_some_and(|i| i >= kept) {
+            self.image_from = None;
+            self.engine.set_rope_delta(0);
+        }
+    }
+
+    /// The token chat templates write for an image (Qwen-VL's <|image_pad|>), if the model has one.
+    pub fn image_pad(&self) -> Option<u32> {
+        let p = self.tok.encode("<|image_pad|>", false, true);
+        (p.len() == 1).then(|| p[0])
+    }
+
+    /// `prefill_images` for a prompt as a chat template writes it, with one placeholder token
+    /// per image: encodes each image (RGB bytes, width, height; sides multiples of the encoder's
+    /// unit) and gives it as many placeholder tokens as it has merged patches. A placeholder
+    /// count that does not match the images (text that spells out the placeholder) is refused.
+    pub async fn prefill_rgb(&mut self, tokens: &[u32], vision: &crate::gpu::vision::VisionGpu, images: &[(&[u8], usize, usize)]) -> Result<Prefill, String> {
+        let pad = self.image_pad().ok_or("this model has no image placeholder token")?;
+        let found = tokens.iter().filter(|&&t| t == pad).count();
+        if found != images.len() {
+            return Err(format!("the prompt has {found} image placeholders for {} images", images.len()));
+        }
+        let merge = vision.cfg.unit() / vision.cfg.patch;
+        let mut inputs = Vec::with_capacity(images.len());
+        for &(rgb, w, h) in images {
+            let px = crate::vision::patches_for(&vision.cfg, rgb, w, h)?;
+            let enc = vision.encode(&px).await?;
+            inputs.push(ImageInput { embeddings: enc.embeddings, rows: px.grid_h / merge, cols: px.grid_w / merge, deepstack: enc.deepstack });
+        }
+        let mut expanded = Vec::with_capacity(tokens.len() + inputs.iter().map(|i| i.rows * i.cols).sum::<usize>());
+        let mut next = inputs.iter();
+        for &t in tokens {
+            match next.len() {
+                _ if t != pad => expanded.push(t),
+                _ => {
+                    let i = next.next().ok_or("more image placeholders than images")?;
+                    expanded.extend(std::iter::repeat_n(pad, i.rows * i.cols));
+                }
+            }
+        }
+        self.prefill_images(&expanded, pad, &inputs).await
+    }
+
+    /// Bring the cache to `tokens`, where each run of `pad` tokens takes the next image's
+    /// embeddings (rows x cols tokens). Text keeps one position per token; an image's tokens are
+    /// at (start, start + row, start + col) in (time, height, width), and the text after it
+    /// resumes at start + max(rows, cols) (Qwen2-VL and Qwen3-VL multimodal rotary positions).
+    pub async fn prefill_images(&mut self, tokens: &[u32], pad: u32, images: &[ImageInput]) -> Result<Prefill, String> {
+        let first = tokens.iter().position(|&t| t == pad).ok_or("the prompt has no image tokens")?;
+        let wanted: usize = images.iter().map(|i| i.rows * i.cols).sum();
+        if tokens.iter().filter(|&&t| t == pad).count() != wanted {
+            return Err(format!("the prompt has {} image tokens; the images need {wanted}", tokens.iter().filter(|&&t| t == pad).count()));
+        }
+        if tokens.len() >= self.engine.context_length() {
+            return Err(format!("the prompt has {} tokens; the context holds {}", tokens.len(), self.engine.context_length()));
+        }
+        self.pending = None;
+        // Reuse the text before the first image only: another image has the same placeholder ids.
+        let mut common = self.cached.iter().zip(tokens).take_while(|(a, b)| a == b).count().min(first);
+        // A recurrent state cannot be rewound: go back to the snapshot if it is still a prefix,
+        // or start over (as in prefill).
+        let stale = self.engine.is_recurrent() && self.engine.recurrent_position() != self.cached.len();
+        if self.engine.is_recurrent() && (stale || common < self.cached.len()) {
+            common = match self.snapshot.filter(|&p| p <= common) {
+                Some(p) if self.engine.restore() == Some(p) => p,
+                _ => 0,
+            };
+        }
+        self.cached.truncate(common);
+        self.forget_images(common);
+        let rest = &tokens[common..];
+        let d = self.engine.cfg.n_embd;
+        let layers = images.iter().map(|i| i.deepstack.len()).max().unwrap_or(0);
+        let mut hidden = Vec::with_capacity(rest.len() * d);
+        let mut positions = Vec::with_capacity(rest.len());
+        let mut deep = vec![vec![0f32; rest.len() * d]; layers];
+        let (mut pos, mut i, mut img) = (common as u32, 0usize, 0usize);
+        while i < rest.len() {
+            if rest[i] != pad {
+                let j = rest[i..].iter().position(|&t| t == pad).map_or(rest.len(), |k| i + k);
+                hidden.extend(self.engine.embed_tokens(&rest[i..j])?);
+                for _ in i..j {
+                    positions.push([pos, pos, pos]);
+                    pos += 1;
+                }
+                i = j;
+                continue;
+            }
+            let im = images.get(img).ok_or("more image placeholders than images")?;
+            let n = im.rows * im.cols;
+            if im.embeddings.len() != n * d {
+                return Err(format!("image {img} has embeddings of the wrong width (the model takes {d})"));
+            }
+            hidden.extend_from_slice(&im.embeddings);
+            for r in 0..im.rows {
+                for c in 0..im.cols {
+                    positions.push([pos, pos + r as u32, pos + c as u32]);
+                }
+            }
+            for (l, f) in im.deepstack.iter().enumerate() {
+                deep[l][i * d..(i + n) * d].copy_from_slice(f);
+            }
+            pos += im.rows.max(im.cols) as u32;
+            i += n;
+            img += 1;
+        }
+        self.logits = self.engine.forward_hidden_positioned(&hidden, rest.len(), common, &positions, &deep).await?;
+        self.cached.extend_from_slice(rest);
+        if self.engine.is_recurrent() {
+            self.engine.snapshot();
+            self.snapshot = Some(self.cached.len());
+        }
+        self.image_from = Some(common + rest[..].iter().position(|&t| t == pad).unwrap_or(0));
+        // Tokens from here on: rotary position = cache slot + this offset.
+        self.engine.set_rope_delta(pos as i32 - self.cached.len() as i32);
+        Ok(Prefill { reused: common, computed: rest.len() })
     }
 
     /// Sample the next token and, unless it ends the turn, advance the model past it.

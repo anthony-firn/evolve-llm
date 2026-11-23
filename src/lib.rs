@@ -11,6 +11,7 @@ pub mod quant;
 pub mod remote;
 pub mod sampler;
 pub mod session;
+pub mod vision;
 pub mod source;
 pub mod tokenizer;
 

@@ -352,3 +352,29 @@ test('worker host reports an engine panic once, with the cookies it could save',
   assert.equal(h.posted.filter((m) => m.type === 'crashed').length, 1);
   assert(h.host.crashed);
 });
+
+test('fitImage averages an RGBA image down to sides that are multiples of the unit, as RGB', async () => {
+  const { fitImage } = await import('../web/images.mjs');
+  // 4x4: left half red, right half blue.
+  const rgba = new Uint8Array(4 * 4 * 4);
+  for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) rgba.set(x < 2 ? [200, 0, 0, 255] : [0, 0, 200, 255], (y * 4 + x) * 4);
+  const out = fitImage(rgba, 4, 4, { unit: 2, maxSide: 2 });
+  assert.equal(out.width, 2); assert.equal(out.height, 2);
+  assert.deepEqual([...out.rgb], [200, 0, 0, 0, 0, 200, 200, 0, 0, 0, 0, 200]);
+  // Never smaller than one unit, and rounded to the unit.
+  const wide = fitImage(new Uint8Array(100 * 10 * 4), 100, 10, { unit: 32, maxSide: 1024 });
+  assert.deepEqual([wide.width, wide.height], [96, 32]);
+  assert.throws(() => fitImage(new Uint8Array(3), 2, 2));
+});
+
+test('worker host screenshots the last frame drawn, even without a canvas', async () => {
+  const engine = fakeEngine();
+  const h = hostHarness(engine);
+  await h.host.handle({ id: 1, type: 'init', relayUrl: 'ws://r/', width: 2, height: 1 });
+  h.runTimers();
+  await h.host.handle({ id: 2, type: 'screenshot', unit: 2, maxSide: 4 });
+  const reply = h.posted.find((m) => m.id === 2);
+  assert.equal(reply.error, undefined);
+  assert.deepEqual([reply.result.width, reply.result.height, reply.result.rgb.length], [2, 2, 12]);
+  assert(reply.result.rgb.every((v) => v === 255));
+});

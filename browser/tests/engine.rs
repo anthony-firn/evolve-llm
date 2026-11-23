@@ -368,6 +368,14 @@ fn agent_snapshot_and_actions_share_the_page() {
     };
     let r = t.engine.agent_select(find("combobox"), "pro");
     assert_eq!(r["ok"], true, "{r}");
+    // A point inside the button finds its number; a point on empty page finds nothing.
+    let button = t.eval("JSON.stringify(document.querySelector('button').getBoundingClientRect())");
+    let rect: serde_json::Value = serde_json::from_str(&serde_json::from_str::<String>(&button).unwrap()).unwrap();
+    let (cx, cy) = (rect["x"].as_f64().unwrap() + 20.0, rect["y"].as_f64().unwrap() + 10.0);
+    let at = t.engine.agent_ref_at(cx as f32, cy as f32);
+    assert_eq!(at["ref"].as_u64(), Some(find("continue") as u64), "{at}");
+    assert_eq!(t.engine.agent_ref_at(700.0, 590.0)["ok"], false);
+    assert!(t.engine.snapshot(4000)["viewportWidth"].as_f64().unwrap() > 0.0);
     let r = t.engine.agent_click(find("continue"));
     assert_eq!(r["ok"], true, "{r}");
     t.settle();

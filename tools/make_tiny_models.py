@@ -52,6 +52,15 @@ SPECS = {
         rope_theta=10000.0, rope_interleave=True,
         # Saved to config.json as DeepSeek's own checkpoints have it, so the GGUF records sigmoid routing.
         scoring_func="sigmoid", topk_method="noaux_tc")),
+    # Qwen3.5: three Gated DeltaNet layers (two query/key heads shared by four value heads), then
+    # one attention layer with an output gate in its query projection, partial interleaved
+    # multimodal rotary positions.
+    "qwen35": ("Qwen3_5TextConfig", "Qwen3_5ForCausalLM", dict(
+        hidden_size=128, intermediate_size=256, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=64, linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=128,
+        linear_value_head_dim=128, linear_conv_kernel_dim=4, tie_word_embeddings=True,
+        rope_parameters={"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25,
+                         "mrope_section": [3, 3, 2], "mrope_interleaved": True})),
     # DeepSeek V2 Lite layout: no query compression, softmax routing, two shared experts.
     "deepseek2lite": ("DeepseekV2Config", "DeepseekV2ForCausalLM", dict(
         hidden_size=128, intermediate_size=256, moe_intermediate_size=64, num_hidden_layers=3,
@@ -61,6 +70,10 @@ SPECS = {
         qk_rope_head_dim=32, v_head_dim=64, max_position_embeddings=256, tie_word_embeddings=False,
         rope_theta=10000.0)),
 }
+
+
+# Converter options for a model: Qwen3.5 checkpoints normally carry next-token-prediction layers.
+CONVERT_ARGS = {"qwen35": ["--no-mtp"]}
 
 
 def build(name, tokenizer, out_dir):
@@ -88,6 +101,39 @@ def build(name, tokenizer, out_dir):
     return logits
 
 
+def split_merged(src, dst):
+    """The same GGUF with Gated DeltaNet's merged projections split back (attn_qkv_gate into
+    attn_qkv and attn_gate, ssm_beta_alpha into ssm_beta and ssm_alpha), as older converters and
+    most published Qwen3.5 files (Holo3.1, Fara1.5) have them."""
+    import gguf
+    r = gguf.GGUFReader(str(src))
+    arch = r.fields["general.architecture"].contents()
+    w = gguf.GGUFWriter(str(dst), arch)
+    for name, f in r.fields.items():
+        if name.startswith("GGUF.") or name == "general.architecture":
+            continue
+        vtype = f.types[0]
+        sub = f.types[1] if vtype == gguf.GGUFValueType.ARRAY and len(f.types) > 1 else None
+        w.add_key_value(name, f.contents(), vtype, sub_type=sub)
+    ch = 2 * r.fields[f"{arch}.ssm.state_size"].contents() * r.fields[f"{arch}.ssm.group_count"].contents()
+    ch += r.fields[f"{arch}.ssm.inner_size"].contents()
+    heads = r.fields[f"{arch}.ssm.time_step_rank"].contents()
+    for t in r.tensors:
+        data = np.array(t.data)
+        if t.name.endswith("attn_qkv_gate.weight"):
+            parts = [(t.name.replace("attn_qkv_gate", "attn_qkv"), data[:ch]), (t.name.replace("attn_qkv_gate", "attn_gate"), data[ch:])]
+        elif t.name.endswith("ssm_beta_alpha.weight"):
+            parts = [(t.name.replace("ssm_beta_alpha", "ssm_beta"), data[:heads]), (t.name.replace("ssm_beta_alpha", "ssm_alpha"), data[heads:])]
+        else:
+            parts = [(t.name, data)]
+        for n, d in parts:
+            w.add_tensor(n, np.ascontiguousarray(d), raw_dtype=t.tensor_type)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
 def pack(v):
     return base64.b64encode(np.asarray(v, dtype=np.float32).tobytes()).decode()
 
@@ -109,8 +155,11 @@ def main():
             # Also an 8-bit copy, to run the expert kernels on quantized weights.
             for kind, path in (("f16", out), ("q8_0", a.models / f"tiny-{name}-q8_0.gguf")):
                 subprocess.run([sys.executable, str(a.llama_cpp / "convert_hf_to_gguf.py"), str(tmp), "--outtype",
-                                kind, "--outfile", str(path)], check=True, env=env, stdout=subprocess.DEVNULL,
+                                kind, "--outfile", str(path), *CONVERT_ARGS.get(name, [])], check=True, env=env, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)
+        if name == "qwen35":
+            sys.path.insert(0, str(a.llama_cpp / "gguf-py"))
+            split_merged(out, a.models / f"tiny-{name}-split.gguf")
         fx = {"file": out.name, "tokens": TOKENS, "positions": [3, len(TOKENS) - 1],
               "logits": [pack(logits[3]), pack(logits[-1])],
               "range": float(logits.max() - logits.min())}

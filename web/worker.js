@@ -106,6 +106,7 @@ async function listCached() {
   if (!navigator.storage?.getDirectory) return { models: [], supported: false };
   const dir = await modelsDir();
   const models = [];
+  const visions = new Map();
   for await (const [name, handle] of dir.entries()) {
     if (handle.kind !== 'file' || !name.endsWith('.json')) continue;
     const key = name.slice(0, -5);
@@ -114,8 +115,11 @@ async function listCached() {
     const count = meta.parts?.length || 1;
     let size = 0;
     for (let i = 0; i < count; i++) size += await storedSize(dir, partName(key, i, count));
-    models.push({ ...meta, key, stored: size });
+    // A model's image encoder counts as part of the model.
+    if (key.endsWith('.vision')) visions.set(key.slice(0, -7), size);
+    else models.push({ ...meta, key, stored: size });
   }
+  for (const m of models) if (visions.has(m.key)) { m.stored += visions.get(m.key); m.vision = true; }
   let estimate = null;
   try { estimate = await navigator.storage.estimate(); } catch { /* not available */ }
   let persisted = false;
@@ -132,6 +136,7 @@ async function removeCached(key) {
   for (const name of names) {
     try { await dir.removeEntry(name); } catch { /* already gone */ }
   }
+  if (!key.endsWith('.vision')) await removeCached(`${key}.vision`);
 }
 
 function httpError(status) {
@@ -510,13 +515,27 @@ function unload() {
 
 // ---- Generation ----
 
+// Images ride on messages as `images: [{rgb: Uint8Array, width, height}]`; the prompt gets one
+// placeholder per image at the start of its message (Qwen-VL's chat templates put them there).
+const IMAGE_SLOT = '<|vision_start|><|image_pad|><|vision_end|>';
+function withImages(msgs) {
+  return msgs.map(({ images, ...m }) => (images?.length ? { ...m, content: IMAGE_SLOT.repeat(images.length) + (m.content || '') } : m));
+}
+
+function prefillImages(tokens, images) {
+  const rgb = new Uint8Array(images.reduce((n, i) => n + i.rgb.length, 0));
+  let at = 0;
+  for (const i of images) { rgb.set(i.rgb, at); at += i.rgb.length; }
+  return chat.prefill_images(tokens, rgb, new Uint32Array(images.flatMap((i) => [i.width, i.height])));
+}
+
 // One model turn: fit the conversation in the context, read it, and generate until the end.
 async function turn(messages, opts, maxTokens, ctx, emit = post, preserveTask = false) {
   let msgs = messages;
   let tokens;
   let dropped = 0;
   for (;;) {
-    tokens = chat.prompt(JSON.stringify(msgs), JSON.stringify(opts));
+    tokens = chat.prompt(JSON.stringify(withImages(msgs)), JSON.stringify(opts));
     if (tokens.length + Math.min(maxTokens, 256) < ctx) break;
     let first = msgs.findIndex((m) => m.role !== 'system');
     if (preserveTask) {
@@ -532,7 +551,8 @@ async function turn(messages, opts, maxTokens, ctx, emit = post, preserveTask = 
     dropped += 2;
   }
   const t0 = performance.now();
-  const pre = JSON.parse(await chat.prefill(tokens));
+  const images = msgs.flatMap((m) => m.images || []);
+  const pre = JSON.parse(images.length ? await prefillImages(tokens, images) : await chat.prefill(tokens));
   emit('prefill', { ...pre, ms: performance.now() - t0, dropped, promptTokens: tokens.length });
   const t1 = performance.now();
   const limit = Math.min(maxTokens, ctx - tokens.length - 1);
@@ -662,6 +682,16 @@ const handlers = {
     if (result.stageLoaded) {
       post('stage-loaded', { stage: result.stage, placement: result.placement });
       return;
+    }
+    // A vision model's image encoder: downloaded beside it, read whole, and put on its GPU.
+    let visionFile = source.kind === 'file' ? source.visionFile : null;
+    if (source.vision && !source.stream && source.kind !== 'file') {
+      const [part] = await download({ ...source.vision, parts: null });
+      visionFile = await (await (await modelsDir()).getFileHandle(part)).getFile();
+    }
+    if (visionFile) {
+      post('progress', { phase: 'vision', loaded: 0, total: visionFile.size });
+      result.vision = { unit: chat.attach_vision(new Uint8Array(await visionFile.arrayBuffer())) };
     }
     const name = source.kind === 'file' ? (source.files || [source.file])[0].name : null;
     post('loaded', { ...result, source: source.kind === 'file' ? { kind: 'file', name } : { kind: 'hf', key: source.key, id: source.id } });

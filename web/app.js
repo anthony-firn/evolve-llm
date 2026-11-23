@@ -1,7 +1,7 @@
-import { LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from './models.js';
+import { BEST_FOR, LARGE, MODELS, cacheKey, formatBytes, hfUrl, listRepo, parseHfReference, resolveParts, splitParts } from './models.js';
 import { renderMarkdown, splitThinking } from './markdown.js';
 import { stripToolCalls } from './tools.js';
-import { wantsSnakeStarter, wantsBrowser, createWorkView } from './chat-development.mjs';
+import { wantsSnakeStarter, wantsBrowser, createWorkView, kindOf } from './chat-development.mjs';
 import { trace } from './trace.mjs';
 import { newChatId, saveChat, getChat, listChats, deleteChat } from './chats.mjs';
 
@@ -157,7 +157,9 @@ function catalogEntry(m) {
   // Models marked `stream` are read from Hugging Face as they run instead of downloaded.
   const stream = Boolean(m.stream) && !cachedEntry(key)?.complete;
   // Streamed models always list their parts: each part's SHA-256 names its swarm.
-  return { kind: 'hf', id: m.id, key, repo: m.repo, file: m.file, revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, name: m.name, resolve: split || stream, stream };
+  // A vision model's image encoder is stored beside it, under the model's key.
+  const vision = m.vision ? { key: `${key}.vision`, file: m.vision.file, url: hfUrl(m.vision.repo || m.repo, m.vision.file), bytes: m.vision.bytes } : null;
+  return { kind: 'hf', id: m.id, key, repo: m.repo, file: m.file, revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, name: m.name, resolve: split || stream, stream, vision };
 }
 
 const ALL = [...MODELS, ...LARGE];
@@ -242,7 +244,7 @@ function renderStorage() {
 
 let loadStarted = 0;
 
-async function startLoad(source) {
+async function startLoad(source, { keepChat = false } = {}) {
   if (['agent','preparing'].includes(state.phase)) { $('status-line').textContent = 'Stop the current reply before loading another model.'; return; }
   if (!state.adapter?.ok) return;
   closeDrawer();
@@ -253,8 +255,11 @@ async function startLoad(source) {
   const label = known ? known.name : source.kind === 'file' ? first.replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '') : source.name;
   state.loading = { label, key: known ? cacheKey(known.repo, known.file) : source.key, id: known ? known.id : source.id, kind: source.kind, stream: Boolean(source.stream) };
   state.loaded = null;
-  for(const m of state.messages)m.workView?.dispose();
-  state.messages = [];state.chatId=newChatId();assistant?.reset();
+  // Switching models for a kind of request keeps the conversation; choosing one starts afresh.
+  if (!keepChat) {
+    for(const m of state.messages)m.workView?.dispose();
+    state.messages = [];state.chatId=newChatId();assistant?.reset();
+  }
   renderMessages();
   $('loading-title').textContent = label;
   for (const li of $('loading-steps').children) li.dataset.state = '';
@@ -680,7 +685,7 @@ function onLoaded(msg) {
   const { model, chat, source } = msg;
   state.lastLoaded = msg;
   const label = state.loading?.label || chat.name;
-  state.loaded = { ...source, key: state.loading?.key ?? source.key, label, info: model, chat, tools: Boolean(msg.tools), stream: Boolean(state.loading?.stream) };
+  state.loaded = { ...source, key: state.loading?.key ?? source.key, label, info: model, chat, tools: Boolean(msg.tools), stream: Boolean(state.loading?.stream), vision: msg.vision || null };
   state.loading = null;
   $('loading-bar').classList.remove('indeterminate');
   const secs = (performance.now() - loadStarted) / 1000;
@@ -697,6 +702,10 @@ function onLoaded(msg) {
   $('status-line').textContent = 'Replies are generated on this device. Responses can be wrong; check anything important.';
   setPhase('ready');
   $('prompt').focus();
+  // A switch for a kind of request: answer the request that asked for it.
+  const after = state.afterLoad;
+  state.afterLoad = null;
+  if (after) { $('status-line').textContent = after.note; after.run(); }
 }
 
 function formatParams(n) {
@@ -830,7 +839,29 @@ function send(text) {
   text = text.trim();
   if (!text || state.phase !== 'ready') return;
   state.messages.push({ role: 'user', content: text });
+  const better = betterModelFor(text);
+  if (better) {
+    trace({ type: 'switch', chat: state.chatId, kind: better.kind, from: state.loaded.label, to: better.name });
+    state.afterLoad = { run: runResponse, note: `Switched to ${better.name}, which does ${better.kind} best on this device.` };
+    startLoad(better.entry, { keepChat: true });
+    return;
+  }
   runResponse();
+}
+
+/** The saved model that does this kind of request best (BEST_FOR in models.js), when it is not the
+ *  one loaded and switching is on. Only models already saved on this device: no downloads. */
+function betterModelFor(question) {
+  if (state.settings.autoSwitch === false || !state.loaded?.tools || localComputer.connected) return null;
+  const kind = kindOf(question);
+  for (const id of BEST_FOR[kind] || []) {
+    const m = ALL.find((x) => x.id === id);
+    if (!m) continue;
+    const key = cacheKey(m.repo, m.file);
+    if (state.loaded.key === key) return null;
+    if (cachedEntry(key)?.complete) return { kind, name: m.name, entry: catalogEntry(m) };
+  }
+  return null;
 }
 
 function regenerate() {
@@ -892,6 +923,7 @@ async function getAssistant(){
       },
       getNetwork:()=>({enabled:Boolean(state.settings.internet),jinaKey:state.settings.jinaKey||''}),
       sandbox:async()=>(await ensureWorkbench()).sandbox(),
+      getVision:()=>state.loaded?.vision||null,
     });
   }
   return assistant;
@@ -1030,6 +1062,8 @@ function onDone(d) {
 
 function onError({ during, message }) {
   if (during === 'load') {
+    if (state.afterLoad) message = `Switching models for this request did not work: ${message}`;
+    state.afterLoad = null;
     state.loading = null;
     state.loaded = null;
     $('loading-bar').classList.remove('indeterminate');
@@ -1199,7 +1233,10 @@ $('hf-form').addEventListener('submit', async (e) => {
 $('file-input').addEventListener('change', (e) => {
   const files = [...(e.target.files || [])].sort((a, b) => a.name.localeCompare(b.name));
   e.target.value = '';
-  if (files.length) startLoad({ kind: 'file', files, key: null, id: null });
+  // An image encoder (llama.cpp names them mmproj) picked with the model goes beside it.
+  const vision = files.find((f) => /mmproj/i.test(f.name)) || null;
+  const model = files.filter((f) => f !== vision);
+  if (model.length) startLoad({ kind: 'file', files: model, key: null, id: null, visionFile: vision });
 });
 
 // Drawer on narrow screens.
@@ -1230,6 +1267,7 @@ function fillSettings() {
   form.elements.shareUpload.value = String(s.shareUpload ?? 2);
   form.elements.thinking.checked = Boolean(s.thinking);
   form.elements.poolGpus.checked = s.poolGpus !== false;
+  form.elements.autoSwitch.checked = s.autoSwitch !== false;
   form.elements.internet.checked = Boolean(s.internet);
   form.elements.jinaKey.value = s.jinaKey || '';
   form.elements.githubToken.value = s.githubToken || '';
