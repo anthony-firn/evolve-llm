@@ -73,12 +73,17 @@ const shellText = r => [`exit code ${r.code}${r.timedOut?' (timed out)':''}, in 
 /** The file a sed substitution reads without -i (so it changes nothing), if a command has one. */
 export function sedWithoutInPlace(command) {
   for (const part of String(command).split(/&&|\|\||;|\|/)) {
-    const m = /^\s*sed\s+(.*)$/.exec(part);
+    const m = /^\s*sed\s+([\s\S]*)$/.exec(part); // a replacement may hold a newline
     if (!m || /(^|\s)-[a-zA-Z]*i|--in-place|>/.test(m[1]) || !/(^|['"\s;])\d*,?\d*s([^\w\s])/.test(m[1])) continue;
     const file = /\s([\w./-]+)\s*$/.exec(m[1]);
     if (file) return file[1];
   }
   return null;
+}
+
+/** Whether a request asks for something more than once ("two kettles", "another", "3 times"). */
+export function wantsMore(prompt) {
+  return /\b(two|three|four|five|six|seven|eight|nine|ten|another|again|several|both|each|more than one|twice)\b|\b[2-9]\d*\s*(x\b|times\b|of\b|items?\b|pieces?\b|kettles?\b|copies\b)/i.test(String(prompt));
 }
 
 /** Whether a request places a line relative to another ("right after the line ..."). */
@@ -227,7 +232,7 @@ function refLine(snapshotText, ref) {
 }
 
 /** Browser tools that act on the shared live page through a BrowserClient (browser/API.md §4). */
-function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, confirmBrowserAction, vision = null } = {}) {
+function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, confirmBrowserAction, vision = null, request = () => '' } = {}) {
   let client=null, last=null;
   // Buttons already clicked, by page and label, with what the page said after: a second click
   // (small models go back and click "Add to cart" again and again) is held once and explained.
@@ -293,9 +298,11 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
         if(!ok)return {ok:false,text:`Click [${ref}] was not done: ${line} may buy, send, post, delete or change an account, so it needs the person's approval. Tell the person what this would do and ask them to click it in the browser themselves (or to approve it).`};
       }
       const key=/^(button|clickable|menuitem)\b/.test(line)?`${last.url}|${label0}`:null;
-      if(key&&pressed.has(key)&&!held.has(key)){
+      // Held once; held again unless the request asks for more than one ("two", "another", "3 times").
+      if(key&&pressed.has(key)&&(!held.has(key)||!wantsMore(request()))){
+        const again=held.has(key);
         held.add(key);
-        return {ok:true,text:`Click [${ref}] was not done: you already clicked ${label0} on this page, and the page then said: "${pressed.get(key)}". Clicking it again would do it a second time. If the request asks for it more than once, click it again; otherwise go on with the next step.`,snap:last};
+        return {ok:true,text:again?`Click [${ref}] was not done again: the request asks for it once, and it is done (the page said: "${pressed.get(key)}"). Go on with the next step.`:`Click [${ref}] was not done: you already clicked ${label0} on this page, and the page then said: "${pressed.get(key)}". Clicking it again would do it a second time. If the request asks for it more than once, click it again; otherwise go on with the next step.`,snap:last};
       }
       action=await b.click(ref);
       if(action?.ok!==false)clicked={ref,version:null};
@@ -351,8 +358,10 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       return {why:'This question asks for sources, and you have not searched yet.',cmd:'web_search with a short query, then open_url on the best result, and cite its link'};
     // Sources asked for and pages read, but no link in the answer (small models cite a title):
     // give the addresses of the pages actually opened, so no link is made up.
-    if(wantsSources(currentPrompt)&&opened.length&&!/https?:\/\//.test(reply))
-      return {why:'The request asks for sources, and your answer has no link.',say:`Give your answer again with the link of the page it came from. Pages you opened: ${opened.slice(-3).join(' ')}`};
+    // Pages opened first; else the search results the answer came from.
+    const read=opened.length?opened:found;
+    if(wantsSources(currentPrompt)&&read.length&&!/https?:\/\//.test(reply))
+      return {why:'The request asks for sources, and your answer has no link.',say:`Give your answer again with the link of the page it came from. ${opened.length?'Pages you opened':'Pages your search found'}: ${read.slice(opened.length?-3:0,3).join(' ')}`};
     if(!linux||!asked?.commit)return null;
     const st=await workspace.request('exec',{command:'git status'},{signal}).catch(()=>null);
     if(!st||st.code)return null;
@@ -360,8 +369,8 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(asked.push&&/is ahead of/.test(st.stdout||''))return {why:'Your commits are not pushed yet.',cmd:'git push'};
     if(asked.pr&&pushed){const v=await workspace.request('exec',{command:'gh pr view'},{signal}).catch(()=>null);if(v&&v.code)return {why:'The pull request is not open yet.',cmd:'gh pr create --title "Title" --body "What and why"'};}
     return null;
-  };let ghRepo=null, stuck=null, asked=null, declined=false, nudges=0, pushed=false, webCalls=0, currentPrompt='', opened=[];
-  const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction,vision}):null;
+  };let ghRepo=null, stuck=null, asked=null, declined=false, nudges=0, pushed=false, webCalls=0, currentPrompt='', opened=[], found=[];
+  const browserTools=browser?createBrowserTools(browser,{snapshotChars:browserSnapshotChars,confirmBrowserAction,vision,request:()=>currentPrompt}):null;
   const limits=linux?LINUX_LIMITS:browserTools?BROWSER_LIMITS:LIMITS;
   const declarations=(linux?[
     ['bash','Run a shell command in the Linux VM (POSIX-style shell with pipes, &&, git and gh). Returns stdout, stderr and the exit code.',fields({command:string('Shell command')})],
@@ -433,8 +442,9 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
       if(['write','edit'].includes(name)){changes++;if(/\.html?$/i.test(args.path))previewPath=args.path;}
     }
     else if(['preview','browser_test'].includes(name)){if(!preview)throw new Error('Preview is unavailable.');if(name==='preview'&&pendingChangeError)throw new Error('A file change failed. Read the file and correct the failed write or edit before final preview.');result=await preview(args.path,{signal,smoke:name==='browser_test'});if(name==='preview'&&result.ok===true)completedPreview=true;}
-    else{result=await network.run(name,args,signal);webCalls++;if(name==='open_url')for(const src of result.sources||[])if(src.url&&!opened.includes(src.url))opened.push(src.url);}
-    const full=name==='read'?`File: ${args.path}\n${result.text}`:name==='bash'&&linux?shellText(result):JSON.stringify(result);
+    else{result=await network.run(name,args,signal);webCalls++;for(const src of result.sources||[]){const list=name==='open_url'?opened:found;if(src.url&&!list.includes(src.url))list.push(src.url);}}
+    const {now,...rest}=result||{};
+    const full=name==='read'?`File: ${args.path}\n${result.text}`:name==='bash'&&linux?shellText(result):name==='edit'&&now?`${JSON.stringify(rest)}\nThose lines now read:\n${now}`:JSON.stringify(result);
     const body=full.length<=limits.result?full:full.slice(0,limits.result)+(name==='read'?`\n… (${full.length-limits.result} more characters not shown. To find a line, run: grep -n "SOME WORDS" ${args.path}; edit needs only the exact text to replace.)`:'\n… (output cut)');
     return {content:[{type:'text',text:body}],details:{sandbox:true},isError:result.ok===false||Boolean(result.code)||(['web_search','open_url'].includes(name)&&!result.sources?.length)};
   }}));
@@ -530,5 +540,5 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
-  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;cutoffs=0;pushed=false;webCalls=0;opened=[];currentPrompt=String(prompt);const pre=linux?await preamble(prompt,workspace,linux.cwd,linux.building?.()||null):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
+  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;cutoffs=0;pushed=false;webCalls=0;opened=[];found=[];currentPrompt=String(prompt);const pre=linux?await preamble(prompt,workspace,linux.cwd,linux.building?.()||null):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
 }

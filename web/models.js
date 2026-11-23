@@ -11,12 +11,14 @@ const KIMI_K31 = { license: 'Kimi K3.1 Pro License', licenseUrl: 'https://huggin
  *  work best in tests/agent_bench.py, best first. With "Switch models by kind of request" on, the
  *  chat loads the first one saved on this device before answering. Measured on a laptop with an
  *  RTX 3050 and an Intel GPU (2026-11-22); update from new benchmark runs. */
+// From the agent benchmark (tests/agent_bench.py), rounds 7 and 8: Qwen3 4B Instruct 2507 10/10
+// twice; Nanbeige4.1 3B 7/10 (coding 4/6, research, law and browsing 1/1 each); Qwen3 4B 4/10 twice.
 export const BEST_FOR = {
-  coding: ['qwen3-4b', 'qwen3-4b-2507'],
-  research: ['qwen3-4b-2507', 'qwen3-4b'],
-  law: ['qwen3-4b-2507', 'qwen3-4b'],
-  browser: ['qwen3-4b-2507', 'qwen3-4b'],
-  chat: ['qwen3-4b-2507', 'qwen3-4b'],
+  coding: ['qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
+  research: ['qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
+  law: ['qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
+  browser: ['qwen3-4b-2507', 'nanbeige4.1-3b', 'qwen3-4b'],
+  chat: ['qwen3-4b-2507', 'qwen3-4b', 'nanbeige4.1-3b'],
 };
 
 export const MODELS = [

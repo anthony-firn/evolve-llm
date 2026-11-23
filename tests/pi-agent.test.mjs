@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement, sedWithoutInPlace } from '../web/pi-agent.mjs';
+import { createPiTask, askedSteps, namedRepos, wantsSources, wantsPlacement, sedWithoutInPlace, wantsMore } from '../web/pi-agent.mjs';
 
 test('real Pi agent loop invokes sandbox tools and feeds their results back to the local transport',async()=>{
  const files=new Map(),events=[];let round=0;
@@ -407,7 +407,8 @@ test('a request for sources answered from memory is asked to search first, once,
    return{text:n===2&&enabled?'<tool_call>'+JSON.stringify({name:'web_search',arguments:{query:'Sunvale deposit'}})+'</tool_call>':'Landlords have 30 days.',reason:'end'};
   }});
   await task.run('How many days does a Sunvale landlord have to return a deposit? Cite the section.');
-  if(enabled){assert.match(seen[1],/Not finished yet: This question asks for sources, and you have not searched yet\. Make that tool call now: web_search/);assert.equal(n,3);}
+  // Then, its answer having no link, it is given the search's results to cite.
+  if(enabled){assert.match(seen[1],/Not finished yet: This question asks for sources, and you have not searched yet\. Make that tool call now: web_search/);assert.match(seen[3],/Pages your search found: https:\/\/x/);assert.equal(n,4);}
   else assert.equal(n,1);
  }
 });
@@ -426,6 +427,8 @@ test('a line asked for after another line but appended with >> gets a note on ho
 test('sedWithoutInPlace finds a substitution that leaves its file unchanged',()=>{
  assert.equal(sedWithoutInPlace("cd app && sed -n '1s/def add(a, b):/x/' calc.py"),'calc.py');
  assert.equal(sedWithoutInPlace("sed 's/a - b/a + b/' calc.py"),'calc.py');
+ // As models send it: the replacement's \n arrives as a real newline.
+ assert.equal(sedWithoutInPlace("cd app && sed -n '1s/def add(a, b):/def add(a, b):\n    return a + b/' calc.py"),'calc.py');
  assert.equal(sedWithoutInPlace("sed -i 's/a - b/a + b/' calc.py"),null);
  assert.equal(sedWithoutInPlace("sed 's/a/b/' calc.py > new.py"),null);
  assert.equal(sedWithoutInPlace("sed -n '1,20p' calc.py"),null);
@@ -472,7 +475,7 @@ test('a button clicked again on the same page is held once and explained, then a
     if (n === 5) return call('browser_click', { ref: 1 });
     return { text: 'Done.', reason: 'end' };
   } });
-  await task.run('Add the blue kettle to the cart');
+  await task.run('Add two blue kettles to the cart');
   assert.deepEqual(browser.log.filter(l => l[0] === 'click').map(l => l[1]), [2, 2, 1]);
   assert.match(JSON.stringify(seen[2]), /was not done: you already clicked button \\"Add Blue Kettle to cart\\" on this page, and the page then said: \\"Cart: 1 item\(s\)\\"/);
 });
@@ -565,4 +568,33 @@ test('a reply cut off at the output limit is asked again once, by how it was cut
   const twice = createPiTask({ workspace: { request: async () => ({}) }, network: { options: () => ({ enabled: false }) }, turn: async () => { m++; return { text: '<think>' + 'more '.repeat(20), reason: 'length' }; } });
   await assert.rejects(twice.run('Merge it'), /output\/context limit/);
   assert.equal(m, 2);
+});
+
+test('an answer from search results alone, without a link, is sent back with the results\' addresses', async () => {
+  const prompts = []; let n = 0;
+  const network = { options: () => ({ enabled: true }), run: async () => ({ text: '1. Lighthouse: lit in 1887', sources: [{ title: 'Lighthouse', url: 'https://en.wikipedia.org/wiki/Lighthouse' }, { title: 'Other', url: 'https://example.org/b' }] }) };
+  const task = createPiTask({ workspace: { request: async () => ({}) }, network, turn: async (messages) => {
+    n++; prompts.push(JSON.stringify(messages.at(-1)));
+    if (n === 1) return { text: '<tool_call>' + JSON.stringify({ name: 'web_search', arguments: { query: 'lighthouse' } }) + '</tool_call>', reason: 'end' };
+    return { text: n === 2 ? 'It was lit in 1887. Source: Lighthouse' : 'It was lit in 1887. https://en.wikipedia.org/wiki/Lighthouse', reason: 'end' };
+  } });
+  await task.run('When was the lighthouse first lit? Include the link you used.');
+  assert.equal(n, 3);
+  assert.match(prompts[2], /Pages your search found: https:\/\/en\.wikipedia\.org\/wiki\/Lighthouse https:\/\/example\.org\/b/);
+});
+
+test('a button clicked again stays held when the request asks for it once', async () => {
+  assert.ok(wantsMore('Add two kettles')); assert.ok(wantsMore('click it 3 times')); assert.ok(!wantsMore('Go to http://127.0.0.1:37187/ and add the Blue Kettle'));
+  const pages = { 'https://shop.example/': '# Shop\nCart: 1 item(s)\n[1] button "Add Red Kettle to cart"  [2] button "Add Blue Kettle to cart"' };
+  const browser = fakeBrowser(pages); let n = 0; const seen = [];
+  const task = createPiTask({ browser, workspace: { request: async () => ({}) }, network, turn: async (messages) => {
+    if (n) seen.push(JSON.stringify(messages.at(-1).content));
+    n++;
+    if (n === 1) return call('browser_open', { url: 'https://shop.example/' });
+    if (n <= 4) return call('browser_click', { ref: 2 });
+    return { text: 'Done.', reason: 'end' };
+  } });
+  await task.run('Go to https://shop.example/ and add the Blue Kettle to the cart.');
+  assert.deepEqual(browser.log.filter(l => l[0] === 'click').map(l => l[1]), [2]);
+  assert.match(seen[3], /was not done again: the request asks for it once/);
 });

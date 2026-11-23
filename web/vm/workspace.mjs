@@ -1,6 +1,17 @@
 // Pi's workspace on the Evolve VM: the same requests as the browser sandbox (web/shell-client.mjs)
 // — exec, read, write, edit — answered by the VM, in a working directory.
 
+/** The edited lines as they are now, numbered, with a line before and two after (so a model sees
+ *  what it left, such as an old line under its new one); left out for long edits. */
+export function around(text, at, length) {
+  const lines = text.split('\n');
+  const first = text.slice(0, at).split('\n').length - 1;
+  const last = text.slice(0, at + length).split('\n').length - 1;
+  const from = Math.max(0, first - 1), to = Math.min(lines.length, last + 3);
+  if (to - from > 14) return {};
+  return { now: lines.slice(from, to).map((l, i) => `${from + i + 1}: ${l}`).join('\n') };
+}
+
 export class VmWorkspace {
   constructor(vm, { cwd = '/home/user', timeoutMs = 600000 } = {}) {
     this.vm = vm;
@@ -48,12 +59,15 @@ export class VmWorkspace {
         const loose = looseReplace(r.data, data.oldText || '', data.newText ?? '');
         if (loose != null) {
           await this.vm.write(path, loose);
-          return { path, replaced: 1, note: 'matched with blank lines and spaces at line ends ignored; only the changed lines were replaced' };
+          const at = loose.indexOf(data.newText ?? '');
+          return { path, replaced: 1, note: 'matched with blank lines and spaces at line ends ignored; only the changed lines were replaced', ...(at >= 0 && around(loose, at, (data.newText ?? '').length)) };
         }
       }
       if (count !== 1) throw new Error(count ? `oldText matches ${count} places in ${data.path}; include more context` : `oldText is not in ${data.path}; read the file again and copy the exact text`);
-      await this.vm.write(path, r.data.replace(data.oldText, () => data.newText ?? ''));
-      return { path, replaced: 1 };
+      const at = r.data.indexOf(data.oldText);
+      const edited = r.data.replace(data.oldText, () => data.newText ?? '');
+      await this.vm.write(path, edited);
+      return { path, replaced: 1, ...around(edited, at, (data.newText ?? '').length) };
     }
     if (type === 'snapshot') return { snapshot: JSON.stringify({ files: {}, dirs: [], cwd: this.cwd }) };
     throw new Error(`${type} is not available in the Linux workspace`);
