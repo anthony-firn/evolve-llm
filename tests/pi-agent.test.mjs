@@ -407,7 +407,8 @@ test('a request for sources answered from memory is asked to search first, once,
    return{text:n===2&&enabled?'<tool_call>'+JSON.stringify({name:'web_search',arguments:{query:'Sunvale deposit'}})+'</tool_call>':'Landlords have 30 days.',reason:'end'};
   }});
   await task.run('How many days does a Sunvale landlord have to return a deposit? Cite the section.');
-  if(enabled){assert.match(seen[1],/Not finished yet: This question asks for sources, and you have not searched yet\. Make that tool call now: web_search/);assert.equal(n,3);}
+  // Then, its answer having no link, it is given the search's results to cite.
+  if(enabled){assert.match(seen[1],/Not finished yet: This question asks for sources, and you have not searched yet\. Make that tool call now: web_search/);assert.match(seen[3],/Pages your search found: https:\/\/x/);assert.equal(n,4);}
   else assert.equal(n,1);
  }
 });
@@ -567,4 +568,17 @@ test('a reply cut off at the output limit is asked again once, by how it was cut
   const twice = createPiTask({ workspace: { request: async () => ({}) }, network: { options: () => ({ enabled: false }) }, turn: async () => { m++; return { text: '<think>' + 'more '.repeat(20), reason: 'length' }; } });
   await assert.rejects(twice.run('Merge it'), /output\/context limit/);
   assert.equal(m, 2);
+});
+
+test('an answer from search results alone, without a link, is sent back with the results\' addresses', async () => {
+  const prompts = []; let n = 0;
+  const network = { options: () => ({ enabled: true }), run: async () => ({ text: '1. Lighthouse: lit in 1887', sources: [{ title: 'Lighthouse', url: 'https://en.wikipedia.org/wiki/Lighthouse' }, { title: 'Other', url: 'https://example.org/b' }] }) };
+  const task = createPiTask({ workspace: { request: async () => ({}) }, network, turn: async (messages) => {
+    n++; prompts.push(JSON.stringify(messages.at(-1)));
+    if (n === 1) return { text: '<tool_call>' + JSON.stringify({ name: 'web_search', arguments: { query: 'lighthouse' } }) + '</tool_call>', reason: 'end' };
+    return { text: n === 2 ? 'It was lit in 1887. Source: Lighthouse' : 'It was lit in 1887. https://en.wikipedia.org/wiki/Lighthouse', reason: 'end' };
+  } });
+  await task.run('When was the lighthouse first lit? Include the link you used.');
+  assert.equal(n, 3);
+  assert.match(prompts[2], /Pages your search found: https:\/\/en\.wikipedia\.org\/wiki\/Lighthouse https:\/\/example\.org\/b/);
 });
