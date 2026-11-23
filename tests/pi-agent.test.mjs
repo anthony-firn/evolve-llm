@@ -29,7 +29,8 @@ test('truncated tool calls are not executed and malformed arguments do not cross
  const task=createPiTask({workspace:{request:async()=>{executed++;return{ok:true}}},network:{options:()=>({enabled:false})},turn:async()=>{
   n++;return n===1?{text:'<tool_call>{"name":"write","arguments":{"path":"/workspace/a","text":"x"}}</tool_call>',reason:'length',n:1}:{text:'Stopped at the output limit.',reason:'end',n:1};
  }});
- await assert.rejects(task.run('Write'),/output\/context limit/);assert.equal(executed,0);
+ // The cut-off call never runs; the model is asked once more (see the cut-off test below).
+ await task.run('Write');assert.equal(executed,0);assert.equal(n,2);
 });
 
 test('invalid tool JSON cannot be reported as successful execution',async()=>{
@@ -543,4 +544,25 @@ test('typing without an element number goes to the element clicked last on the s
   await task.run('Search for kettles');
   assert.deepEqual(browser.log.filter((l) => l[0] === 'type').map((l) => [l[1], l[2]]), [[1, 'kettle']]);
   assert.match(seen[0], /ref must be an element number/);
+});
+
+test('a reply cut off at the output limit is asked again once, by how it was cut', async () => {
+  for (const [cut, want] of [
+    ['<think>\nLet me weigh every option ' + 'again '.repeat(50), /You thought past the reply limit/],
+    ['<think>ok</think>\n\n \n\n \n\n', /only blank lines/],
+    ['<tool_call>\n{"name": "write", "arguments": {"path": "counter.html", "text": "<html>' + 'x'.repeat(200), /cut off at the output limit.*small and simple/],
+  ]) {
+    let n = 0; const asks = [];
+    const task = createPiTask({ workspace: { request: async () => ({}) }, network: { options: () => ({ enabled: false }) }, turn: async (messages) => {
+      n++; if (n > 1) asks.push(messages.at(-1).content);
+      return n === 1 ? { text: cut, reason: 'length' } : { text: 'Done.', reason: 'end' };
+    } });
+    await task.run('Make counter.html');
+    assert.equal(n, 2); assert.match(asks[0], want);
+  }
+  // A second cut-off in the same task stops it, as before.
+  let m = 0;
+  const twice = createPiTask({ workspace: { request: async () => ({}) }, network: { options: () => ({ enabled: false }) }, turn: async () => { m++; return { text: '<think>' + 'more '.repeat(20), reason: 'length' }; } });
+  await assert.rejects(twice.run('Merge it'), /output\/context limit/);
+  assert.equal(m, 2);
 });
