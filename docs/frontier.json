@@ -1,0 +1,313 @@
+{
+ "about": "Coding quality from an independent evaluator against speed on this engine. Read by tools/frontier.py.",
+ "quality": {
+  "name": "Artificial Analysis Coding Index (Intelligence Index v4.0)",
+  "what": "Terminal-Bench Hard and SciCode, run by Artificial Analysis",
+  "source": "https://web.archive.org/web/20260601053007/https://artificialanalysis.ai/models",
+  "as_of": "2026-06-01",
+  "why_archived": "Artificial Analysis retired the Coding Index after v4.0; this is its last full table, covering Qwen3.5 and Qwen3.6",
+  "tokens": "Output tokens each model spent on Artificial Analysis Intelligence Index v4.0 (same table), in millions: time per answer is these over speed"
+ },
+ "device": "Laptop: RTX 3050 6 GB Laptop GPU (Vulkan, native CLI), 15 GB RAM, NVMe drive",
+ "speed_method": "evolve-llm bench: 256 prompt tokens, then 64 greedy tokens; the warm round",
+ "read_rates_gb_s": {
+  "drive": 1.5,
+  "network": 0.011
+ },
+ "read_rates_how": {
+  "drive": "dd with O_DIRECT, 16 MB blocks, on this laptop (2026-11-22)",
+  "network": "this connection on 2026-11-22: 11 MB/s over 9 connections to three mirrors; one connection gave 1.5-1.9 MB/s"
+ },
+ "models": [
+  {
+   "name": "SmolLM2 135M",
+   "file_gb": 0.14,
+   "coding": null,
+   "tok_s": 218.3
+  },
+  {
+   "name": "Qwen2.5 0.5B",
+   "file_gb": 0.49,
+   "coding": null,
+   "tok_s": 129.4
+  },
+  {
+   "name": "Qwen3 0.6B",
+   "file_gb": 0.64,
+   "coding": {
+    "no_thinking": {
+     "coding": 1.35,
+     "output_mtok": 2.9
+    },
+    "thinking": {
+     "coding": 0.93,
+     "output_mtok": 19.5
+    }
+   },
+   "tok_s": 96.4
+  },
+  {
+   "name": "Qwen3.5 0.8B",
+   "file_gb": 0.53,
+   "coding": {
+    "no_thinking": {
+     "coding": 0.96,
+     "output_mtok": 101.5
+    },
+    "thinking": {
+     "coding": 0.0,
+     "output_mtok": 232.8
+    }
+   },
+   "tok_s": 92.1
+  },
+  {
+   "name": "Llama 3.2 1B",
+   "file_gb": 0.81,
+   "coding": {
+    "no_thinking": {
+     "coding": 0.58,
+     "output_mtok": null
+    }
+   },
+   "tok_s": 72.9
+  },
+  {
+   "name": "Qwen3-VL 2B",
+   "file_gb": 1.11,
+   "coding": null,
+   "tok_s": 53.1
+  },
+  {
+   "name": "Qwen3.5 2B",
+   "file_gb": 1.28,
+   "coding": {
+    "no_thinking": {
+     "coding": 4.92,
+     "output_mtok": 100.2
+    },
+    "thinking": {
+     "coding": 3.45,
+     "output_mtok": 389.5
+    }
+   },
+   "tok_s": 47.3
+  },
+  {
+   "name": "Nanbeige4.1 3B",
+   "file_gb": 2.44,
+   "coding": {
+    "thinking": {
+     "coding": 8.87,
+     "output_mtok": 146.2
+    }
+   },
+   "tok_s": 26.3
+  },
+  {
+   "name": "Qwen3 4B",
+   "file_gb": 2.5,
+   "coding": null,
+   "tok_s": 22.7
+  },
+  {
+   "name": "Qwen3 4B Instruct 2507",
+   "file_gb": 2.5,
+   "coding": {
+    "no_thinking": {
+     "coding": 9.05,
+     "output_mtok": 21.8
+    }
+   },
+   "tok_s": 22.5
+  },
+  {
+   "name": "Qwen3.5 4B",
+   "file_gb": 2.74,
+   "coding": {
+    "no_thinking": {
+     "coding": 13.67,
+     "output_mtok": 75.1
+    },
+    "thinking": {
+     "coding": 17.49,
+     "output_mtok": 236.7
+    }
+   },
+   "tok_s": 20.3
+  },
+  {
+   "name": "Ornith 1.0 9B",
+   "file_gb": 5.63,
+   "coding": null,
+   "tok_s": 1.3,
+   "setup": "drive",
+   "note": "4.5 GB GPU budget: 6 of 32 layers read from the drive each token"
+  },
+  {
+   "name": "OmniCoder 9B",
+   "file_gb": 5.74,
+   "coding": null,
+   "tok_s": 1.1,
+   "setup": "drive",
+   "note": "4.5 GB GPU budget: 7 of 32 layers read from the drive each token"
+  },
+  {
+   "name": "OLMoE 1B-7B",
+   "file_gb": 4.21,
+   "coding": null,
+   "tok_s": 15,
+   "device": "Intel GPU",
+   "note": "README measurement, Q2_K on the Intel GPU"
+  },
+  {
+   "name": "Qwen3 4B Thinking 2507",
+   "file_gb": 2.5,
+   "coding": {
+    "thinking": {
+     "coding": 9.54,
+     "output_mtok": 52.9
+    }
+   },
+   "same_as": "Qwen3 4B Instruct 2507"
+  },
+  {
+   "name": "SmolLM2 360M",
+   "file_gb": 0.39,
+   "coding": null
+  },
+  {
+   "name": "SmolLM2 1.7B",
+   "file_gb": 1.06,
+   "coding": null
+  },
+  {
+   "name": "Qwen2.5 1.5B",
+   "file_gb": 1.12,
+   "coding": null
+  },
+  {
+   "name": "Qwen2.5 Coder 1.5B",
+   "file_gb": 0.99,
+   "coding": null
+  },
+  {
+   "name": "Qwen3 1.7B",
+   "file_gb": 1.83,
+   "coding": {
+    "no_thinking": {
+     "coding": 2.31,
+     "output_mtok": 4.4
+    },
+    "thinking": {
+     "coding": 1.43,
+     "output_mtok": 36.7
+    }
+   }
+  },
+  {
+   "name": "Llama 3.2 3B",
+   "file_gb": 2.02,
+   "coding": null
+  },
+  {
+   "name": "GUI-Owl 1.5 4B",
+   "file_gb": 2.5,
+   "coding": null
+  },
+  {
+   "name": "Qwen3 Coder 30B-A3B",
+   "file_gb": 12.85,
+   "coding": {
+    "no_thinking": {
+     "coding": 19.36,
+     "output_mtok": 13.2
+    }
+   },
+   "reads_gb": 0.74
+  },
+  {
+   "name": "Qwen3 30B-A3B 2507",
+   "file_gb": 11.79,
+   "coding": {
+    "no_thinking": {
+     "coding": 14.19,
+     "output_mtok": 14.7
+    }
+   },
+   "reads_gb": 0.67
+  },
+  {
+   "name": "Qwen3 235B-A22B 2507",
+   "file_gb": 88.77,
+   "coding": {
+    "no_thinking": {
+     "coding": 22.1,
+     "output_mtok": 14.8
+    }
+   },
+   "reads_gb": 6.08
+  },
+  {
+   "name": "Qwen3 Coder 480B-A35B",
+   "file_gb": 149.72,
+   "coding": {
+    "no_thinking": {
+     "coding": 24.59,
+     "output_mtok": 9.0
+    }
+   },
+   "reads_gb": 11.14
+  },
+  {
+   "name": "DeepSeek V3.1",
+   "file_gb": 192.31,
+   "coding": {
+    "no_thinking": {
+     "coding": 28.39,
+     "output_mtok": 9.2
+    },
+    "thinking": {
+     "coding": 29.71,
+     "output_mtok": 59.7
+    }
+   },
+   "reads_gb": 13.91
+  },
+  {
+   "name": "Kimi K2 0905",
+   "file_gb": 248.61,
+   "coding": {
+    "no_thinking": {
+     "coding": 25.88,
+     "output_mtok": 7.9
+    }
+   },
+   "reads_gb": 10.17
+  },
+  {
+   "name": "Kimi K3.1 Pro",
+   "file_gb": 592.67,
+   "coding": null,
+   "reads_gb": 56.7,
+   "note": "Released after Artificial Analysis retired its Coding Index; its v5 Intelligence Index is 46.45, the highest here"
+  },
+  {
+   "name": "Qwen3.6 35B-A3B",
+   "file_gb": 16.85,
+   "coding": {
+    "no_thinking": {
+     "coding": 17.6,
+     "output_mtok": 24.3
+    },
+    "thinking": {
+     "coding": 35.15,
+     "output_mtok": 143.2
+    }
+   },
+   "tok_s": 1.5,
+   "setup": "drive",
+   "note": "evolve-llm run, 80 tokens after a 30-token prompt; 4.5 GB GPU budget, experts read from the drive (62% from the GPU cache)"
+  }
+ ]
+}
