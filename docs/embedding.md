@@ -27,7 +27,7 @@ const engine = createEngine();
 const abort = new AbortController();
 try {
   await engine.initialize({ signal: abort.signal });
-  await engine.load('smollm2-135m', {
+  await engine.load('qwen3-0.6b', {
     contextSize: 2048,
     signal: abort.signal,
     onProgress: event => console.log(event.type),
@@ -49,7 +49,8 @@ try {
 ## Contract
 
 `initialize()` checks the GPU adapter and initializes the WASM runtime. `load(id, options)`
-uses an exact catalog ID, such as `smollm2-135m`, `qwen2.5-0.5b` or `llama3.2-1b`.
+uses an exact catalog ID, such as `qwen3-0.6b`, `qwen3.5-2b` or `qwen3-4b-2507` (the catalog holds only
+models on the speed and quality frontier; web/models.js lists them).
 Use `load({ files: [...fileInput.files] })` for local GGUF files. Remote catalog files use the
 catalog's Hugging Face URL; its current revision is `main`, not an immutable model artifact.
 Pin and retain your own model files if you need reproducible weights.
@@ -80,9 +81,8 @@ Worker errors use fixed messages, so raw engine exceptions and prompt text are n
 
 ## Verified scope
 
-SmolLM2 135M, Qwen2.5 0.5B, Qwen3 0.6B, Llama 3.2 1B and OLMoE 1B-7B have browser/native
-reply comparisons in the engine's existing verification record. The largest catalog models
-have architecture and layout tests, but have not been run end to end. Their speed is unmeasured.
+Qwen3 0.6B has browser/native reply comparisons in the engine's existing verification record,
+as do SmolLM2 135M, Qwen2.5 0.5B, Llama 3.2 1B and OLMoE 1B-7B, which you can load as files.
 See [the engine's verification and measured results](https://github.com/anthony-firn/evolve-llm#verification).
 
 The SDK protocol tests use synthetic workers to check stream ordering, cancellation, bounded

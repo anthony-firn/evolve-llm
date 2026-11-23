@@ -6,8 +6,10 @@ and public leaderboards. Marks:
 - **[X]** measured by another model maker;
 - **[S]** self-reported by the model's maker.
 
-Agent and GUI scores vary a lot with the harness, so the benchmark that decides is our own:
-`tests/agent_bench.py`, scored per kind of request, which feeds `BEST_FOR` in `web/models.js`.
+Which models the app offers is decided by the frontier (`web/model-manager.mjs`): Artificial
+Analysis's Coding Index and output tokens per model (`modes` in `web/models.js`) against speed on
+this engine, so only quality is taken from outside and only speed is measured here. Our own
+`tests/agent_bench.py` checks that the models the frontier picks really do the work.
 
 ## Summary
 

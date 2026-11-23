@@ -10,8 +10,8 @@ it. There is nothing to install, no account, and no server that sees your messag
 **Status: early release.** The engine runs dense models (Llama, Mistral, Qwen2, Qwen3, SmolLM)
 and mixture-of-experts models (Qwen3-MoE, Mixtral, OLMoE, DeepSeek V2 and V3, Kimi K2) from
 GGUF files, single or split. It is tested in Chrome on Linux with NVIDIA and Intel GPUs and
-against reference implementations (see [Verification](#verification)). The largest models in
-the catalog have not been run end to end yet; see [Limits](#limits).
+against reference implementations (see [Verification](#verification)). The largest models it
+reads (DeepSeek V3.1, Kimi K2, Kimi K3.1 Pro) have not been run end to end yet; see [Limits](#limits).
 
 ## One chat that can also do things
 
@@ -38,10 +38,15 @@ announced on Nostr. See [docs/browser.md](docs/browser.md).
 
 ## What it does
 
-- **Downloads a model once.** Choose from the catalog, browse any Hugging Face repository, or
-  paste a GGUF file's path. Files stream into the browser's private storage and resume after a
-  dropped connection; split models download part by part. You can also open GGUF files already
-  on your device; they are read in place.
+- **Chooses the model for each request.** The app keeps only models on the frontier of coding
+  quality (Artificial Analysis's independent Coding Index) against time per answer on this
+  device, and runs each request on the rung its difficulty needs: everyday requests on the
+  fastest, harder ones higher up. A turn that fails, or "that did not work", moves the
+  conversation up a rung, and a failed turn is tried again there (`web/model-manager.mjs`).
+- **Downloads a model once.** Pieces come over several connections from Hugging Face and, when
+  published chunk hashes can check every piece, from ModelScope too; they land in the browser's
+  private storage and a stopped download resumes with what it has. Developers can also paste a
+  Hugging Face path or open GGUF files already on the device; those are read in place.
 - **Runs it on your GPU.** Weights upload in 16 MB slices, so loading never needs the whole
   file in memory.
 - **Runs models that do not fit.** Give the model a GPU memory budget in Settings. What fits
@@ -206,8 +211,9 @@ so streaming in the browser is slower than native.
 
 ## Limits
 
-- The largest catalog models (Qwen3 235B-A22B, Qwen3 Coder 480B-A35B, DeepSeek V3.1, Kimi K2,
-  Kimi K3.1 Pro) use architectures, weight formats, tokenizers and templates that are verified
+- The largest models (Qwen3 235B-A22B, Qwen3 Coder 480B-A35B, DeepSeek V3.1, Kimi K2,
+  Kimi K3.1 Pro), which the app no longer offers (they are off its frontier on any one device)
+  but the CLI and a pasted link still run, use architectures, weight formats, tokenizers and templates that are verified
   here, but they have not produced a reply end to end: over the test laptop's connection one
   token of Kimi K3.1 Pro takes hours. Their speed depends on the connection and on how much
   of each token's reads the device cache holds.
@@ -312,7 +318,7 @@ to print every value at full precision (the fixture records the prompts and toke
 ## License
 
 Apache 2.0. The IQ code books and block decoders derive from ggml (MIT); see NOTICE. Models are
-not part of this repository; each one keeps its own license, shown in the model picker.
+not part of this repository; each one keeps its own license, shown in the model list.
 
 ## Browser embedding API
 

@@ -32,14 +32,11 @@
     <aside class="sidebar" id="sidebar" aria-labelledby="models-title">
       <div class="side-head">
         <h2 id="models-title">Models</h2>
-        <p id="models-intro">Each model downloads once from Hugging Face, then runs from this browser. The largest run from Hugging Face directly, without a download.</p>
+        <p id="models-intro">The app chooses the model for each request: everyday requests run on the fastest, harder ones on stronger models, and a request that fails is tried again on a stronger one. Only models that no other beats on both speed and quality are used. Each downloads once, then runs from this browser.</p>
       </div>
       <ul class="model-list" id="model-list"></ul>
-      <h3 class="list-title" id="large-title">Large models</h3>
-      <p class="list-note">Mixture-of-experts models. OLMoE 1B-7B has been run in the browser. The entries marked “Runs from Hugging Face” are larger than most devices can store: they are read over the network as they run, a token at a time, and can take minutes to hours per token. They have architecture tests but have not produced a reply end to end.</p>
-      <ul class="model-list" id="large-list" aria-labelledby="large-title"></ul>
       <details class="other" id="other-sources">
-        <summary>Other models</summary>
+        <summary>For developers: other models</summary>
         <form id="hf-form" class="hf-form" novalidate>
           <label for="hf-input">A Hugging Face repository or GGUF file</label>
           <div class="field-row">
@@ -65,7 +62,7 @@
         <section class="welcome" id="welcome" aria-labelledby="welcome-title">
           <p class="eyebrow">Private by design</p>
           <h1 id="welcome-title">Run a language model on your own GPU.</h1>
-          <p class="lede">Choose a model to download it once. It then runs entirely in this tab: a Rust engine compiled to WebAssembly computes every token with WebGPU shaders. Models larger than your GPU's memory run too, reading what does not fit from storage. Your messages never leave this device.</p>
+          <p class="lede">The app downloads the right model for this device once. It then runs entirely in this tab: a Rust engine compiled to WebAssembly computes every token with WebGPU shaders. Models larger than your GPU's memory run too, reading what does not fit from storage. Your messages never leave this device.</p>
           <ul class="points">
             <li><strong>No install, no account.</strong> A modern browser is all it takes.</li>
             <li><strong>Stays on your device.</strong> No server sees your prompts or replies. Web search is off unless you turn it on.</li>
@@ -100,7 +97,7 @@
 
       <form class="composer" id="composer">
         <label class="sr-only" for="prompt">Message</label>
-        <textarea id="prompt" rows="1" placeholder="Choose a model to start" disabled enterkeyhint="send"></textarea>
+        <textarea id="prompt" rows="1" placeholder="Start above to load a model" disabled enterkeyhint="send"></textarea>
         <button class="web-toggle" type="button" id="web-toggle" aria-pressed="false" title="Let the model search the web">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 12h18M12 3c2.8 3 2.8 15 0 18M12 3c-2.8 3-2.8 15 0 18" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
           <span>Web</span>
@@ -148,9 +145,8 @@
         <small>On laptops with two GPUs, power saving usually picks the integrated one. Used when a model loads.</small>
       </label>
       <label class="check"><input type="checkbox" name="poolGpus"> Use both GPUs when a model does not fit on the faster one</label>
-      <label class="check"><input type="checkbox" name="manageModels"> Manage models for me: pick the best model for this device, load it when I open the app, download better ones in the background, and remove ones I do not use</label>
+      <label class="check"><input type="checkbox" name="manageModels"> Choose models for me: run each request on the model of this device’s speed and quality frontier that its difficulty needs, download them in the background, and remove ones not used. Turn off only to test a model of your own.</label>
       <label class="check"><input type="checkbox" name="mirrors"> Download models from mirrors too (ModelScope beside Hugging Face) when published hashes can check every piece</label>
-      <label class="check"><input type="checkbox" name="autoSwitch"> Switch to the saved model that does each kind of request best (coding, research, law, browsing)</label>
       <small>With Highest performance on a computer with two GPUs: the faster runs as many layers as its free memory holds, and the other GPU the rest, instead of reading them from storage.</small>
       <label class="block">GPU memory for the model
         <select name="gpuMemory">
@@ -229,7 +225,7 @@
           <small>A fine-grained token with Contents and Pull requests (read and write), and Actions (read), on the repositories the assistant may change. Kept only in this browser and sent only to api.github.com; programs in the terminal never see it. Without one, it can clone public repositories.</small>
         </label>
       </fieldset>
-      <label class="check"><input type="checkbox" name="thinking"> Let reasoning models think before answering</label>
+      <label class="check"><input type="checkbox" name="thinking"> Let reasoning models think before answering (when models are not chosen for you)</label>
       <fieldset class="block web">
         <legend>Internet access</legend>
         <label class="check"><input type="checkbox" name="internet"> Let the model search the web and read pages</label>
