@@ -310,6 +310,23 @@ mod tests {
         );
     }
 
+    /// Qwen3.5's template groups consecutive tool results into one user turn with loop.previtem
+    /// and loop.nextitem (minijinja's adjacent_loop_items).
+    #[test]
+    fn tool_results_group_with_adjacent_loop_items() {
+        let t = ChatTemplate {
+            source: r#"{%- for message in messages %}{%- if message.role == "tool" %}{%- if loop.previtem and loop.previtem.role != "tool" %}{{- '<|im_start|>user' }}{%- endif %}{{- '\n<tool_response>\n' + message.content + '\n</tool_response>' }}{%- if not loop.last and loop.nextitem.role != "tool" %}{{- '<|im_end|>\n' }}{%- elif loop.last %}{{- '<|im_end|>\n' }}{%- endif %}{%- else %}{{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}{%- endif %}{%- endfor %}"#.into(),
+            from_model: true,
+            bos: String::new(),
+            eos: String::new(),
+        };
+        let m: Vec<Message> = [("assistant", "call"), ("tool", "A"), ("tool", "B"), ("user", "next")].iter().map(|(r, c)| Message::new(r, c)).collect();
+        assert_eq!(
+            t.render(&m, false, &Options::default()).unwrap(),
+            "<|im_start|>assistant\ncall<|im_end|>\n<|im_start|>user\n<tool_response>\nA\n</tool_response>\n<tool_response>\nB\n</tool_response><|im_end|>\n<|im_start|>user\nnext<|im_end|>\n"
+        );
+    }
+
     #[test]
     fn chatml_fallback_renders() {
         let t = ChatTemplate {
