@@ -154,11 +154,22 @@ function familyCalls(text, types) {
 // the name starts with a common command and bash is a tool, it is that bash command.
 const SHELL_WORDS = /^(git|gh|ls|cat|cd|grep|sed|echo|mkdir|touch|rm|mv|cp|python3|node|npm|npx|cargo|head|tail|wc|find|diff|edit)\s/;
 function commandAsName(body, allowed) {
-  const m = /^\{\s*"name"\s*:\s*"([\s\S]+)"\s*\}$/.exec(String(body).trim());
-  if (!m || !SHELL_WORDS.test(m[1]) || ![...allowed].includes('bash')) return null;
-  // The JSON string's closing quote often also closes the last argument ("--body "Done."}).
-  const quotes = (m[1].match(/(?<!\\)"/g) || []).length;
-  return call({ name: 'bash', arguments: { command: quotes % 2 ? `${m[1]}"` : m[1] } }, allowed);
+  if (![...allowed].includes('bash')) return null;
+  const text = String(body).trim();
+  // Extra closing braces are common too ({"name": "gh pr create ..."}}).
+  const m = /^\{\s*"name"\s*:\s*"([\s\S]+)"\s*\}+$/.exec(text);
+  if (m && SHELL_WORDS.test(m[1])) return call({ name: 'bash', arguments: { command: balanced(m[1]) } }, allowed);
+  // A bash call whose command escapes some quotes and not others
+  // ({"command": "gh pr create --title \"X\" --body "Y\""}): its one argument runs to the end.
+  const b = /^\{\s*"name"\s*:\s*"bash"\s*,\s*"arguments"\s*:\s*\{\s*"command"\s*:\s*"([\s\S]*)"\s*\}\s*\}+$/.exec(text);
+  if (b) return call({ name: 'bash', arguments: { command: balanced(b[1].replace(/\\(["\\])/g, '$1').replace(/\\n/g, '\n')) } }, allowed);
+  return null;
+}
+
+// The JSON string's closing quote often also closes the last argument ("--body "Done."}).
+function balanced(command) {
+  const quotes = (command.match(/(?<!\\)"/g) || []).length;
+  return quotes % 2 ? `${command}"` : command;
 }
 
 export function parseToolCalls(text, allowed = NAMES, types = null) {
