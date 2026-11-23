@@ -434,7 +434,8 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     }
     else if(['preview','browser_test'].includes(name)){if(!preview)throw new Error('Preview is unavailable.');if(name==='preview'&&pendingChangeError)throw new Error('A file change failed. Read the file and correct the failed write or edit before final preview.');result=await preview(args.path,{signal,smoke:name==='browser_test'});if(name==='preview'&&result.ok===true)completedPreview=true;}
     else{result=await network.run(name,args,signal);webCalls++;if(name==='open_url')for(const src of result.sources||[])if(src.url&&!opened.includes(src.url))opened.push(src.url);}
-    const full=name==='read'?`File: ${args.path}\n${result.text}`:name==='bash'&&linux?shellText(result):JSON.stringify(result);
+    const {now,...rest}=result||{};
+    const full=name==='read'?`File: ${args.path}\n${result.text}`:name==='bash'&&linux?shellText(result):name==='edit'&&now?`${JSON.stringify(rest)}\nThose lines now read:\n${now}`:JSON.stringify(result);
     const body=full.length<=limits.result?full:full.slice(0,limits.result)+(name==='read'?`\n… (${full.length-limits.result} more characters not shown. To find a line, run: grep -n "SOME WORDS" ${args.path}; edit needs only the exact text to replace.)`:'\n… (output cut)');
     return {content:[{type:'text',text:body}],details:{sandbox:true},isError:result.ok===false||Boolean(result.code)||(['web_search','open_url'].includes(name)&&!result.sources?.length)};
   }}));
