@@ -73,7 +73,7 @@ const shellText = r => [`exit code ${r.code}${r.timedOut?' (timed out)':''}, in 
 /** The file a sed substitution reads without -i (so it changes nothing), if a command has one. */
 export function sedWithoutInPlace(command) {
   for (const part of String(command).split(/&&|\|\||;|\|/)) {
-    const m = /^\s*sed\s+(.*)$/.exec(part);
+    const m = /^\s*sed\s+([\s\S]*)$/.exec(part); // a replacement may hold a newline
     if (!m || /(^|\s)-[a-zA-Z]*i|--in-place|>/.test(m[1]) || !/(^|['"\s;])\d*,?\d*s([^\w\s])/.test(m[1])) continue;
     const file = /\s([\w./-]+)\s*$/.exec(m[1]);
     if (file) return file[1];

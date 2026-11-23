@@ -426,6 +426,8 @@ test('a line asked for after another line but appended with >> gets a note on ho
 test('sedWithoutInPlace finds a substitution that leaves its file unchanged',()=>{
  assert.equal(sedWithoutInPlace("cd app && sed -n '1s/def add(a, b):/x/' calc.py"),'calc.py');
  assert.equal(sedWithoutInPlace("sed 's/a - b/a + b/' calc.py"),'calc.py');
+ // As models send it: the replacement's \n arrives as a real newline.
+ assert.equal(sedWithoutInPlace("cd app && sed -n '1s/def add(a, b):/def add(a, b):\n    return a + b/' calc.py"),'calc.py');
  assert.equal(sedWithoutInPlace("sed -i 's/a - b/a + b/' calc.py"),null);
  assert.equal(sedWithoutInPlace("sed 's/a/b/' calc.py > new.py"),null);
  assert.equal(sedWithoutInPlace("sed -n '1,20p' calc.py"),null);
