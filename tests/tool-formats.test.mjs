@@ -104,3 +104,14 @@ test('GUI models\' actions become browser tools', async () => {
   // Without browser tools nothing is mapped.
   assert.deepEqual(parseToolCalls('<tool_call>\n{"name": "web", "arguments": {"url": "http://x/"}}\n</tool_call>', new Set(['bash'])), []);
 });
+
+test('commands with stray braces or half-escaped quotes still become the bash call meant', async () => {
+  const { parseToolCalls } = await import('../web/tools.js');
+  const names = new Set(['bash', 'read']);
+  const one = (body) => parseToolCalls('<tool_call> \n' + body + '\n</tool_call>', names);
+  assert.deepEqual(one('{"name": "gh pr create --title "docs-serve" --body "Added a line"}}'), [{ name: 'bash', args: { command: 'gh pr create --title "docs-serve" --body "Added a line"' } }]);
+  assert.deepEqual(one('{"name": "bash", "arguments": {"command": "gh pr create --title \\"Add serve\\" --body "Adds a way to serve\\""}}'), [{ name: 'bash', args: { command: 'gh pr create --title "Add serve" --body "Adds a way to serve"' } }]);
+  // Other tools and broken calls are not guessed at.
+  assert.deepEqual(one('{"name": "read", "arguments": {"path": "a"b"}}'), []);
+  assert.deepEqual(one('{"name": "bash", "arguments": {"command": "ls"'), []);
+});
