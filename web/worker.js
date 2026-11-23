@@ -4,7 +4,10 @@ import { formatBytes } from './models.js';
 import { assistantWithCalls, nativeToolFormat, toolResult, toolTransport } from './tool-transport.mjs';
 import { openModelReaders, storageError } from './model-readers.mjs';
 import { RangeCache, RemoteModel } from './remote-reader.mjs';
-import { CHUNK as SWARM_CHUNK } from './swarm-protocol.mjs';
+import { CHUNK as SWARM_CHUNK, MANIFESTS, Manifests } from './swarm-protocol.mjs';
+import { PIECE, fetchPieces, packPieces, sourcesFor, unpackPieces } from './mirrors.mjs';
+
+const manifests = new Manifests(MANIFESTS);
 import { capacityOf, planFill, planSplit } from './split.mjs';
 import { TOOL_SCHEMAS, displayText, parseToolCalls, rawPiece, runTool, schemaTypes, webSearch } from './tools.js';
 
@@ -155,11 +158,14 @@ let fetching = null;
 let probingNow = null;
 
 // `quiet`: progress goes to 'fetch-progress', not the loading screen; `controller` stops it.
+// Each file comes in pieces over several connections, from Hugging Face and, when a chunk
+// manifest can check them, from mirrors too (mirrors.mjs). Pieces are written in place and
+// listed in the model's record as they land, so a stopped download resumes with what it has.
 async function download(entry, { quiet = false, controller = null } = {}) {
   if (!navigator.storage?.getDirectory) throw new Error('This browser cannot store downloaded models. Open a GGUF file from your device instead.');
   const dir = await modelsDir();
   const { key } = entry;
-  const parts = entry.parts?.length ? entry.parts : [{ file: entry.file, url: entry.url, bytes: entry.bytes }];
+  const parts = entry.parts?.length ? entry.parts : [{ file: entry.file, url: entry.url, bytes: entry.bytes, sha256: entry.sha256 }];
   const count = parts.length;
   const names = parts.map((_, i) => partName(key, i, count));
   const meta = await readMeta(dir, key);
@@ -169,77 +175,109 @@ async function download(entry, { quiet = false, controller = null } = {}) {
     for (let i = 0; i < count; i++) ok &&= (await storedSize(dir, names[i])) === (meta.parts?.[i]?.bytes ?? meta.bytes);
     if (ok) return names;
   }
-  const total = parts.reduce((t, p) => t + (p.bytes || 0), 0);
-  let have = 0;
-  for (let i = 0; i < count; i++) have += same ? await storedSize(dir, names[i]) : 0;
+  for (const part of parts) if (!part.bytes) part.bytes = await remoteSize(part.url, controller);
+  // Pieces already saved: listed in the record, or (downloads from before pieces) every whole
+  // piece below the stored size, which was written front to back.
+  const saved = [];
+  for (let i = 0; i < count; i++) {
+    const pieces = Math.ceil(parts[i].bytes / PIECE);
+    const listed = same ? meta.parts?.[i]?.pieces : undefined;
+    if (listed !== undefined) saved.push(unpackPieces(listed, pieces));
+    else {
+      const size = same ? await storedSize(dir, names[i]) : 0;
+      const whole = size >= parts[i].bytes ? pieces : Math.floor(size / PIECE);
+      saved.push(new Set(Array.from({ length: whole }, (_, k) => k)));
+    }
+  }
+  const pieceBytes = (i, k) => Math.min(PIECE, parts[i].bytes - k * PIECE);
+  const total = parts.reduce((t, p) => t + p.bytes, 0);
+  const have = saved.reduce((t, set, i) => t + [...set].reduce((u, k) => u + pieceBytes(i, k), 0), 0);
   const estimate = await navigator.storage.estimate().catch(() => null);
   if (estimate?.quota && total - have > estimate.quota - (estimate.usage || 0)) {
     throw new Error(`This browser can store ${formatBytes(estimate.quota - (estimate.usage || 0))} more, and the model needs ${formatBytes(total - have)}. Remove a downloaded model or open the files from your device.`);
   }
   try { await navigator.storage.persist?.(); } catch { /* best effort */ }
   const record = { url: entry.url, repo: entry.repo, file: entry.file, revision: entry.revision, name: entry.name, bytes: total,
-    parts: parts.map((p) => ({ file: p.file, bytes: p.bytes })), complete: false, started: meta?.started || Date.now() };
+    parts: parts.map((p, i) => ({ file: p.file, bytes: p.bytes, pieces: packPieces(saved[i], Math.ceil(p.bytes / PIECE)) })),
+    complete: false, started: meta?.started || Date.now() };
   await writeText(dir, `${key}.json`, JSON.stringify(record));
   const t0 = performance.now();
   let done = have;
   let last = 0;
+  let lastSave = performance.now();
   for (let i = 0; i < count; i++) {
     const part = parts[i];
+    const pieces = Math.ceil(part.bytes / PIECE);
+    if (saved[i].size === pieces) continue;
     const handle = await dir.getFileHandle(names[i], { create: true });
-    let pos = same ? (await handle.getFile()).size : 0;
-    if (part.bytes && pos === part.bytes) continue;
-    if (part.bytes && pos > part.bytes) pos = 0;
     const abort = controller || (downloadAbort = new AbortController());
-    let res;
-    try {
-      res = await fetch(part.url, { headers: pos > 0 ? { Range: `bytes=${pos}-` } : {}, signal: abort.signal });
-    } catch (e) {
-      if (e?.name === 'AbortError') throw new Error('Download paused. Choose the model again to resume.');
-      throw new Error('Could not reach Hugging Face. Check your connection and try again.');
-    }
-    if (!res.ok) throw new Error(httpError(res.status));
-    if (res.status !== 206) { done -= pos; pos = 0; }
+    const sha = /^[0-9a-f]{64}$/.test(part.sha256 || '') ? part.sha256 : null;
+    const index = sha && entry.mirrors !== false ? await manifests.index(sha).catch(() => null) : null;
+    const verified = Boolean(index && index.size === part.bytes);
+    // Checked pieces come from the commit the manifest was made from, so a file re-uploaded
+    // under the same name on Hugging Face since then cannot mix into this one.
+    const commit = verified && /^[0-9a-f]{40}$/.test(index.source?.revision || '') ? index.source.revision : null;
+    const url = commit ? part.url.replace(/^(https:\/\/huggingface\.co\/[^/]+\/[^/]+\/resolve\/)[^/]+\//, `$1${commit}/`) : part.url;
+    const sources = sourcesFor(url, { verified, mirrors: entry.mirrors !== false });
+    const via = new Set();
     const access = await handle.createSyncAccessHandle();
     try {
-      if (pos === 0) access.truncate(0);
-      const reader = res.body.getReader();
-      for (;;) {
-        let chunk;
-        try {
-          chunk = await reader.read();
-        } catch (e) {
-          if (e?.name === 'AbortError') throw new Error('Download paused. Choose the model again to resume.');
-          throw new Error('The connection dropped. Choose the model again to resume the download.');
-        }
-        if (chunk.done) break;
-        // A write that stops short (or throws) means this browser's storage is full: the file
-        // would otherwise be marked complete with a hole at the end.
-        let wrote;
-        try {
-          wrote = access.write(chunk.value, { at: pos });
-        } catch (e) {
-          throw new Error(e?.name === 'QuotaExceededError' ? FULL : `Could not store the model: ${e?.message || e}`);
-        }
-        if (wrote !== chunk.value.byteLength) throw new Error(FULL);
-        pos += chunk.value.byteLength;
-        done += chunk.value.byteLength;
-        const now = performance.now();
-        if (now - last > 150) {
-          last = now;
-          post(quiet ? 'fetch-progress' : 'progress', { phase: 'download', key, loaded: done, total, part: i + 1, parts: count,
-            rate: (done - have) / Math.max(0.001, (now - t0) / 1000) });
-        }
-      }
+      if (!saved[i].size) access.truncate(0);
+      const save = () => {
+        record.parts[i].pieces = packPieces(saved[i], pieces);
+        return writeText(dir, `${key}.json`, JSON.stringify(record));
+      };
+      await fetchPieces({
+        size: part.bytes, sources, done: saved[i], signal: abort.signal,
+        verify: verified ? (start, bytes) => manifests.verify(sha, start / SWARM_CHUNK, Math.ceil((start + bytes.byteLength) / SWARM_CHUNK), bytes).catch(() => null) : undefined,
+        // A write that stops short (or throws) means this browser's storage is full.
+        write: (start, bytes) => {
+          let wrote;
+          try {
+            wrote = access.write(bytes, { at: start });
+          } catch (e) {
+            throw new Error(e?.name === 'QuotaExceededError' ? FULL : `Could not store the model: ${e?.message || e}`);
+          }
+          if (wrote !== bytes.byteLength) throw new Error(FULL);
+        },
+        onPiece: (k, bytes, source) => {
+          saved[i].add(k);
+          via.add(source);
+          done += bytes.byteLength;
+          const now = performance.now();
+          if (now - lastSave > 2000) { lastSave = now; access.flush(); save().catch(() => {}); }
+          if (now - last > 150) {
+            last = now;
+            post(quiet ? 'fetch-progress' : 'progress', { phase: 'download', key, loaded: done, total, part: i + 1, parts: count,
+              rate: (done - have) / Math.max(0.001, (now - t0) / 1000), sources: [...via] });
+          }
+        },
+      });
       access.flush();
-      if (access.getSize() !== pos) throw new Error(FULL);
+      if (access.getSize() !== part.bytes) throw new Error(FULL);
+    } catch (e) {
+      if (e?.name === 'AbortError') throw new Error('Download paused. Choose the model again to resume.');
+      if (e?.status) throw new Error(httpError(e.status));
+      if (e instanceof TypeError) throw new Error('Could not reach Hugging Face. Check your connection and try again.');
+      throw e;
     } finally {
+      try { access.flush(); } catch { /* closed */ }
       access.close();
       if (!controller) downloadAbort = null;
+      record.parts[i].pieces = packPieces(saved[i], pieces);
+      await writeText(dir, `${key}.json`, JSON.stringify(record)).catch(() => {});
     }
-    if (part.bytes && pos !== part.bytes) throw new Error('The download ended early. Choose the model again to resume it.');
   }
   await writeText(dir, `${key}.json`, JSON.stringify({ ...record, complete: true, saved: Date.now() }));
   return names;
+}
+
+// A file's size from a one-byte request, for a part whose size the catalog does not list.
+async function remoteSize(url, controller) {
+  const res = await fetch(url, { headers: { Range: 'bytes=0-0' }, signal: controller?.signal });
+  const size = Number(/\/(\d+)$/.exec(res.headers.get('content-range') || '')?.[1] || res.headers.get('content-length'));
+  if (!res.ok || !size) throw new Error(httpError(res.status));
+  return size;
 }
 
 // ---- Reading models that stay on Hugging Face ----

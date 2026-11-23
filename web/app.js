@@ -161,7 +161,8 @@ function catalogEntry(m) {
   // Streamed models always list their parts: each part's SHA-256 names its swarm.
   // A vision model's image encoder is stored beside it, under the model's key.
   const vision = m.vision ? { key: `${key}.vision`, file: m.vision.file, url: hfUrl(m.vision.repo || m.repo, m.vision.file), bytes: m.vision.bytes } : null;
-  return { kind: 'hf', id: m.id, key, repo: m.repo, file: m.file, revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, name: m.name, resolve: split || stream, stream, vision };
+  return { kind: 'hf', id: m.id, key, repo: m.repo, file: m.file, revision: 'main', url: hfUrl(m.repo, m.file), bytes: m.bytes, sha256: m.sha256 || null, name: m.name,
+    resolve: split || stream, stream, vision, mirrors: state.settings.mirrors !== false };
 }
 
 const ALL = [...MODELS, ...LARGE];
@@ -767,11 +768,12 @@ function setProgress(loaded, total, detail) {
   $('loading-detail').textContent = detail;
 }
 
-function onProgress({ phase, loaded, total, rate, part, parts }) {
+function onProgress({ phase, loaded, total, rate, part, parts, sources }) {
   const bar = $('loading-bar');
   bar.classList.toggle('indeterminate', phase === 'prepare');
   if (phase === 'download') {
-    $('loading-step').textContent = parts > 1 ? `Downloading part ${part} of ${parts} from Hugging Face` : 'Downloading from Hugging Face';
+    const from = sources?.length ? sources.join(' and ') : 'Hugging Face';
+    $('loading-step').textContent = parts > 1 ? `Downloading part ${part} of ${parts} from ${from}` : `Downloading from ${from}`;
     setStep('download');
     const left = rate > 0 ? (total - loaded) / rate : 0;
     setProgress(loaded, total, `${formatBytes(loaded)} of ${formatBytes(total)} · ${formatBytes(rate)}/s${left > 1 ? ` · about ${formatDuration(left)} left` : ''}`);
@@ -1398,6 +1400,7 @@ function fillSettings() {
   form.elements.poolGpus.checked = s.poolGpus !== false;
   form.elements.autoSwitch.checked = s.autoSwitch !== false;
   form.elements.manageModels.checked = s.manageModels !== false;
+  form.elements.mirrors.checked = s.mirrors !== false;
   form.elements.internet.checked = Boolean(s.internet);
   form.elements.jinaKey.value = s.jinaKey || '';
   form.elements.githubToken.value = s.githubToken || '';
