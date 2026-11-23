@@ -341,7 +341,7 @@ function createBrowserTools(browser, { snapshotChars = BROWSER_SNAPSHOT_CHARS, c
 export function createPiTask({ turn, workspace, network, onEvent = () => {}, modelName = 'Local model', preview, maxTokens = 2048, browser, confirmBrowserAction, browserSnapshotChars, linux = null, native = false, history = [], vision = null }) {
   // Call ids in Kimi's form (functions.name:index), which other templates ignore or only match.
   let callIndex=0;
-  let turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, pendingChangeError=false, previewPath=null;const failedCommands=new Map(), seen=new Set(), noted=new Set();
+  let cutoffs=0, turns=0, calls=0, repairs=0, changes=0, errors=0, lastToolFailed=false, completedPreview=false, pendingChangeError=false, previewPath=null;const failedCommands=new Map(), seen=new Set(), noted=new Set();
   // A final reply while a step the request asked for has not happened (small models stop with
   // "Next steps: commit, push…" or say it is done): git status and gh pr view name the next one.
   const unfinished=async(signal,reply='')=>{
@@ -480,7 +480,20 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
             if(++turns>limits.turns)throw new Error(`Pi task reached its ${limits.turns}-turn limit.`);
             result=await turn(messages,schemas,{signal:options?.signal,maxTokens,onToken:delta=>onEvent({type:'token',text:delta})});
             options?.signal?.throwIfAborted();
-            if(result.reason==='length')throw new Error('Pi reply reached its output/context limit. No tools from this incomplete reply were executed. Increase Pi output tokens and the model context in Settings, or ask for a smaller file.');
+            if(result.reason==='length'){
+              // Once per task, ask again instead of stopping: thinking models run past the limit
+              // before acting, write a file too long for one reply, or trail off into blank lines.
+              if(cutoffs>=1)throw new Error('Pi reply reached its output/context limit. No tools from this incomplete reply were executed. Increase Pi output tokens and the model context in Settings, or ask for a smaller file.');
+              cutoffs++;
+              const thinking=/<think>(?![\s\S]*<\/think>)/.test(result.text);
+              const blank=!thinking&&!attemptedToolCall(result.text)&&!stripToolCalls(result.text).replace(/<think>[\s\S]*?<\/think>/g,'').trim();
+              const [why,ask]=thinking?['The model thought past the reply limit','You thought past the reply limit, so nothing ran. Do not think it over again: make the next tool call now.']
+                :blank?['The reply was only blank lines','Your reply was only blank lines. If the task is done, say briefly what you did; otherwise make the next tool call.']
+                :['The reply was cut off at the output limit','Your reply was cut off at the output limit, so nothing ran. Make the tool call again, shorter: keep any file you write small and simple.'];
+              onEvent({type:'retry',attempt:cutoffs,message:`${why}; asking it again.`,output:''});
+              messages=[...original,{role:'user',content:ask}];
+              continue;
+            }
             parsed=parseToolCalls(result.text,names,types).slice(0,3);
             const finalPreview=parsed.findIndex(call=>call.name==='preview');if(finalPreview>=0)parsed=parsed.slice(0,finalPreview+1);
             const attempted=attemptedToolCall(result.text);
@@ -517,5 +530,5 @@ export function createPiTask({ turn, workspace, network, onEvent = () => {}, mod
     if(event.type==='tool_execution_end'){lastToolFailed=Boolean(event.isError);if(lastToolFailed)errors++;if(['write','edit'].includes(event.toolName))pendingChangeError=lastToolFailed;onEvent({type:'tool-result',name:event.toolName,result:event.result,isError:event.isError});}
     if(event.type==='message_end'&&event.message.role==='assistant')onEvent({type:'answer',text:text(event.message.content),stopReason:event.message.stopReason,error:event.message.errorMessage});
   });
-  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;pushed=false;webCalls=0;opened=[];currentPrompt=String(prompt);const pre=linux?await preamble(prompt,workspace,linux.cwd,linux.building?.()||null):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
+  return {async run(prompt){asked=askedSteps(prompt);declined=false;nudges=0;cutoffs=0;pushed=false;webCalls=0;opened=[];currentPrompt=String(prompt);const pre=linux?await preamble(prompt,workspace,linux.cwd,linux.building?.()||null):null;ghRepo=pre?.repo||null;await agent.prompt(pre?`${pre.text}\n\n${prompt}`:prompt);if(stuck)throw new Error(stuck);const last=agent.state.messages.at(-1);if(last?.role==='assistant'&&['error','aborted'].includes(last.stopReason))throw new Error(last.errorMessage||'Pi task stopped.');return {turns,calls,repairs,changes,errors,lastToolFailed,previewPath,messages:agent.state.messages}},abort:()=>agent.abort()};
 }
