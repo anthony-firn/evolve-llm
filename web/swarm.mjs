@@ -3,10 +3,10 @@
 // checked against the published manifest before use, and a peer that sends a wrong one is
 // dropped for the visit. Whatever no peer delivers comes from Hugging Face as before.
 
-import { CHUNK, FRAME, MAX_REQUEST_CHUNKS, Manifests, PROTOCOL, RangeSet, decodeFrame, encodeFrame, parseControl } from './swarm-protocol.mjs';
+import { CHUNK, FRAME, MANIFESTS, MAX_REQUEST_CHUNKS, Manifests, PROTOCOL, RangeSet, decodeFrame, encodeFrame, parseControl } from './swarm-protocol.mjs';
 import { Signal } from './swarm-signal.mjs';
 
-export const MANIFESTS = 'https://raw.githubusercontent.com/anthony-firn/evolve-llm-manifests/main/v1/';
+export { MANIFESTS };
 export const ICE_SERVERS = [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }];
 const MAX_PEERS = 8;
 const REQUEST_MS = 20000;

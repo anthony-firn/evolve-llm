@@ -5,6 +5,8 @@
 // Face lists it for every GGUF), so the same file in any repository is one swarm. Every chunk a
 // peer sends is checked against the manifest (tools/chunk_manifest.py) before it is used.
 
+/** Published chunk hashes, by file SHA-256 (tools/chunk_manifest.py). */
+export const MANIFESTS = 'https://raw.githubusercontent.com/anthony-firn/evolve-llm-manifests/main/v1/';
 export const CHUNK = 256 * 1024;
 export const PAGE_CHUNKS = 4096;
 /** Largest request one peer serves at once, in chunks (4 MiB). */

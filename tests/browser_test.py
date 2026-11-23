@@ -25,7 +25,7 @@ from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
 CSP = ("default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; "
-       "img-src 'self' data:; font-src 'self'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co https://*.wikipedia.org https://api.duckduckgo.com https://r.jina.ai https://s.jina.ai https://raw.githubusercontent.com https://api.github.com wss: ws://127.0.0.1:* ws://localhost:*; "
+       "img-src 'self' data:; font-src 'self'; connect-src 'self' https://huggingface.co https://*.huggingface.co https://*.hf.co https://www.modelscope.cn https://*.modelscope.cn https://*.wikipedia.org https://api.duckduckgo.com https://r.jina.ai https://s.jina.ai https://raw.githubusercontent.com https://api.github.com wss: ws://127.0.0.1:* ws://localhost:*; "
        "frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
 PREVIEW_CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-scripts"
 FLAGS = ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-angle=vulkan", "--ignore-gpu-blocklist"]
@@ -212,8 +212,18 @@ def main():
 
         if a.download:
             page.click("#new-chat")
+            # Which hosts served the model's pieces (Hugging Face's CDN, and ModelScope's when
+            # published hashes check them).
+            pieces = {}
+            def piece(r):
+                if r.status == 206 and (r.url.split("?")[0].endswith(".gguf") or "lfs" in r.url or "xet" in r.url):
+                    host = r.url.split("/")[2]
+                    pieces[host] = pieces.get(host, 0) + 1
+            page.on("response", piece)
             page.locator(".model", has_text="SmolLM2 135M").click()
+            # Which sources the pieces come from (Hugging Face, and ModelScope when hashes check them).
             page.wait_for_selector("#ready:not([hidden])", timeout=600000)
+            print("pieces by host:", dict(pieces))
             saved = page.locator(".model", has_text="SmolLM2 135M").inner_text()
             print("downloaded and loaded:", page.inner_text("#ready-meta"))
             assert "Running" in saved
@@ -221,7 +231,10 @@ def main():
             page.wait_for_selector("#gpu-chip[data-state=ok]", timeout=30000)
             page.wait_for_selector(".model:has-text('SmolLM2 135M') .tag.ok", timeout=30000)
             t0 = time.time()
-            page.locator(".model", has_text="SmolLM2 135M").click()
+            # With models managed for you, the app loads the model it last ran on its own.
+            button = page.locator(".model", has_text="SmolLM2 135M")
+            if button.is_enabled():
+                button.click()
             page.wait_for_selector("#ready:not([hidden])", timeout=120000)
             print(f"reloaded from browser storage in {time.time() - t0:.1f}s")
             steps = page.eval_on_selector_all("#loading-steps li", "els => els.map(e => e.dataset.step + ':' + e.dataset.state)")
