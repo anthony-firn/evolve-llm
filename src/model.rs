@@ -317,7 +317,12 @@ pub fn config(g: &Gguf) -> Result<Config, String> {
     let opt = |k: &str| g.u64(&key(k)).map(|v| v as usize);
     let moe = match opt("expert_count") {
         Some(n_expert) if n_expert > 1 => {
-            let n_ff = opt("expert_feed_forward_length").unwrap_or(need("feed_forward_length")?);
+            // Qwen3.5/3.6 MoE files carry only the expert width; `unwrap_or(need(..)?)` would
+            // evaluate the fallback (and fail) even when the expert width is there.
+            let n_ff = match opt("expert_feed_forward_length") {
+                Some(n) => n,
+                None => need("feed_forward_length")?,
+            };
             let shared = g
                 .tensor("blk.0.ffn_gate_shexp.weight")
                 .or_else(|| {
